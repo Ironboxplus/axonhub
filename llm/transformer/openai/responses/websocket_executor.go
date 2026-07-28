@@ -1048,12 +1048,23 @@ func (s *webSocketStream) Next() bool {
 
 	_, msg, err := s.lease.conn.ReadMessage()
 	if err != nil {
+		if ctxErr := s.ctx.Err(); ctxErr != nil {
+			s.setErr(ctxErr)
+			s.finish(true)
+			return false
+		}
+
+		// Platforms report a peer close differently. Windows can surface
+		// WSAECONNABORTED where Unix reports a normal WebSocket close. Before the
+		// first response event these are the same retryable protocol failure, so
+		// expose stable semantics while retaining the transport cause.
+		if !s.hasSeenEvent() {
+			s.setErr(fmt.Errorf("websocket closed before response event: %w", err))
+			s.finish(true)
+			return false
+		}
+
 		if websocket.IsCloseError(err, websocket.CloseNormalClosure) || strings.Contains(err.Error(), "use of closed network connection") {
-			if ctxErr := s.ctx.Err(); ctxErr != nil {
-				s.setErr(ctxErr)
-			} else if !s.hasSeenEvent() {
-				s.setErr(fmt.Errorf("websocket closed before response event"))
-			}
 			s.finish(true)
 			return false
 		}

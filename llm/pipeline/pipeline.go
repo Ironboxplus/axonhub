@@ -269,8 +269,6 @@ func (p *pipeline) Process(ctx context.Context, request *httpclient.Request) (*R
 		return nil, err
 	}
 
-	originalStream := llmRequest.Stream
-
 	var lastErr error
 
 	channelSwitches := 0
@@ -278,9 +276,12 @@ func (p *pipeline) Process(ctx context.Context, request *httpclient.Request) (*R
 
 	// Step 3: Process the request
 	for {
-		llmRequest.Stream = originalStream
+		// Outbound transformers and attempt middleware may enrich or normalize
+		// mutable request fields. Give every retry/channel attempt an isolated
+		// graph so a failed provider cannot contaminate the next attempt.
+		attemptRequest := llmRequest.Clone()
 
-		result, err := p.processRequest(ctx, llmRequest)
+		result, err := p.processRequest(ctx, attemptRequest)
 		if err == nil {
 			return result, nil
 		}
