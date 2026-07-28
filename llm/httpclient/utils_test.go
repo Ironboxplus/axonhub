@@ -5,6 +5,7 @@ import (
 	"compress/flate"
 	"compress/gzip"
 	"compress/zlib"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -257,6 +258,42 @@ func TestReadHTTPRequest_EmptyBodyWithContentEncoding(t *testing.T) {
 	got, err := ReadHTTPRequest(req)
 	require.NoError(t, err)
 	assert.Empty(t, got.Body)
+}
+
+func TestReadHTTPRequestWithLimitRejectsTransportBody(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(bytes.Repeat([]byte("x"), 65)))
+	_, err := ReadHTTPRequestWithLimit(req, 64)
+	require.ErrorIs(t, err, ErrRequestBodyTooLarge)
+}
+
+func TestReadHTTPRequestWithLimitRejectsDecodedCompressionBomb(t *testing.T) {
+	original := bytes.Repeat([]byte("private-data-"), 1024)
+	compressors := map[string]func([]byte) []byte{
+		"gzip": func(body []byte) []byte {
+			var output bytes.Buffer
+			writer := gzip.NewWriter(&output)
+			_, err := writer.Write(body)
+			require.NoError(t, err)
+			require.NoError(t, writer.Close())
+			return output.Bytes()
+		},
+		"zstd": func(body []byte) []byte {
+			writer, err := zstd.NewWriter(nil)
+			require.NoError(t, err)
+			defer writer.Close()
+			return writer.EncodeAll(body, nil)
+		},
+	}
+	for encoding, compress := range compressors {
+		t.Run(encoding, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(compress(original)))
+			req.Header.Set("Content-Encoding", encoding)
+			_, err := ReadHTTPRequestWithLimit(req, 1024)
+			if !errors.Is(err, ErrRequestBodyTooLarge) {
+				t.Fatalf("decoded %s error = %v, want ErrRequestBodyTooLarge", encoding, err)
+			}
+		})
+	}
 }
 
 func TestDecodeRequestBody_NoEncoding(t *testing.T) {

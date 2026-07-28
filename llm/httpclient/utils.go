@@ -5,6 +5,7 @@ import (
 	"compress/flate"
 	"compress/gzip"
 	"compress/zlib"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -16,7 +17,16 @@ import (
 	"github.com/samber/lo"
 )
 
+var ErrRequestBodyTooLarge = errors.New("HTTP request body exceeds configured limit")
+
 func ReadHTTPRequest(rawReq *http.Request) (*Request, error) {
+	return ReadHTTPRequestWithLimit(rawReq, 0)
+}
+
+// ReadHTTPRequestWithLimit enforces maxBodyBytes on both the transport body
+// and the decoded representation. A non-positive limit preserves the legacy
+// unbounded behavior.
+func ReadHTTPRequestWithLimit(rawReq *http.Request, maxBodyBytes int64) (*Request, error) {
 	req := &Request{
 		Method:     rawReq.Method,
 		URL:        rawReq.URL.String(),
@@ -30,13 +40,13 @@ func ReadHTTPRequest(rawReq *http.Request) (*Request, error) {
 		RawRequest: rawReq,
 	}
 
-	body, err := io.ReadAll(rawReq.Body)
+	body, err := readAllLimited(rawReq.Body, maxBodyBytes)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read request body: %w", err)
 	}
 
 	if len(body) > 0 {
-		body, err = decodeRequestBody(body, req.Headers)
+		body, err = decodeRequestBodyWithLimit(body, req.Headers, maxBodyBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -47,7 +57,25 @@ func ReadHTTPRequest(rawReq *http.Request) (*Request, error) {
 	return req, nil
 }
 
+func readAllLimited(reader io.Reader, maxBytes int64) ([]byte, error) {
+	if maxBytes <= 0 {
+		return io.ReadAll(reader)
+	}
+	body, err := io.ReadAll(io.LimitReader(reader, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > maxBytes {
+		return nil, ErrRequestBodyTooLarge
+	}
+	return body, nil
+}
+
 func decodeRequestBody(body []byte, headers http.Header) ([]byte, error) {
+	return decodeRequestBodyWithLimit(body, headers, 0)
+}
+
+func decodeRequestBodyWithLimit(body []byte, headers http.Header, maxBodyBytes int64) ([]byte, error) {
 	contentEncoding := headers.Get("Content-Encoding")
 	if contentEncoding == "" {
 		return body, nil
@@ -66,7 +94,7 @@ func decodeRequestBody(body []byte, headers http.Header) ([]byte, error) {
 		}
 		defer reader.Close()
 
-		decoded, err := io.ReadAll(reader)
+		decoded, err := readAllLimited(reader, maxBodyBytes)
 		if err != nil {
 			return nil, fmt.Errorf("failed to decompress gzip body: %w", err)
 		}
@@ -79,7 +107,7 @@ func decodeRequestBody(body []byte, headers http.Header) ([]byte, error) {
 	case "deflate":
 		// RFC 7230/2616 defines "deflate" as zlib (RFC 1950), but many clients send
 		// raw DEFLATE (RFC 1951). Try zlib first, fall back to raw DEFLATE.
-		decoded, err := decodeZlibOrFlate(body)
+		decoded, err := decodeZlibOrFlate(body, maxBodyBytes)
 		if err != nil {
 			return nil, fmt.Errorf("failed to decompress deflate body: %w", err)
 		}
@@ -90,13 +118,13 @@ func decodeRequestBody(body []byte, headers http.Header) ([]byte, error) {
 		return decoded, nil
 
 	case "zstd":
-		decoder, err := zstd.NewReader(nil)
+		decoder, err := zstd.NewReader(bytes.NewReader(body))
 		if err != nil {
 			return nil, fmt.Errorf("failed to create zstd decoder: %w", err)
 		}
 		defer decoder.Close()
 
-		decoded, err := decoder.DecodeAll(body, nil)
+		decoded, err := readAllLimited(decoder, maxBodyBytes)
 		if err != nil {
 			return nil, fmt.Errorf("failed to decode zstd compressed body: %w", err)
 		}
@@ -111,16 +139,16 @@ func decodeRequestBody(body []byte, headers http.Header) ([]byte, error) {
 	}
 }
 
-func decodeZlibOrFlate(body []byte) ([]byte, error) {
+func decodeZlibOrFlate(body []byte, maxBodyBytes int64) ([]byte, error) {
 	reader, err := zlib.NewReader(bytes.NewReader(body))
 	if err == nil {
 		defer reader.Close()
-		return io.ReadAll(reader)
+		return readAllLimited(reader, maxBodyBytes)
 	}
 
 	flateReader := flate.NewReader(bytes.NewReader(body))
 	defer flateReader.Close()
-	return io.ReadAll(flateReader)
+	return readAllLimited(flateReader, maxBodyBytes)
 }
 
 func getClientIP(req *http.Request) string {

@@ -43,13 +43,23 @@ func GetDecoder(contentType string) (StreamDecoderFactory, bool) {
 
 // NewDefaultSSEDecoder creates a new default SSE decoder.
 func NewDefaultSSEDecoder(ctx context.Context, rc io.ReadCloser) StreamDecoder {
+	return NewSSEDecoderWithMaxEventSize(ctx, rc, 32*1024*1024)
+}
+
+// NewSSEDecoderWithMaxEventSize creates an SSE decoder with an explicit event
+// bound. This lets embedding products preserve large image events without
+// removing the decoder's memory guardrail.
+func NewSSEDecoderWithMaxEventSize(ctx context.Context, rc io.ReadCloser, maxEventSize int) StreamDecoder {
+	if maxEventSize <= 0 {
+		maxEventSize = 32 * 1024 * 1024
+	}
 	return &defaultSSEDecoder{
 		ctx:    ctx,
 		reader: rc,
 		// sseStream: sse.NewStream(rc),
 		// 图片生成需要大量数据，设置最大事件大小
 		sseStream: sse.NewStreamWithConfig(rc, &sse.StreamConfig{
-			MaxEventSize: 32 * 1024 * 1024,
+			MaxEventSize: maxEventSize,
 		}),
 	}
 }

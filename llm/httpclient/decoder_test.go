@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"maps"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -183,6 +184,13 @@ func TestDefaultSSEDecoder_EmptyStream(t *testing.T) {
 	// Close should work
 	err := decoder.Close()
 	require.NoError(t, err)
+}
+
+func TestSSEDecoderWithMaxEventSizeRejectsOversizedEvent(t *testing.T) {
+	rc := newMockReadCloser([]byte("data: " + strings.Repeat("x", 128) + "\n\n"))
+	decoder := NewSSEDecoderWithMaxEventSize(context.Background(), rc, 32)
+	require.False(t, decoder.Next())
+	require.Error(t, decoder.Err())
 }
 
 func TestDefaultSSEDecoder_NextAfterClose(t *testing.T) {

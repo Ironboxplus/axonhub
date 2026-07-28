@@ -26,9 +26,10 @@ const MaxErrorBodySize = 1 << 20 // 1 MB
 
 // HttpClient implements the HttpClient interface.
 type HttpClient struct {
-	client      *http.Client
-	proxyConfig *ProxyConfig
-	opts        []ClientOption
+	client          *http.Client
+	proxyConfig     *ProxyConfig
+	opts            []ClientOption
+	maxSSEEventSize int
 }
 
 // ClientOption configures an HttpClient.
@@ -36,6 +37,14 @@ type ClientOption func(*clientOptions)
 
 type clientOptions struct {
 	insecureSkipVerify bool
+	maxSSEEventSize    int
+}
+
+// WithMaxSSEEventSize configures the maximum decoded SSE event size.
+func WithMaxSSEEventSize(size int) ClientOption {
+	return func(o *clientOptions) {
+		o.maxSSEEventSize = size
+	}
 }
 
 // WithInsecureSkipVerify disables TLS certificate verification.
@@ -79,8 +88,9 @@ func NewHttpClientWithProxy(proxyConfig *ProxyConfig, opts ...ClientOption) *Htt
 		client: &http.Client{
 			Transport: transport,
 		},
-		proxyConfig: proxyConfig,
-		opts:        opts,
+		proxyConfig:     proxyConfig,
+		opts:            opts,
+		maxSSEEventSize: options.maxSSEEventSize,
 	}
 }
 
@@ -195,15 +205,22 @@ func NewHttpClient(opts ...ClientOption) *HttpClient {
 	}
 
 	return &HttpClient{
-		client: client,
-		opts:   opts,
+		client:          client,
+		opts:            opts,
+		maxSSEEventSize: options.maxSSEEventSize,
 	}
 }
 
 // NewHttpClientWithClient creates a new HTTP client with a custom http.Client.
-func NewHttpClientWithClient(client *http.Client) *HttpClient {
+func NewHttpClientWithClient(client *http.Client, opts ...ClientOption) *HttpClient {
+	var options clientOptions
+	for _, opt := range opts {
+		opt(&options)
+	}
 	return &HttpClient{
-		client: client,
+		client:          client,
+		opts:            opts,
+		maxSSEEventSize: options.maxSSEEventSize,
 	}
 }
 
@@ -370,6 +387,13 @@ func (hc *HttpClient) DoStream(ctx context.Context, request *Request) (streams.S
 		slog.DebugContext(ctx, "no decoder found for content type, using default SSE", slog.String("content_type", contentType))
 
 		decoderFactory = NewDefaultSSEDecoder
+	}
+	if hc.maxSSEEventSize > 0 {
+		if mediaType, _, err := mime.ParseMediaType(contentType); err == nil && mediaType == "text/event-stream" {
+			decoderFactory = func(ctx context.Context, rc io.ReadCloser) StreamDecoder {
+				return NewSSEDecoderWithMaxEventSize(ctx, rc, hc.maxSSEEventSize)
+			}
+		}
 	}
 
 	stream := decoderFactory(ctx, rawResp.Body)
