@@ -64,6 +64,14 @@ func WithMiddlewares(decorators ...Middleware) Option {
 	}
 }
 
+// WithObserver configures privacy-safe, stage-level pipeline observation.
+// The observer is optional; a nil observer leaves the hot path uninstrumented.
+func WithObserver(observer Observer) Option {
+	return func(p *pipeline) {
+		p.observer = observer
+	}
+}
+
 // WithEmptyResponseDetection enables detection of empty streaming responses.
 // When enabled, the pipeline pre-reads up to 3 events from the LLM stream to check
 // if the response contains any meaningful content. If the stream ends without content,
@@ -125,6 +133,7 @@ type pipeline struct {
 	emptyResponseDetection  bool
 	streamFirstEventTimeout time.Duration
 	nonStreamTimeout        time.Duration
+	observer                Observer
 }
 
 type Result struct {
@@ -254,8 +263,16 @@ func (p *pipeline) applyLlmStreamMiddlewares(ctx context.Context, stream streams
 }
 
 func (p *pipeline) Process(ctx context.Context, request *httpclient.Request) (*Result, error) {
+	trace := newPipelineTrace(p.observer, p.Outbound.APIFormat())
+	ctx = withPipelineTrace(ctx, trace)
+
 	// Step 1: Transform httpclient.Request to llm.Request using inbound transformer
+	startedAt := observationStart(ctx)
 	llmRequest, err := p.Inbound.TransformRequest(ctx, request)
+	if trace != nil {
+		trace.setRequest(llmRequest)
+	}
+	observeStage(ctx, StageInboundTransform, startedAt, err, observationData{inputBytes: int64(requestBodySize(request))})
 	if err != nil {
 		return nil, err
 	}
@@ -264,7 +281,9 @@ func (p *pipeline) Process(ctx context.Context, request *httpclient.Request) (*R
 	llmRequest.RawRequest = request
 
 	// Step 2: Apply before request middlewares
+	startedAt = observationStart(ctx)
 	llmRequest, err = p.applyBeforeRequestMiddlewares(ctx, llmRequest)
+	observeStage(ctx, StageInboundMiddleware, startedAt, err, observationData{})
 	if err != nil {
 		return nil, err
 	}
@@ -273,9 +292,14 @@ func (p *pipeline) Process(ctx context.Context, request *httpclient.Request) (*R
 
 	channelSwitches := 0
 	sameChannelRetries := 0
+	attempt := 0
 
 	// Step 3: Process the request
 	for {
+		attempt++
+		if trace != nil {
+			trace.attempt.Store(int64(attempt))
+		}
 		// Outbound transformers and attempt middleware may enrich or normalize
 		// mutable request fields. Give every retry/channel attempt an isolated
 		// graph so a failed provider cannot contaminate the next attempt.
@@ -304,13 +328,18 @@ func (p *pipeline) Process(ctx context.Context, request *httpclient.Request) (*R
 					if err := channelRetryable.PrepareForRetry(ctx); err == nil {
 						sameChannelRetries++
 						canRetry = true
+						observeStage(ctx, StageRetryDecision, time.Time{}, nil, observationData{
+							outcome:   OutcomeRetry,
+							retryKind: RetryKindSameChannel,
+						})
 
 						slog.DebugContext(ctx, "retrying same channel",
 							slog.Int("same_channel_attempt", sameChannelRetries),
 							slog.Int("max_same_channel_retries", p.getMaxSameChannelRetries()),
 						)
 					} else {
-						slog.WarnContext(ctx, "failed to prepare same channel retry, will try channel switch", slog.Any("error", err))
+						slog.WarnContext(ctx, "failed to prepare same channel retry, will try channel switch",
+							slog.String("error_class", string(classifyObservationError(StageRetryDecision, err))))
 					}
 				}
 			}
@@ -324,13 +353,18 @@ func (p *pipeline) Process(ctx context.Context, request *httpclient.Request) (*R
 						channelSwitches++
 						sameChannelRetries = 0 // Reset same-channel attempts for new channel
 						canRetry = true
+						observeStage(ctx, StageRetryDecision, time.Time{}, nil, observationData{
+							outcome:   OutcomeRetry,
+							retryKind: RetryKindSwitchChannel,
+						})
 
 						slog.DebugContext(ctx, "switched to next channel",
 							slog.Int("channel_switch_attempt", channelSwitches),
 							slog.Int("max_channel_retries", p.maxChannelRetries),
 						)
 					} else {
-						slog.WarnContext(ctx, "failed to switch to next channel", slog.Any("error", err))
+						slog.WarnContext(ctx, "failed to switch to next channel",
+							slog.String("error_class", string(classifyObservationError(StageRetryDecision, err))))
 					}
 				}
 			}
@@ -338,6 +372,7 @@ func (p *pipeline) Process(ctx context.Context, request *httpclient.Request) (*R
 
 		// If no retry strategy worked, break and return last error
 		if !canRetry {
+			observeStage(ctx, StageRetryDecision, time.Time{}, lastErr, observationData{})
 			break
 		}
 
@@ -347,7 +382,7 @@ func (p *pipeline) Process(ctx context.Context, request *httpclient.Request) (*R
 		}
 
 		slog.WarnContext(ctx, "request process failed, retrying...",
-			slog.Any("error", lastErr),
+			slog.String("error_class", string(classifyObservationError(StageRetryDecision, lastErr))),
 			slog.Int("channel_switches", channelSwitches),
 			slog.Int("same_channel_retries", sameChannelRetries),
 		)
@@ -359,7 +394,13 @@ func (p *pipeline) Process(ctx context.Context, request *httpclient.Request) (*R
 func (p *pipeline) processRequest(ctx context.Context, request *llm.Request) (*Result, error) {
 	originalWantStream := request.Stream != nil && *request.Stream
 
+	startedAt := observationStart(ctx)
 	httpReq, err := p.Outbound.TransformRequest(ctx, request)
+	outputBytes := int64(0)
+	if httpReq != nil {
+		outputBytes = int64(len(httpReq.Body))
+	}
+	observeStage(ctx, StageOutboundTransform, startedAt, err, observationData{outputBytes: outputBytes})
 	if err != nil {
 		return nil, fmt.Errorf("failed to transform request: %w", err)
 	}
@@ -372,7 +413,13 @@ func (p *pipeline) processRequest(ctx context.Context, request *llm.Request) (*R
 	}
 
 	// Apply raw request middlewares
+	startedAt = observationStart(ctx)
 	httpReq, err = p.applyRawRequestMiddlewares(ctx, httpReq)
+	outputBytes = 0
+	if httpReq != nil {
+		outputBytes = int64(len(httpReq.Body))
+	}
+	observeStage(ctx, StageOutboundMiddleware, startedAt, err, observationData{outputBytes: outputBytes})
 	if err != nil {
 		p.applyRawErrorResponseMiddlewares(ctx, err)
 

@@ -150,7 +150,9 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 	}
 
 	if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
-		slog.DebugContext(context.Background(), "received response stream event", slog.Any("event", streamEvent))
+		slog.DebugContext(context.Background(), "received response stream event",
+			slog.String("event_type", string(streamEvent.Type)),
+			slog.Int("data_bytes", len(event.Data)))
 	}
 
 	// Build base response

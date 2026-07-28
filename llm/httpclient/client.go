@@ -209,7 +209,10 @@ func NewHttpClientWithClient(client *http.Client) *HttpClient {
 
 // Do executes the HTTP request.
 func (hc *HttpClient) Do(ctx context.Context, request *Request) (*Response, error) {
-	slog.DebugContext(ctx, "execute http request", slog.Any("request", request), slog.Any("proxy", hc.proxyConfig))
+	slog.DebugContext(ctx, "execute http request",
+		slog.String("request_type", request.RequestType),
+		slog.String("api_format", request.APIFormat),
+		slog.Int("body_bytes", len(request.Body)))
 
 	rawReq, err := hc.BuildHttpRequest(ctx, request)
 	if err != nil {
@@ -248,9 +251,8 @@ func (hc *HttpClient) Do(ctx context.Context, request *Request) (*Response, erro
 		if slog.Default().Enabled(ctx, slog.LevelDebug) {
 			slog.DebugContext(ctx, "HTTP request failed",
 				slog.String("method", rawReq.Method),
-				slog.String("url", rawReq.URL.String()),
 				slog.Int("status_code", rawResp.StatusCode),
-				slog.String("body", string(body)))
+				slog.Int("error_body_bytes", len(body)))
 		}
 
 		return nil, &Error{
@@ -271,9 +273,8 @@ func (hc *HttpClient) Do(ctx context.Context, request *Request) (*Response, erro
 	if slog.Default().Enabled(ctx, slog.LevelDebug) {
 		slog.DebugContext(ctx, "HTTP request success",
 			slog.String("method", rawReq.Method),
-			slog.String("url", rawReq.URL.String()),
 			slog.Int("status_code", rawResp.StatusCode),
-			slog.String("body", string(body)))
+			slog.Int("body_bytes", len(body)))
 	}
 
 	// Build generic response
@@ -292,7 +293,10 @@ func (hc *HttpClient) Do(ctx context.Context, request *Request) (*Response, erro
 
 // DoStream executes a streaming HTTP request using Server-Sent Events.
 func (hc *HttpClient) DoStream(ctx context.Context, request *Request) (streams.Stream[*StreamEvent], error) {
-	slog.DebugContext(ctx, "execute stream request", slog.Any("request", request))
+	slog.DebugContext(ctx, "execute stream request",
+		slog.String("request_type", request.RequestType),
+		slog.String("api_format", request.APIFormat),
+		slog.Int("body_bytes", len(request.Body)))
 
 	rawReq, err := hc.BuildHttpRequest(ctx, request)
 	if err != nil {
@@ -334,9 +338,8 @@ func (hc *HttpClient) DoStream(ctx context.Context, request *Request) (streams.S
 		if slog.Default().Enabled(ctx, slog.LevelDebug) {
 			slog.DebugContext(ctx, "HTTP stream request failed",
 				slog.String("method", rawReq.Method),
-				slog.String("url", rawReq.URL.String()),
 				slog.Int("status_code", rawResp.StatusCode),
-				slog.String("body", string(body)))
+				slog.Int("error_body_bytes", len(body)))
 		}
 
 		return nil, &Error{

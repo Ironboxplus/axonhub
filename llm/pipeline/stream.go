@@ -294,7 +294,16 @@ func (p *pipeline) stream(
 ) (streams.Stream[*httpclient.StreamEvent], error) {
 	streamCtx, firstEventGuard := newFirstEventTimeoutGuard(ctx, firstEventTimeout)
 
+	startedAt := observationStart(ctx)
 	outboundStream, err := executor.DoStream(streamCtx, request)
+	statusCode := 0
+	if err == nil && outboundStream != nil {
+		statusCode = 200
+	}
+	observeStage(ctx, StageProviderExchange, startedAt, err, observationData{
+		inputBytes: int64(requestBodySize(request)),
+		statusCode: statusCode,
+	})
 	if firstEventGuard.timedOut() {
 		if outboundStream != nil {
 			outboundStream.Close()
@@ -323,9 +332,12 @@ func (p *pipeline) stream(
 	}
 
 	// Apply raw stream middlewares
+	outboundStream = observeStream(ctx, StageProviderStream, outboundStream, rawStreamEventSize)
 	rawStream := outboundStream
 
+	startedAt = observationStart(ctx)
 	outboundStream, err = p.applyRawStreamMiddlewares(ctx, outboundStream)
+	observeStage(ctx, StageRawResponseMiddleware, startedAt, err, observationData{})
 	if err != nil {
 		rawStream.Close()
 		err = firstEventGuard.finishBeforeFirstEvent(err)
@@ -338,22 +350,16 @@ func (p *pipeline) stream(
 		return nil, fmt.Errorf("failed to apply raw stream middlewares: %w", err)
 	}
 
-	if slog.Default().Enabled(ctx, slog.LevelDebug) {
-		outboundStream = streams.Map(outboundStream,
-			func(event *httpclient.StreamEvent) *httpclient.StreamEvent {
-				slog.DebugContext(ctx, "Outbound stream event", slog.Any("event", event))
-				return event
-			},
-		)
-	}
-
+	startedAt = observationStart(ctx)
 	llmStream, err := p.Outbound.TransformStream(ctx, request, outboundStream)
+	observeStage(ctx, StageProviderStreamTransform, startedAt, err, observationData{})
 	if err != nil {
 		outboundStream.Close()
 		err = firstEventGuard.finishBeforeFirstEvent(err)
 		p.applyRawErrorResponseMiddlewares(ctx, err)
 
-		slog.ErrorContext(ctx, "Failed to transform streaming request", slog.Any("error", err))
+		slog.ErrorContext(ctx, "failed to transform provider stream",
+			slog.String("error_class", string(classifyObservationError(StageProviderStreamTransform, err))))
 
 		if errors.Is(err, ErrStreamFirstEventTimeout) {
 			return nil, err
@@ -362,10 +368,13 @@ func (p *pipeline) stream(
 		return nil, WrapUpstreamError(err)
 	}
 
+	llmStream = observeStream(ctx, StageUnifiedStream, llmStream, unifiedStreamEventSize)
 	rawLlmStream := llmStream
 
 	// Apply LLM stream middlewares
+	startedAt = observationStart(ctx)
 	llmStream, err = p.applyLlmStreamMiddlewares(ctx, llmStream)
+	observeStage(ctx, StageUnifiedStreamMiddleware, startedAt, err, observationData{})
 	if err != nil {
 		rawLlmStream.Close()
 		err = firstEventGuard.finishBeforeFirstEvent(err)
@@ -378,19 +387,14 @@ func (p *pipeline) stream(
 		return nil, fmt.Errorf("failed to apply llm stream middlewares: %w", err)
 	}
 
-	if slog.Default().Enabled(ctx, slog.LevelDebug) {
-		llmStream = streams.Map(llmStream, func(event *llm.Response) *llm.Response {
-			slog.DebugContext(ctx, "LLM stream event", slog.Any("event", event))
-			return event
-		})
-	}
-
 	// Check stream start before the handler commits the response. This enforces
 	// first-event timeout, empty-response detection, and pre-content retry.
 	if p.emptyResponseDetection || firstEventTimeout > 0 || p.hasStreamRetryBudget() {
 		rawLlmStream := llmStream
 
+		startedAt = observationStart(ctx)
 		llmStream, err = p.preReadLlmStream(ctx, llmStream, firstEventGuard)
+		observeStage(ctx, StageStreamPrelude, startedAt, err, observationData{})
 		if err != nil {
 			rawLlmStream.Close()
 			err = firstEventGuard.finishBeforeFirstEvent(err)
@@ -406,20 +410,25 @@ func (p *pipeline) stream(
 		firstEventGuard.stop()
 	}
 
+	startedAt = observationStart(ctx)
 	inboundStream, err := p.Inbound.TransformStream(ctx, llmStream)
+	observeStage(ctx, StageClientStreamTransform, startedAt, err, observationData{})
 	if err != nil {
 		llmStream.Close()
 		firstEventGuard.cancelStream()
 		p.applyRawErrorResponseMiddlewares(ctx, err)
 
-		slog.ErrorContext(ctx, "Failed to transform streaming request", slog.Any("error", err))
+		slog.ErrorContext(ctx, "failed to transform client stream",
+			slog.String("error_class", string(classifyObservationError(StageClientStreamTransform, err))))
 
 		return nil, err
 	}
 
 	rawInboundStream := inboundStream
 
+	startedAt = observationStart(ctx)
 	inboundStream, err = p.applyInboundRawStreamMiddlewares(ctx, inboundStream)
+	observeStage(ctx, StageClientStreamMiddleware, startedAt, err, observationData{})
 	if err != nil {
 		rawInboundStream.Close()
 		firstEventGuard.cancelStream()
@@ -428,15 +437,7 @@ func (p *pipeline) stream(
 		return nil, fmt.Errorf("failed to apply inbound raw stream middlewares: %w", err)
 	}
 
-	if slog.Default().Enabled(ctx, slog.LevelDebug) {
-		inboundStream = streams.Map(
-			inboundStream,
-			func(event *httpclient.StreamEvent) *httpclient.StreamEvent {
-				slog.DebugContext(ctx, "Inbound stream event", slog.Any("event", event))
-				return event
-			},
-		)
-	}
+	inboundStream = observeStream(ctx, StageClientStream, inboundStream, rawStreamEventSize)
 
 	if firstEventGuard != nil {
 		inboundStream = &cancelOnCloseStream{

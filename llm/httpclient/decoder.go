@@ -154,7 +154,9 @@ func (s *defaultSSEDecoder) Next() bool {
 		return false
 	}
 
-	slog.DebugContext(s.ctx, "SSE event received", slog.Any("event", event))
+	slog.DebugContext(s.ctx, "SSE event received",
+		slog.String("event_type", event.Type),
+		slog.Int("data_bytes", len(event.Data)))
 
 	s.current = &StreamEvent{
 		LastEventID: event.LastEventID,
