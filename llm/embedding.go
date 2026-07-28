@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 )
@@ -17,22 +18,23 @@ type EmbeddingInput struct {
 	StringArray   []string  `json:"string_array,omitempty"`
 	IntArray      []int64   `json:"int_array,omitempty"`
 	IntArrayArray [][]int64 `json:"int_array_array,omitempty"`
+	inputType     string
 }
 
 func (e EmbeddingInput) MarshalJSON() ([]byte, error) {
-	if e.String != "" {
+	if e.inputType == EmbeddingInputTypeString || e.String != "" {
 		return json.Marshal(e.String)
 	}
 
-	if len(e.StringArray) > 0 {
+	if e.inputType == EmbeddingInputTypeStringArray || e.StringArray != nil {
 		return json.Marshal(e.StringArray)
 	}
 
-	if len(e.IntArray) > 0 {
+	if e.inputType == EmbeddingInputTypeIntArray || e.IntArray != nil {
 		return json.Marshal(e.IntArray)
 	}
 
-	if len(e.IntArrayArray) > 0 {
+	if e.inputType == EmbeddingInputTypeIntArrayArray || e.IntArrayArray != nil {
 		return json.Marshal(e.IntArrayArray)
 	}
 
@@ -40,11 +42,16 @@ func (e EmbeddingInput) MarshalJSON() ([]byte, error) {
 }
 
 func (e *EmbeddingInput) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return fmt.Errorf("invalid embedding input type")
+	}
+
 	var str string
 
 	err := json.Unmarshal(data, &str)
 	if err == nil {
-		e.String = str
+		*e = EmbeddingInput{String: str, inputType: EmbeddingInputTypeString}
 		return nil
 	}
 
@@ -52,7 +59,7 @@ func (e *EmbeddingInput) UnmarshalJSON(data []byte) error {
 
 	err = json.Unmarshal(data, &strArray)
 	if err == nil {
-		e.StringArray = strArray
+		*e = EmbeddingInput{StringArray: strArray, inputType: EmbeddingInputTypeStringArray}
 		return nil
 	}
 
@@ -60,7 +67,7 @@ func (e *EmbeddingInput) UnmarshalJSON(data []byte) error {
 
 	err = json.Unmarshal(data, &intArray)
 	if err == nil {
-		e.IntArray = intArray
+		*e = EmbeddingInput{IntArray: intArray, inputType: EmbeddingInputTypeIntArray}
 		return nil
 	}
 
@@ -68,7 +75,7 @@ func (e *EmbeddingInput) UnmarshalJSON(data []byte) error {
 
 	err = json.Unmarshal(data, &intArrayArray)
 	if err == nil {
-		e.IntArrayArray = intArrayArray
+		*e = EmbeddingInput{IntArrayArray: intArrayArray, inputType: EmbeddingInputTypeIntArrayArray}
 		return nil
 	}
 
@@ -76,19 +83,23 @@ func (e *EmbeddingInput) UnmarshalJSON(data []byte) error {
 }
 
 func (e EmbeddingInput) GetType() string {
+	if e.inputType != "" {
+		return e.inputType
+	}
+
 	if e.String != "" {
 		return EmbeddingInputTypeString
 	}
 
-	if len(e.StringArray) > 0 {
+	if e.StringArray != nil {
 		return EmbeddingInputTypeStringArray
 	}
 
-	if len(e.IntArray) > 0 {
+	if e.IntArray != nil {
 		return EmbeddingInputTypeIntArray
 	}
 
-	if len(e.IntArrayArray) > 0 {
+	if e.IntArrayArray != nil {
 		return EmbeddingInputTypeIntArrayArray
 	}
 
@@ -153,26 +164,32 @@ type EmbeddingData struct {
 type Embedding struct {
 	Embedding []float64 `json:"embedding,omitempty"`
 	Base64    string    `json:"base64,omitempty"`
+	valueType string
 }
 
 func (e Embedding) MarshalJSON() ([]byte, error) {
-	if len(e.Embedding) > 0 {
+	if e.valueType == "float_array" || e.Embedding != nil {
 		return json.Marshal(e.Embedding)
 	}
 
-	if e.Base64 != "" {
+	if e.valueType == "base64" || e.Base64 != "" {
 		return json.Marshal(e.Base64)
 	}
 
-	return json.Marshal(nil)
+	return json.Marshal([]float64{})
 }
 
 func (e *Embedding) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return fmt.Errorf("invalid embedding type")
+	}
+
 	var str string
 
 	err := json.Unmarshal(data, &str)
 	if err == nil {
-		e.Base64 = str
+		*e = Embedding{Base64: str, valueType: "base64"}
 		return nil
 	}
 
@@ -180,7 +197,7 @@ func (e *Embedding) UnmarshalJSON(data []byte) error {
 
 	err = json.Unmarshal(data, &floatArray)
 	if err == nil {
-		e.Embedding = floatArray
+		*e = Embedding{Embedding: floatArray, valueType: "float_array"}
 		return nil
 	}
 
