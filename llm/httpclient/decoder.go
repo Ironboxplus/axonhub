@@ -53,16 +53,37 @@ func NewSSEDecoderWithMaxEventSize(ctx context.Context, rc io.ReadCloser, maxEve
 	if maxEventSize <= 0 {
 		maxEventSize = 32 * 1024 * 1024
 	}
-	return &defaultSSEDecoder{
+	decoder := &defaultSSEDecoder{
 		ctx:    ctx,
 		reader: rc,
-		// sseStream: sse.NewStream(rc),
-		// 图片生成需要大量数据，设置最大事件大小
-		sseStream: sse.NewStreamWithConfig(rc, &sse.StreamConfig{
-			MaxEventSize: maxEventSize,
-		}),
 	}
+	trackedReader := &eofTrackingReadCloser{ReadCloser: rc, eof: &decoder.sourceEOF}
+	// Image-generation events can be large, so retain an explicit configurable
+	// bound instead of the dependency's much smaller default.
+	decoder.sseStream = sse.NewStreamWithConfig(trackedReader, &sse.StreamConfig{
+		MaxEventSize: maxEventSize,
+	})
+	return decoder
 }
+
+// eofTrackingReadCloser records physical EOF without changing reader
+// semantics. The looplj/go-sse fork currently panics if Recv is called after
+// it emitted an unterminated final event at EOF; the decoder uses this signal
+// to recognize only that dependency bug while still surfacing other panics.
+type eofTrackingReadCloser struct {
+	io.ReadCloser
+	eof *atomic.Bool
+}
+
+func (r *eofTrackingReadCloser) Read(buffer []byte) (int, error) {
+	n, err := r.ReadCloser.Read(buffer)
+	if errors.Is(err, io.EOF) && r.eof != nil {
+		r.eof.Store(true)
+	}
+	return n, err
+}
+
+var errSSEDecoderPanic = errors.New("SSE decoder panicked")
 
 // Ensure defaultSSEDecoder implements StreamDecoder.
 var _ StreamDecoder = (*defaultSSEDecoder)(nil)
@@ -119,6 +140,7 @@ type defaultSSEDecoder struct {
 	err       error
 
 	closed    atomic.Bool
+	sourceEOF atomic.Bool
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -144,7 +166,7 @@ func (s *defaultSSEDecoder) Next() bool {
 	default:
 	}
 
-	event, err := s.sseStream.Recv()
+	event, err := s.recv()
 	if err != nil {
 		if errors.Is(err, io.EOF) {
 			slog.DebugContext(s.ctx, "SSE stream closed")
@@ -175,6 +197,25 @@ func (s *defaultSSEDecoder) Next() bool {
 	}
 
 	return true
+}
+
+// recv contains the recovery boundary around the third-party SSE parser. Its
+// parser clears its scanner after EOF and then dereferences that scanner if a
+// final unterminated event made the caller invoke Recv once more. EOF is known
+// independently through eofTrackingReadCloser, so that exact panic is safely
+// equivalent to io.EOF. A panic before physical EOF remains a real decoder
+// error and is never silently converted into successful completion.
+func (s *defaultSSEDecoder) recv() (event sse.Event, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			if s.sourceEOF.Load() {
+				err = io.EOF
+				return
+			}
+			err = errSSEDecoderPanic
+		}
+	}()
+	return s.sseStream.Recv()
 }
 
 // Current returns the current event data.
