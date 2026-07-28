@@ -22,6 +22,18 @@ type Request struct {
 	ContentType string      `json:"content_type"`
 	Body        []byte      `json:"body,omitempty"`
 
+	// BodySource provides a replayable, read-once body for large requests that
+	// must not be materialized in memory (for example multipart image edits).
+	// BuildHttpRequest calls Open once per transport attempt. Body and
+	// BodySource are mutually exclusive.
+	BodySource BodySource `json:"-"`
+
+	// ResponseBodyMode controls how a successful non-streaming HTTP response is
+	// returned. The default buffers Body for semantic transformation. Stream
+	// mode transfers ownership of Response.BodyStream to the caller and is
+	// intended for explicit same-protocol large-payload passthroughs.
+	ResponseBodyMode ResponseBodyMode `json:"-"`
+
 	// JSONBody is a json representation of the request body.
 	// For some scenario, the request body is not a json, but we still need to marshal it to json for the request.
 	// For example, the image edit api.
@@ -58,6 +70,22 @@ type Request struct {
 	SkipInboundQueryMerge bool `json:"-"`
 }
 
+// BodySource is a replayable request body. Implementations must return a new
+// reader on every Open call and remain valid until their owner closes them.
+// Size returns -1 when the encoded length is unknown (for example a streaming
+// multipart rewrite), causing net/http to use chunked transfer encoding.
+type BodySource interface {
+	Open(ctx context.Context) (io.ReadCloser, error)
+	Size() int64
+}
+
+type ResponseBodyMode string
+
+const (
+	ResponseBodyModeBuffered ResponseBodyMode = ""
+	ResponseBodyModeStream   ResponseBodyMode = "stream"
+)
+
 // AuthConfig represents authentication configuration.
 type AuthConfig struct {
 	// Type represents the type of authentication.
@@ -90,6 +118,11 @@ type Response struct {
 	// Response body, for the non-streaming response.
 	Body []byte `json:"body,omitempty"`
 
+	// BodyStream is set only for an explicitly requested streaming successful
+	// response body. The caller owns it and must call Close. It is separate from
+	// Stream, which represents provider event streams handled by DoStream.
+	BodyStream io.ReadCloser `json:"-"`
+
 	// Streaming support
 	Stream io.ReadCloser `json:"-"`
 
@@ -101,6 +134,15 @@ type Response struct {
 
 	// Raw HTTP request for advanced use cases
 	RawRequest *http.Request `json:"-"`
+}
+
+func (r *Response) Close() error {
+	if r == nil || r.BodyStream == nil {
+		return nil
+	}
+	err := r.BodyStream.Close()
+	r.BodyStream = nil
+	return err
 }
 
 type StreamEvent struct {

@@ -229,7 +229,7 @@ func (hc *HttpClient) Do(ctx context.Context, request *Request) (*Response, erro
 	slog.DebugContext(ctx, "execute http request",
 		slog.String("request_type", request.RequestType),
 		slog.String("api_format", request.APIFormat),
-		slog.Int("body_bytes", len(request.Body)))
+		slog.Int64("body_bytes", requestBodySize(request)))
 
 	rawReq, err := hc.BuildHttpRequest(ctx, request)
 	if err != nil {
@@ -247,19 +247,17 @@ func (hc *HttpClient) Do(ctx context.Context, request *Request) (*Response, erro
 		return nil, fmt.Errorf("HTTP request failed: %w", err)
 	}
 
-	defer func() {
-		err := rawResp.Body.Close()
-		if err != nil {
-			slog.WarnContext(ctx, "failed to close HTTP response body", slog.Any("error", err))
-		}
-	}()
-
 	var body []byte
 	// Cap error response bodies at 1 MB to prevent OOM from pathological
 	// upstream error bodies (e.g., vLLM echoing multi-MB input in validation
 	// errors). Successful responses are read in full because they are
 	// typically small JSON payloads.
 	if rawResp.StatusCode >= 400 {
+		defer func() {
+			if closeErr := rawResp.Body.Close(); closeErr != nil {
+				slog.WarnContext(ctx, "failed to close HTTP error response body", slog.String("error_class", "response_close"))
+			}
+		}()
 		body, err = io.ReadAll(io.LimitReader(rawResp.Body, MaxErrorBodySize))
 		if err != nil {
 			return nil, fmt.Errorf("failed to read error response body: %w", err)
@@ -281,6 +279,23 @@ func (hc *HttpClient) Do(ctx context.Context, request *Request) (*Response, erro
 			Headers:    rawResp.Header,
 		}
 	}
+
+	if request.ResponseBodyMode == ResponseBodyModeStream {
+		return &Response{
+			StatusCode:  rawResp.StatusCode,
+			Headers:     rawResp.Header,
+			BodyStream:  rawResp.Body,
+			RawResponse: rawResp,
+			Request:     request,
+			RawRequest:  rawReq,
+		}, nil
+	}
+
+	defer func() {
+		if closeErr := rawResp.Body.Close(); closeErr != nil {
+			slog.WarnContext(ctx, "failed to close HTTP response body", slog.String("error_class", "response_close"))
+		}
+	}()
 
 	body, err = io.ReadAll(rawResp.Body)
 	if err != nil {
@@ -313,7 +328,7 @@ func (hc *HttpClient) DoStream(ctx context.Context, request *Request) (streams.S
 	slog.DebugContext(ctx, "execute stream request",
 		slog.String("request_type", request.RequestType),
 		slog.String("api_format", request.APIFormat),
-		slog.Int("body_bytes", len(request.Body)))
+		slog.Int64("body_bytes", requestBodySize(request)))
 
 	rawReq, err := hc.BuildHttpRequest(ctx, request)
 	if err != nil {
@@ -406,14 +421,39 @@ func BuildHttpRequest(
 	ctx context.Context,
 	request *Request,
 ) (*http.Request, error) {
+	if request == nil {
+		return nil, errors.New("request is nil")
+	}
 	var body io.Reader
-	if len(request.Body) > 0 {
+	var sourceBody io.ReadCloser
+	sourceSize := int64(-1)
+	if request.BodySource != nil && len(request.Body) > 0 {
+		return nil, errors.New("request Body and BodySource are mutually exclusive")
+	}
+	if request.BodySource != nil {
+		sourceSize = request.BodySource.Size()
+		var err error
+		sourceBody, err = request.BodySource.Open(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("open request body source: %w", err)
+		}
+		if sourceBody == nil {
+			return nil, errors.New("request body source returned a nil reader")
+		}
+		body = sourceBody
+	} else if len(request.Body) > 0 {
 		body = bytes.NewReader(request.Body)
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, request.Method, request.URL, body)
 	if err != nil {
+		if sourceBody != nil {
+			_ = sourceBody.Close()
+		}
 		return nil, err
+	}
+	if sourceSize >= 0 {
+		httpReq.ContentLength = sourceSize
 	}
 
 	httpReq.Header = request.Headers
@@ -438,6 +478,9 @@ func BuildHttpRequest(
 	if request.Auth != nil {
 		err = applyAuth(httpReq.Header, request.Auth)
 		if err != nil {
+			if sourceBody != nil {
+				_ = sourceBody.Close()
+			}
 			return nil, fmt.Errorf("failed to apply authentication: %w", err)
 		}
 	}
@@ -451,6 +494,16 @@ func BuildHttpRequest(
 	}
 
 	return httpReq, nil
+}
+
+func requestBodySize(request *Request) int64 {
+	if request == nil {
+		return 0
+	}
+	if request.BodySource != nil {
+		return request.BodySource.Size()
+	}
+	return int64(len(request.Body))
 }
 
 // BuildHttpRequest builds an HTTP request from Request.

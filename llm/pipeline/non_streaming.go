@@ -26,7 +26,7 @@ func (p *pipeline) notStream(
 	}
 	observeStage(ctx, StageProviderExchange, startedAt, err, observationData{
 		statusCode:  statusCode,
-		inputBytes:  int64(requestBodySize(request)),
+		inputBytes:  requestBodySize(request),
 		outputBytes: outputBytes,
 	})
 	if err != nil {
@@ -57,6 +57,25 @@ func (p *pipeline) notStream(
 		p.applyRawErrorResponseMiddlewares(ctx, err)
 
 		return nil, fmt.Errorf("failed to apply raw response middlewares: %w", err)
+	}
+
+	// Explicit large-body passthrough keeps successful image/media payloads out
+	// of memory. Request transformation and raw middlewares have already run;
+	// semantic response transformation is intentionally skipped because the
+	// caller requested the provider's same-protocol wire representation.
+	if httpResp != nil && httpResp.BodyStream != nil {
+		startedAt = observationStart(ctx)
+		finalResp, passthroughErr := p.applyInboundRawResponseMiddlewares(ctx, httpResp)
+		statusCode = httpResp.StatusCode
+		observeStage(ctx, StageRawResponsePassthrough, startedAt, passthroughErr, observationData{
+			statusCode: statusCode,
+		})
+		if passthroughErr != nil {
+			_ = httpResp.Close()
+			p.applyRawErrorResponseMiddlewares(ctx, passthroughErr)
+			return nil, fmt.Errorf("failed to apply passthrough response middleware: %w", passthroughErr)
+		}
+		return finalResp, nil
 	}
 
 	startedAt = observationStart(ctx)

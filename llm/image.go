@@ -66,3 +66,19 @@ type ImageData struct {
 	URL           string `json:"url,omitempty"`
 	RevisedPrompt string `json:"revised_prompt,omitempty"`
 }
+
+// ImageStreamEvent is the provider-neutral form of an image generation SSE
+// event. Type is typically image_generation.partial_image or
+// image_generation.completed. B64JSON and URL are mutually exclusive wire
+// representations of the same image payload.
+type ImageStreamEvent struct {
+	Type              string `json:"type"`
+	B64JSON           string `json:"b64_json,omitempty"`
+	URL               string `json:"url,omitempty"`
+	PartialImageIndex *int64 `json:"partial_image_index,omitempty"`
+	Created           int64  `json:"created,omitempty"`
+	Background        string `json:"background,omitempty"`
+	OutputFormat      string `json:"output_format,omitempty"`
+	Quality           string `json:"quality,omitempty"`
+	Size              string `json:"size,omitempty"`
+}

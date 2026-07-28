@@ -23,6 +23,29 @@ func ReadHTTPRequest(rawReq *http.Request) (*Request, error) {
 	return ReadHTTPRequestWithLimit(rawReq, 0)
 }
 
+// NewRequestWithBodySource captures HTTP metadata without consuming the body.
+// It is used by callers that already spooled and bounded a large request. The
+// source remains owned by the caller and must outlive every pipeline attempt.
+func NewRequestWithBodySource(rawReq *http.Request, source BodySource) (*Request, error) {
+	if rawReq == nil {
+		return nil, errors.New("raw HTTP request is nil")
+	}
+	if source == nil {
+		return nil, errors.New("request body source is nil")
+	}
+	return &Request{
+		Method:     rawReq.Method,
+		URL:        rawReq.URL.String(),
+		Path:       rawReq.URL.Path,
+		Query:      rawReq.URL.Query(),
+		Headers:    rawReq.Header.Clone(),
+		BodySource: source,
+		Auth:       &AuthConfig{},
+		ClientIP:   getClientIP(rawReq),
+		RawRequest: rawReq,
+	}, nil
+}
+
 // ReadHTTPRequestWithLimit enforces maxBodyBytes on both the transport body
 // and the decoded representation. A non-positive limit preserves the legacy
 // unbounded behavior.

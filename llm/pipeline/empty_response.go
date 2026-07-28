@@ -80,6 +80,10 @@ func hasResponseContent(resp *llm.Response) bool {
 		return true
 	}
 
+	if resp.ImageStreamEvent != nil && (resp.ImageStreamEvent.B64JSON != "" || resp.ImageStreamEvent.URL != "") {
+		return true
+	}
+
 	if resp.Video != nil &&
 		(resp.Video.ID != "" || resp.Video.Status != "" || resp.Video.VideoURL != "" || resp.Video.Error != nil) {
 		return true

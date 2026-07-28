@@ -12,8 +12,6 @@ import (
 	"net/textproto"
 	"strings"
 
-	"github.com/samber/lo"
-
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/transformer"
@@ -22,8 +20,6 @@ import (
 // buildImageGenerationAPIRequest builds the HTTP request to call the OpenAI Image Generation API.
 // based on whether images are present in the request.
 func (t *OutboundTransformer) buildImageGenerationAPIRequest(ctx context.Context, chatReq *llm.Request) (*httpclient.Request, error) {
-	chatReq.Stream = lo.ToPtr(false)
-
 	if chatReq.Image == nil {
 		return nil, fmt.Errorf("image request is required")
 	}
@@ -135,6 +131,11 @@ func (t *OutboundTransformer) buildImageGenerateRequest(chatReq *llm.Request, ap
 		reqBody["response_format"] = img.ResponseFormat
 	}
 
+	stream := chatReq.Stream != nil && *chatReq.Stream
+	if stream {
+		reqBody["stream"] = true
+	}
+
 	if supportsImageGenerationResponseFormat(chatReq.Model) {
 		if _, ok := reqBody["response_format"]; !ok {
 			reqBody["response_format"] = "b64_json"
@@ -149,7 +150,11 @@ func (t *OutboundTransformer) buildImageGenerateRequest(chatReq *llm.Request, ap
 	// Prepare headers
 	headers := make(http.Header)
 	headers.Set("Content-Type", "application/json")
-	headers.Set("Accept", "application/json")
+	if stream {
+		headers.Set("Accept", "text/event-stream")
+	} else {
+		headers.Set("Accept", "application/json")
+	}
 
 	// Build URL
 	url := t.config.BaseURL + "/images/generations"
@@ -163,13 +168,17 @@ func (t *OutboundTransformer) buildImageGenerateRequest(chatReq *llm.Request, ap
 		APIKey: apiKey,
 	}
 
-	return &httpclient.Request{
+	request := &httpclient.Request{
 		Method:  http.MethodPost,
 		URL:     url,
 		Headers: headers,
 		Body:    body,
 		Auth:    auth,
-	}, nil
+	}
+	if chatReq.RawResponsePassthrough && !stream {
+		request.ResponseBodyMode = httpclient.ResponseBodyModeStream
+	}
+	return request, nil
 }
 
 // buildImageEditRequest builds request for Image Edit API (images/edits).
@@ -181,6 +190,9 @@ func (t *OutboundTransformer) buildImageEditRequest(chatReq *llm.Request, apiKey
 	prompt := chatReq.Image.Prompt
 	if prompt == "" {
 		return nil, fmt.Errorf("prompt is required for image generation")
+	}
+	if chatReq.RawRequest != nil && chatReq.RawRequest.BodySource != nil {
+		return t.buildSourceBackedImageRequest(chatReq, apiKey, imageMultipartEdit)
 	}
 
 	var (
@@ -392,7 +404,7 @@ func (t *OutboundTransformer) buildImageEditRequest(chatReq *llm.Request, apiKey
 		return nil, fmt.Errorf("failed to marshal JSON body: %w", err)
 	}
 
-	return &httpclient.Request{
+	request := &httpclient.Request{
 		Method:      http.MethodPost,
 		URL:         url,
 		Headers:     headers,
@@ -400,11 +412,18 @@ func (t *OutboundTransformer) buildImageEditRequest(chatReq *llm.Request, apiKey
 		Body:        body.Bytes(),
 		JSONBody:    jsonBodyBytes,
 		Auth:        auth,
-	}, nil
+	}
+	if chatReq.RawResponsePassthrough {
+		request.ResponseBodyMode = httpclient.ResponseBodyModeStream
+	}
+	return request, nil
 }
 
 func (t *OutboundTransformer) buildImageVariationRequest(chatReq *llm.Request, apiKey string) (*httpclient.Request, error) {
 	model := chatReq.Model
+	if chatReq.RawRequest != nil && chatReq.RawRequest.BodySource != nil {
+		return t.buildSourceBackedImageRequest(chatReq, apiKey, imageMultipartVariation)
+	}
 
 	var formFiles []FormFile
 
@@ -514,7 +533,7 @@ func (t *OutboundTransformer) buildImageVariationRequest(chatReq *llm.Request, a
 		return nil, fmt.Errorf("failed to marshal JSON body: %w", err)
 	}
 
-	return &httpclient.Request{
+	request := &httpclient.Request{
 		Method:      http.MethodPost,
 		URL:         url,
 		Headers:     headers,
@@ -522,7 +541,11 @@ func (t *OutboundTransformer) buildImageVariationRequest(chatReq *llm.Request, a
 		Body:        body.Bytes(),
 		JSONBody:    jsonBodyBytes,
 		Auth:        auth,
-	}, nil
+	}
+	if chatReq.RawResponsePassthrough {
+		request.ResponseBodyMode = httpclient.ResponseBodyModeStream
+	}
+	return request, nil
 }
 
 type FormFile struct {

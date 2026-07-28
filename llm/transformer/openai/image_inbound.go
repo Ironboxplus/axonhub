@@ -26,9 +26,10 @@ import (
 )
 
 const (
-	defaultMaxImageFileSize = 50 * 1024 * 1024
-	maxImageCount           = 16
-	maxImageBodySize        = defaultMaxImageFileSize*maxImageCount + 16*1024*1024
+	defaultMaxImageFileSize   = 50 * 1024 * 1024
+	maxImageCount             = 16
+	maxImageBodySize          = defaultMaxImageFileSize*maxImageCount + 16*1024*1024
+	maxImageSemanticFieldSize = 1 * 1024 * 1024
 )
 
 var maxImageFileSize = initMaxImageFileSize()
@@ -100,7 +101,7 @@ func (t *ImageInboundTransformer) TransformRequest(ctx context.Context, httpReq 
 		return nil, fmt.Errorf("%w: http request is nil", transformer.ErrInvalidRequest)
 	}
 
-	if len(httpReq.Body) == 0 {
+	if len(httpReq.Body) == 0 && httpReq.BodySource == nil {
 		return nil, fmt.Errorf("%w: request body is empty", transformer.ErrInvalidRequest)
 	}
 
@@ -109,9 +110,9 @@ func (t *ImageInboundTransformer) TransformRequest(ctx context.Context, httpReq 
 	case llm.APIFormatOpenAIImageGeneration:
 		return t.transformGenerationRequest(httpReq)
 	case llm.APIFormatOpenAIImageEdit:
-		return t.transformEditRequest(httpReq)
+		return t.transformEditRequest(ctx, httpReq)
 	case llm.APIFormatOpenAIImageVariation:
-		return t.transformVariationRequest(httpReq)
+		return t.transformVariationRequest(ctx, httpReq)
 	default:
 		return nil, fmt.Errorf("%w: unknown image api format: %s", transformer.ErrInvalidRequest, t.apiFormat)
 	}
@@ -184,7 +185,10 @@ func (t *ImageInboundTransformer) TransformResponse(ctx context.Context, llmResp
 }
 
 func (t *ImageInboundTransformer) TransformStream(ctx context.Context, stream streams.Stream[*llm.Response]) (streams.Stream[*httpclient.StreamEvent], error) {
-	return nil, fmt.Errorf("%w: image request does not support streaming", transformer.ErrInvalidRequest)
+	if t.apiFormat != llm.APIFormatOpenAIImageGeneration {
+		return nil, fmt.Errorf("%w: only image generation supports streaming", transformer.ErrInvalidRequest)
+	}
+	return streams.NoNil(streams.MapErr(stream, renderImageStreamEvent)), nil
 }
 
 func (t *ImageInboundTransformer) TransformError(ctx context.Context, rawErr error) *httpclient.Error {
@@ -193,10 +197,48 @@ func (t *ImageInboundTransformer) TransformError(ctx context.Context, rawErr err
 }
 
 func (t *ImageInboundTransformer) AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent) ([]byte, llm.ResponseMeta, error) {
-	return nil, llm.ResponseMeta{}, fmt.Errorf("%w: image request does not support streaming", transformer.ErrInvalidRequest)
+	if t.apiFormat != llm.APIFormatOpenAIImageGeneration {
+		return nil, llm.ResponseMeta{}, fmt.Errorf("%w: only image generation supports streaming", transformer.ErrInvalidRequest)
+	}
+	response := ImagesResponse{Data: make([]ImageData, 0, 1)}
+	for _, chunk := range chunks {
+		if chunk == nil || bytes.HasPrefix(bytes.TrimSpace(chunk.Data), []byte("[DONE]")) {
+			continue
+		}
+		var event imageStreamWireEvent
+		if err := json.Unmarshal(chunk.Data, &event); err != nil {
+			return nil, llm.ResponseMeta{}, fmt.Errorf("failed to decode image stream chunk: %w", err)
+		}
+		if event.Type == "" {
+			event.Type = chunk.Type
+		}
+		if !strings.HasSuffix(event.Type, ".completed") {
+			continue
+		}
+		response.Created = event.Created
+		response.Background = event.Background
+		response.OutputFormat = event.OutputFormat
+		response.Quality = event.Quality
+		response.Size = event.Size
+		response.Usage = event.Usage
+		if event.B64JSON != "" || event.URL != "" {
+			response.Data = append(response.Data, ImageData{B64JSON: event.B64JSON, URL: event.URL})
+		}
+	}
+	if len(response.Data) == 0 {
+		return nil, llm.ResponseMeta{}, fmt.Errorf("%w: image stream did not contain a completed image", transformer.ErrInvalidResponse)
+	}
+	body, err := json.Marshal(response)
+	if err != nil {
+		return nil, llm.ResponseMeta{}, fmt.Errorf("failed to aggregate image stream: %w", err)
+	}
+	return body, llm.ResponseMeta{Usage: imageUsageToLLM(response.Usage), Completed: true}, nil
 }
 
 func (t *ImageInboundTransformer) transformGenerationRequest(httpReq *httpclient.Request) (*llm.Request, error) {
+	if httpReq.BodySource != nil {
+		return nil, fmt.Errorf("%w: generations requires a buffered JSON body", transformer.ErrInvalidRequest)
+	}
 	contentType := strings.ToLower(httpReq.Headers.Get("Content-Type"))
 	if !strings.Contains(contentType, "application/json") {
 		return nil, fmt.Errorf("%w: generations requires application/json", transformer.ErrInvalidRequest)
@@ -206,10 +248,6 @@ func (t *ImageInboundTransformer) transformGenerationRequest(httpReq *httpclient
 
 	if err := json.Unmarshal(httpReq.Body, &genReq); err != nil {
 		return nil, fmt.Errorf("%w: failed to decode generation request: %w", transformer.ErrInvalidRequest, err)
-	}
-
-	if genReq.Stream {
-		return nil, fmt.Errorf("%w: image generation does not support streaming", transformer.ErrInvalidRequest)
 	}
 
 	model := genReq.Model
@@ -239,7 +277,7 @@ func (t *ImageInboundTransformer) transformGenerationRequest(httpReq *httpclient
 	llmReq := &llm.Request{
 		Model:       model,
 		Modalities:  []string{"image"},
-		Stream:      lo.ToPtr(false),
+		Stream:      lo.ToPtr(genReq.Stream),
 		RawRequest:  httpReq,
 		RequestType: llm.RequestTypeImage,
 		APIFormat:   t.apiFormat,
@@ -249,8 +287,8 @@ func (t *ImageInboundTransformer) transformGenerationRequest(httpReq *httpclient
 	return llmReq, nil
 }
 
-func (t *ImageInboundTransformer) transformEditRequest(httpReq *httpclient.Request) (*llm.Request, error) {
-	formData, err := parseMultipartRequest(httpReq)
+func (t *ImageInboundTransformer) transformEditRequest(ctx context.Context, httpReq *httpclient.Request) (*llm.Request, error) {
+	formData, err := parseMultipartRequest(ctx, httpReq)
 	if err != nil {
 		return nil, err
 	}
@@ -320,8 +358,8 @@ func (t *ImageInboundTransformer) transformEditRequest(httpReq *httpclient.Reque
 	return llmReq, nil
 }
 
-func (t *ImageInboundTransformer) transformVariationRequest(httpReq *httpclient.Request) (*llm.Request, error) {
-	formData, err := parseMultipartRequest(httpReq)
+func (t *ImageInboundTransformer) transformVariationRequest(ctx context.Context, httpReq *httpclient.Request) (*llm.Request, error) {
+	formData, err := parseMultipartRequest(ctx, httpReq)
 	if err != nil {
 		return nil, err
 	}
@@ -376,8 +414,11 @@ func (t *ImageInboundTransformer) transformVariationRequest(httpReq *httpclient.
 }
 
 type multipartFile struct {
-	ContentType string
-	Data        []byte
+	Filename     string
+	ContentType  string
+	Data         []byte
+	Size         int64
+	SourceBacked bool
 }
 
 type imageFormData struct {
@@ -386,8 +427,11 @@ type imageFormData struct {
 	Fields map[string]string
 }
 
-func parseMultipartRequest(httpReq *httpclient.Request) (*imageFormData, error) {
-	if len(httpReq.Body) > maxImageBodySize {
+func parseMultipartRequest(ctx context.Context, httpReq *httpclient.Request) (*imageFormData, error) {
+	if httpReq.BodySource != nil && len(httpReq.Body) > 0 {
+		return nil, fmt.Errorf("%w: request body and body source are mutually exclusive", transformer.ErrInvalidRequest)
+	}
+	if len(httpReq.Body) > maxImageBodySize || httpReq.BodySource != nil && httpReq.BodySource.Size() > int64(maxImageBodySize) {
 		return nil, fmt.Errorf("%w: request body too large", transformer.ErrInvalidRequest)
 	}
 
@@ -407,7 +451,26 @@ func parseMultipartRequest(httpReq *httpclient.Request) (*imageFormData, error) 
 		return nil, fmt.Errorf("%w: missing boundary in content-type", transformer.ErrInvalidRequest)
 	}
 
-	reader := multipart.NewReader(bytes.NewReader(httpReq.Body), boundary)
+	var (
+		body         io.ReadCloser
+		sourceBacked bool
+	)
+	if httpReq.BodySource != nil {
+		body, err = httpReq.BodySource.Open(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("%w: failed to open multipart body", transformer.ErrInvalidRequest)
+		}
+		sourceBacked = true
+	} else {
+		body = io.NopCloser(bytes.NewReader(httpReq.Body))
+	}
+	defer body.Close()
+
+	// Bound unknown-size sources as well as each individual part. The context
+	// wrapper makes an initial validation scan of a disk-backed upload stop
+	// promptly when its client disconnects.
+	limitedBody := &io.LimitedReader{R: &contextReader{ctx: ctx, reader: body}, N: int64(maxImageBodySize) + 1}
+	reader := multipart.NewReader(limitedBody, boundary)
 
 	formData := &imageFormData{
 		Fields: map[string]string{},
@@ -429,12 +492,22 @@ func parseMultipartRequest(httpReq *httpclient.Request) (*imageFormData, error) 
 		filename := part.FileName()
 
 		if filename == "" {
-			value, err := io.ReadAll(io.LimitReader(part, int64(maxImageFileSize)+1))
+			fieldLimit := int64(maxImageFileSize)
+			if sourceBacked {
+				if !isImageSemanticField(fieldName) {
+					if _, err := io.Copy(io.Discard, part); err != nil {
+						return nil, fmt.Errorf("%w: failed to read multipart extension field", transformer.ErrInvalidRequest)
+					}
+					continue
+				}
+				fieldLimit = maxImageSemanticFieldSize
+			}
+			value, err := io.ReadAll(io.LimitReader(part, fieldLimit+1))
 			if err != nil {
 				return nil, fmt.Errorf("%w: failed to read multipart field", transformer.ErrInvalidRequest)
 			}
 
-			if len(value) > maxImageFileSize {
+			if int64(len(value)) > fieldLimit {
 				return nil, fmt.Errorf("%w: multipart field too large", transformer.ErrInvalidRequest)
 			}
 
@@ -450,17 +523,24 @@ func parseMultipartRequest(httpReq *httpclient.Request) (*imageFormData, error) 
 
 		contentType := strings.TrimSpace(part.Header.Get("Content-Type"))
 
-		data, err := io.ReadAll(io.LimitReader(part, int64(maxImageFileSize)+1))
+		fileLimit := int64(maxImageFileSize)
+		if sourceBacked {
+			// Replayable sources are expected to be bounded by their owner (and are
+			// additionally bounded by maxImageBodySize above). Allow Octopus' legacy
+			// single-file uploads up to that existing request limit without buffering.
+			fileLimit = int64(maxImageBodySize)
+		}
+		data, prefix, size, err := readMultipartFile(part, fileLimit, !sourceBacked)
 		if err != nil {
 			return nil, fmt.Errorf("%w: failed to read multipart file", transformer.ErrInvalidRequest)
 		}
 
-		if len(data) > maxImageFileSize {
+		if size > fileLimit {
 			return nil, fmt.Errorf("%w: file too large", transformer.ErrInvalidRequest)
 		}
 
 		if contentType == "" {
-			contentType = http.DetectContentType(lo.Ternary(len(data) > 512, data[:512], data))
+			contentType = http.DetectContentType(prefix)
 		}
 
 		if !isAllowedImageType(contentType) {
@@ -468,8 +548,11 @@ func parseMultipartRequest(httpReq *httpclient.Request) (*imageFormData, error) 
 		}
 
 		file := multipartFile{
-			ContentType: contentType,
-			Data:        data,
+			Filename:     filename,
+			ContentType:  contentType,
+			Data:         data,
+			Size:         size,
+			SourceBacked: sourceBacked,
 		}
 
 		switch fieldName {
@@ -480,13 +563,78 @@ func parseMultipartRequest(httpReq *httpclient.Request) (*imageFormData, error) 
 		default:
 		}
 	}
+	if _, err := io.Copy(io.Discard, limitedBody); err != nil {
+		return nil, fmt.Errorf("%w: failed to finish multipart body", transformer.ErrInvalidRequest)
+	}
+	if limitedBody.N <= 0 {
+		return nil, fmt.Errorf("%w: request body too large", transformer.ErrInvalidRequest)
+	}
 
 	return formData, nil
 }
 
+func isImageSemanticField(name string) bool {
+	switch name {
+	case "model", "prompt", "n", "quality", "response_format", "size", "style", "user",
+		"background", "output_format", "output_compression", "moderation", "partial_images",
+		"input_fidelity", "stream":
+		return true
+	default:
+		return false
+	}
+}
+
+type contextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r *contextReader) Read(p []byte) (int, error) {
+	select {
+	case <-r.ctx.Done():
+		return 0, r.ctx.Err()
+	default:
+		return r.reader.Read(p)
+	}
+}
+
+func readMultipartFile(part io.Reader, limit int64, retain bool) (data, prefix []byte, size int64, err error) {
+	limited := &io.LimitedReader{R: part, N: limit + 1}
+	var destination io.Writer = io.Discard
+	var body bytes.Buffer
+	if retain {
+		destination = &body
+	}
+
+	prefixWriter := &limitedPrefixWriter{remaining: 512}
+	size, err = io.Copy(io.MultiWriter(destination, prefixWriter), limited)
+	if err != nil {
+		return nil, nil, size, err
+	}
+	if retain {
+		data = body.Bytes()
+	}
+	return data, prefixWriter.bytes, size, nil
+}
+
+type limitedPrefixWriter struct {
+	bytes     []byte
+	remaining int
+}
+
+func (w *limitedPrefixWriter) Write(p []byte) (int, error) {
+	if w.remaining > 0 {
+		n := min(len(p), w.remaining)
+		w.bytes = append(w.bytes, p[:n]...)
+		w.remaining -= n
+	}
+	return len(p), nil
+}
+
 // buildMultipartJSONBody builds a JSON representation of a multipart/form-data request
-// suitable for logging. Binary image/mask data is encoded as base64 data URLs
-// so they can be displayed in the trace UI.
+// suitable for logging. Buffered bodies retain the legacy data-URL shape used
+// by the trace UI; source-backed bodies contain metadata only and never copy
+// binary payloads into JSONBody.
 func buildMultipartJSONBody(fields map[string]string, images []multipartFile, mask *multipartFile) ([]byte, error) {
 	body := make(map[string]any, len(fields)+2)
 
@@ -518,6 +666,9 @@ func buildMultipartJSONBody(fields map[string]string, images []multipartFile, ma
 }
 
 func multipartFileToDataURL(f multipartFile) string {
+	if f.SourceBacked {
+		return fmt.Sprintf("image:type=%s;size=%d", f.ContentType, f.Size)
+	}
 	// Use xurl.BuildDataURL (single exact-size concat) instead of fmt.Sprintf to
 	// avoid the printer's doubling-growth buffer churn on large base64 data.
 	return xurl.BuildDataURL(f.ContentType, base64.StdEncoding.EncodeToString(f.Data), true)

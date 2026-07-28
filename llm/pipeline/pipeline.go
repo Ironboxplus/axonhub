@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/looplj/axonhub/llm"
@@ -272,7 +274,7 @@ func (p *pipeline) Process(ctx context.Context, request *httpclient.Request) (*R
 	if trace != nil {
 		trace.setRequest(llmRequest)
 	}
-	observeStage(ctx, StageInboundTransform, startedAt, err, observationData{inputBytes: int64(requestBodySize(request))})
+	observeStage(ctx, StageInboundTransform, startedAt, err, observationData{inputBytes: requestBodySize(request)})
 	if err != nil {
 		return nil, err
 	}
@@ -470,19 +472,49 @@ func (p *pipeline) processRequest(ctx context.Context, request *llm.Request) (*R
 
 		timeoutCtx, cancel := p.withNonStreamTimeout(ctx)
 		response, err := p.notStream(timeoutCtx, executor, httpReq)
-		cancel()
 		if err != nil {
+			cancel()
 			if p.isNonStreamTimeout(timeoutCtx) {
 				return nil, ErrNonStreamResponseTimeout
 			}
 
 			return nil, err
 		}
+		if response != nil && response.BodyStream != nil {
+			// A passthrough response is still being read after Process returns. Keep
+			// its request/timeout context alive until the owner closes the body;
+			// canceling here would truncate real net/http response streams.
+			response.BodyStream = &cancelOnCloseReadCloser{
+				ReadCloser: response.BodyStream,
+				cancel:     cancel,
+			}
+		} else {
+			cancel()
+		}
 
 		result.Response = response
 	}
 
 	return result, nil
+}
+
+type cancelOnCloseReadCloser struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (r *cancelOnCloseReadCloser) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	if err != nil {
+		r.once.Do(r.cancel)
+	}
+	return n, err
+}
+
+func (r *cancelOnCloseReadCloser) Close() error {
+	r.once.Do(r.cancel)
+	return r.ReadCloser.Close()
 }
 
 // getMaxSameChannelRetries returns the maximum number of same-channel retries.

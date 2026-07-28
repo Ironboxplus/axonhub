@@ -261,6 +261,12 @@ type Request struct {
 	// RawRequest is the raw request from the client.
 	RawRequest *httpclient.Request `json:"raw_request,omitempty"`
 
+	// RawResponsePassthrough asks a compatible outbound transformer to return a
+	// successful non-streaming provider body as an owned stream. It is an
+	// internal transport hint for large same-protocol payloads and is never sent
+	// to providers.
+	RawResponsePassthrough bool `json:"-"`
+
 	// RequestType is the original inbound request type from the client.
 	// e.g. the request from the chat/completions endpoint is in the chat type.
 	// if it is embedding request, it will be embedding.
@@ -685,6 +691,9 @@ type Response struct {
 
 	// Image is the image response, will present if the request is image request.
 	Image *ImageResponse `json:"image,omitempty"`
+
+	// ImageStreamEvent carries one event from a streaming image generation API.
+	ImageStreamEvent *ImageStreamEvent `json:"image_stream_event,omitempty"`
 
 	// Video is the video response, will present if the request is video request.
 	Video *VideoResponse `json:"video,omitempty"`

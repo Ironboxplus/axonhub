@@ -26,6 +26,7 @@ const (
 	StageProviderExchange          Stage = "provider_exchange"
 	StageProviderStream            Stage = "provider_stream"
 	StageRawResponseMiddleware     Stage = "raw_response_middleware"
+	StageRawResponsePassthrough    Stage = "raw_response_passthrough"
 	StageProviderResponseTransform Stage = "provider_response_transform"
 	StageUnifiedResponseMiddleware Stage = "unified_response_middleware"
 	StageResponseValidation        Stage = "response_validation"
@@ -126,11 +127,17 @@ func newPipelineTrace(observer Observer, outboundAPIFormat llm.APIFormat) *pipel
 	}
 }
 
-func requestBodySize(request *httpclient.Request) int {
+func requestBodySize(request *httpclient.Request) int64 {
 	if request == nil {
 		return 0
 	}
-	return len(request.Body)
+	if request.BodySource != nil {
+		if size := request.BodySource.Size(); size > 0 {
+			return size
+		}
+		return 0
+	}
+	return int64(len(request.Body))
 }
 
 func withPipelineTrace(ctx context.Context, trace *pipelineTrace) context.Context {
@@ -341,6 +348,9 @@ func unifiedStreamEventSize(response *llm.Response) int64 {
 		return 0
 	}
 	var size int64
+	if response.ImageStreamEvent != nil {
+		size += int64(len(response.ImageStreamEvent.Type) + len(response.ImageStreamEvent.B64JSON) + len(response.ImageStreamEvent.URL))
+	}
 	for _, choice := range response.Choices {
 		for _, message := range []*llm.Message{choice.Message, choice.Delta} {
 			if message == nil {

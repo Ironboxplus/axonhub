@@ -301,7 +301,7 @@ func (p *pipeline) stream(
 		statusCode = 200
 	}
 	observeStage(ctx, StageProviderExchange, startedAt, err, observationData{
-		inputBytes: int64(requestBodySize(request)),
+		inputBytes: requestBodySize(request),
 		statusCode: statusCode,
 	})
 	if firstEventGuard.timedOut() {
