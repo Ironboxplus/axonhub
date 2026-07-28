@@ -43,16 +43,23 @@ func TestRequestCloneIsolatesAttemptMutableState(t *testing.T) {
 			}},
 		}},
 		TransformerMetadata: cyclicMetadata,
-		ProviderExtensions: &ProviderExtensions{OpenAIResponses: &OpenAIResponsesProviderExtensions{
-			Request: &OpenAIResponsesRequestExtensions{
-				RawTools: []OpenAIResponsesRawFragment{{
-					Type: "custom",
-					Name: "shell",
-					Raw:  []byte(`{"type":"custom","name":"shell"}`),
-				}},
-				RawToolChoice: []byte(`{"type":"custom","name":"shell"}`),
+		ProviderExtensions: &ProviderExtensions{
+			OpenAIChat: &OpenAIChatProviderExtensions{
+				Request: &OpenAIChatRequestExtensions{
+					RawThinking: []byte(`{"type":"disabled","budget_tokens":4096}`),
+				},
 			},
-		}},
+			OpenAIResponses: &OpenAIResponsesProviderExtensions{
+				Request: &OpenAIResponsesRequestExtensions{
+					RawTools: []OpenAIResponsesRawFragment{{
+						Type: "custom",
+						Name: "shell",
+						Raw:  []byte(`{"type":"custom","name":"shell"}`),
+					}},
+					RawToolChoice: []byte(`{"type":"custom","name":"shell"}`),
+				},
+			},
+		},
 		RawRequest: &httpclient.Request{
 			Method:  http.MethodPost,
 			Query:   url.Values{"trace": {"original"}},
@@ -83,6 +90,7 @@ func TestRequestCloneIsolatesAttemptMutableState(t *testing.T) {
 	*cloned.Messages[0].Content.MultipleContent[0].Text = "changed text"
 	cloned.Messages[0].Content.MultipleContent[0].TransformerMetadata["nested"].([]any)[0].(map[string]any)["value"] = "changed"
 	cloned.Messages[0].InlineToolResults[0].TransformerMetadata["raw"].([]byte)[0] = 'X'
+	cloned.ProviderExtensions.OpenAIChat.Request.RawThinking[0] = 'X'
 	cloned.ProviderExtensions.OpenAIResponses.Request.RawTools[0].Raw[0] = 'X'
 	cloned.ProviderExtensions.OpenAIResponses.Request.RawToolChoice[0] = 'X'
 	cloned.RawRequest.Query.Set("trace", "changed")
@@ -103,6 +111,9 @@ func TestRequestCloneIsolatesAttemptMutableState(t *testing.T) {
 	}
 	if request.ProviderExtensions.OpenAIResponses.Request.RawTools[0].Raw[0] == 'X' || request.ProviderExtensions.OpenAIResponses.Request.RawToolChoice[0] == 'X' {
 		t.Fatal("provider extension raw JSON leaked from clone")
+	}
+	if request.ProviderExtensions.OpenAIChat.Request.RawThinking[0] == 'X' {
+		t.Fatal("OpenAI chat provider extension raw JSON leaked from clone")
 	}
 	if request.RawRequest.Query.Get("trace") != "original" || request.RawRequest.Headers.Get("X-Test") != "original" {
 		t.Fatal("raw request query or headers leaked from clone")

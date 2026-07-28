@@ -104,6 +104,30 @@ type Request struct {
 type Thinking struct {
 	// Type is "enabled" or "disabled".
 	Type string `json:"type"`
+	raw  json.RawMessage
+}
+
+// UnmarshalJSON retains unknown provider fields while exposing Type to Axon's
+// compatibility logic.
+func (t *Thinking) UnmarshalJSON(data []byte) error {
+	type thinkingAlias Thinking
+	var decoded thinkingAlias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*t = Thinking(decoded)
+	t.raw = append(json.RawMessage(nil), data...)
+	return nil
+}
+
+// MarshalJSON replays an inbound provider object losslessly. Programmatically
+// constructed Thinking values continue to use the typed representation.
+func (t Thinking) MarshalJSON() ([]byte, error) {
+	if len(t.raw) > 0 {
+		return t.raw, nil
+	}
+	type thinkingAlias Thinking
+	return json.Marshal(thinkingAlias(t))
 }
 
 // StreamOptions for streaming responses.

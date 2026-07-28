@@ -115,8 +115,11 @@ func (r *Request) ToLLMRequest() *llm.Request {
 		}
 	}
 
-	// Convert Thinking to ReasoningEffort
-	if r.Thinking != nil && r.Thinking.Type == "disabled" {
+	// Derive ReasoningEffort only when the client did not explicitly provide
+	// one. Some OpenAI-compatible providers accept both fields and assign them
+	// distinct meanings, so thinking must not silently overwrite the explicit
+	// common setting.
+	if r.ReasoningEffort == "" && r.Thinking != nil && r.Thinking.Type == "disabled" {
 		req.ReasoningEffort = "none"
 	}
 

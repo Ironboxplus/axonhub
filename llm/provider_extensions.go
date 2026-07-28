@@ -5,7 +5,19 @@ import "encoding/json"
 // ProviderExtensions carries provider/API-format private data that should not
 // be serialized through the common llm request/response JSON model.
 type ProviderExtensions struct {
+	OpenAIChat      *OpenAIChatProviderExtensions      `json:"-"`
 	OpenAIResponses *OpenAIResponsesProviderExtensions `json:"-"`
+}
+
+type OpenAIChatProviderExtensions struct {
+	Request *OpenAIChatRequestExtensions `json:"-"`
+}
+
+type OpenAIChatRequestExtensions struct {
+	// RawThinking preserves the complete provider-specific thinking object. The
+	// common request still exposes ReasoningEffort for cross-provider routing,
+	// while this sidecar makes OpenAI-compatible round trips lossless.
+	RawThinking json.RawMessage `json:"-"`
 }
 
 type OpenAIResponsesProviderExtensions struct {
@@ -30,6 +42,22 @@ type OpenAIResponsesRawFragment struct {
 	Raw                  json.RawMessage `json:"-"`
 }
 
+func EnsureOpenAIChatProviderExtensions(req *Request) *OpenAIChatProviderExtensions {
+	if req == nil {
+		return nil
+	}
+
+	if req.ProviderExtensions == nil {
+		req.ProviderExtensions = &ProviderExtensions{}
+	}
+
+	if req.ProviderExtensions.OpenAIChat == nil {
+		req.ProviderExtensions.OpenAIChat = &OpenAIChatProviderExtensions{}
+	}
+
+	return req.ProviderExtensions.OpenAIChat
+}
+
 func EnsureOpenAIResponsesProviderExtensions(req *Request) *OpenAIResponsesProviderExtensions {
 	if req == nil {
 		return nil
@@ -52,6 +80,14 @@ func CloneProviderExtensions(src *ProviderExtensions) *ProviderExtensions {
 	}
 
 	cloned := &ProviderExtensions{}
+	if src.OpenAIChat != nil {
+		cloned.OpenAIChat = &OpenAIChatProviderExtensions{}
+		if src.OpenAIChat.Request != nil {
+			cloned.OpenAIChat.Request = &OpenAIChatRequestExtensions{
+				RawThinking: cloneRawMessage(src.OpenAIChat.Request.RawThinking),
+			}
+		}
+	}
 	if src.OpenAIResponses != nil {
 		cloned.OpenAIResponses = &OpenAIResponsesProviderExtensions{}
 		if src.OpenAIResponses.Request != nil {

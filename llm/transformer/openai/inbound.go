@@ -65,6 +65,15 @@ func (t *InboundTransformer) TransformRequest(
 
 	// Convert to unified llm.Request
 	chatReq := oaiReq.ToLLMRequest()
+	var rawExtensions struct {
+		Thinking json.RawMessage `json:"thinking"`
+	}
+	if err := json.Unmarshal(httpReq.Body, &rawExtensions); err == nil && len(rawExtensions.Thinking) > 0 {
+		extensions := llm.EnsureOpenAIChatProviderExtensions(chatReq)
+		extensions.Request = &llm.OpenAIChatRequestExtensions{
+			RawThinking: append(json.RawMessage(nil), rawExtensions.Thinking...),
+		}
+	}
 	chatReq.RawRequest = httpReq
 	chatReq.RequestType = llm.RequestTypeChat
 	chatReq.APIFormat = llm.APIFormatOpenAIChatCompletion

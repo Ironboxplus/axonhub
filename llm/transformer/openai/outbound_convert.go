@@ -1,6 +1,9 @@
 package openai
 
 import (
+	"encoding/json"
+	"strings"
+
 	"github.com/samber/lo"
 
 	"github.com/looplj/axonhub/llm"
@@ -26,15 +29,18 @@ func RequestFromLLM(r *llm.Request, reasoningField ReasoningField) *Request {
 		TopP:                r.TopP,
 		PromptCacheKey:      r.PromptCacheKey,
 		SafetyIdentifier:    r.SafetyIdentifier,
-		User:                r.User,
+		User:                chatCompletionUser(r),
 		LogitBias:           r.LogitBias,
-		Metadata:            r.Metadata,
-		Modalities:          r.Modalities,
-		ReasoningEffort:     r.ReasoningEffort,
-		ServiceTier:         r.ServiceTier,
-		Stream:              r.Stream,
-		ParallelToolCalls:   r.ParallelToolCalls,
-		Verbosity:           r.Verbosity,
+		// Chat Completions providers commonly reject the Responses-style
+		// top-level metadata object. metadata.user_id is represented by user.
+		Metadata:          nil,
+		Modalities:        r.Modalities,
+		ReasoningEffort:   r.ReasoningEffort,
+		ServiceTier:       r.ServiceTier,
+		Stream:            r.Stream,
+		ParallelToolCalls: r.ParallelToolCalls,
+		Verbosity:         r.Verbosity,
+		Thinking:          openAIChatThinking(r),
 	}
 
 	// Convert messages
@@ -92,6 +98,35 @@ func RequestFromLLM(r *llm.Request, reasoningField ReasoningField) *Request {
 	}
 
 	return req
+}
+
+func chatCompletionUser(r *llm.Request) *string {
+	if r == nil {
+		return nil
+	}
+	if r.User != nil && strings.TrimSpace(*r.User) != "" {
+		return r.User
+	}
+	if userID := strings.TrimSpace(r.Metadata["user_id"]); userID != "" {
+		return &userID
+	}
+	return r.User
+}
+
+func openAIChatThinking(r *llm.Request) *Thinking {
+	if r == nil || r.ProviderExtensions == nil || r.ProviderExtensions.OpenAIChat == nil ||
+		r.ProviderExtensions.OpenAIChat.Request == nil {
+		return nil
+	}
+	raw := r.ProviderExtensions.OpenAIChat.Request.RawThinking
+	if len(raw) == 0 {
+		return nil
+	}
+	var thinking Thinking
+	if err := json.Unmarshal(raw, &thinking); err != nil {
+		return nil
+	}
+	return &thinking
 }
 
 // applyReasoningEffortMapping replaces reasoning_effort according to a per-channel mapping.
