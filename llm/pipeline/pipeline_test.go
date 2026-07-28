@@ -276,3 +276,44 @@ func (t *testExecutor) DoStream(ctx context.Context, request *httpclient.Request
 	t.callCount++
 	return streams.SliceStream([]*httpclient.StreamEvent{}), nil
 }
+
+type lazyAPIFormatOutbound struct {
+	testOutbound
+	ready bool
+}
+
+func (t *lazyAPIFormatOutbound) APIFormat() llm.APIFormat {
+	if !t.ready {
+		panic("APIFormat called before outbound selection")
+	}
+	return "test/lazy"
+}
+
+func (t *lazyAPIFormatOutbound) TransformRequest(context.Context, *llm.Request) (*httpclient.Request, error) {
+	t.ready = true
+	return &httpclient.Request{}, nil
+}
+
+type collectingObserver struct {
+	events []Observation
+}
+
+func (o *collectingObserver) Observe(_ context.Context, event Observation) {
+	o.events = append(o.events, event)
+}
+
+func TestPipelineObserverSupportsLazyOutboundAPIFormat(t *testing.T) {
+	outbound := &lazyAPIFormatOutbound{}
+	observer := &collectingObserver{}
+
+	result, err := NewFactory(&testExecutor{}).
+		Pipeline(&testInbound{}, outbound, WithObserver(observer)).
+		Process(context.Background(), &httpclient.Request{})
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.True(t, outbound.ready)
+	require.NotEmpty(t, observer.events)
+	require.Empty(t, observer.events[0].OutboundAPIFormat)
+	require.Equal(t, llm.APIFormat("test/lazy"), observer.events[len(observer.events)-1].OutboundAPIFormat)
+}

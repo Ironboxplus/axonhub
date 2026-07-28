@@ -164,6 +164,13 @@ func (t *pipelineTrace) setRequest(request *llm.Request) {
 	t.stream = request.Stream != nil && *request.Stream
 }
 
+func (t *pipelineTrace) setOutboundAPIFormat(apiFormat llm.APIFormat) {
+	if t == nil {
+		return
+	}
+	t.outboundAPIFormat = apiFormat
+}
+
 func observationStart(ctx context.Context) time.Time {
 	if traceFromContext(ctx) == nil {
 		return time.Time{}

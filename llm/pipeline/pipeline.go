@@ -265,7 +265,9 @@ func (p *pipeline) applyLlmStreamMiddlewares(ctx context.Context, stream streams
 }
 
 func (p *pipeline) Process(ctx context.Context, request *httpclient.Request) (*Result, error) {
-	trace := newPipelineTrace(p.observer, p.Outbound.APIFormat())
+	// Some orchestrators select and initialize their concrete outbound lazily in
+	// TransformRequest. Do not call APIFormat before that selection boundary.
+	trace := newPipelineTrace(p.observer, "")
 	ctx = withPipelineTrace(ctx, trace)
 
 	// Step 1: Transform httpclient.Request to llm.Request using inbound transformer
@@ -398,6 +400,11 @@ func (p *pipeline) processRequest(ctx context.Context, request *llm.Request) (*R
 
 	startedAt := observationStart(ctx)
 	httpReq, err := p.Outbound.TransformRequest(ctx, request)
+	if err == nil {
+		if trace := traceFromContext(ctx); trace != nil {
+			trace.setOutboundAPIFormat(p.Outbound.APIFormat())
+		}
+	}
 	outputBytes := int64(0)
 	if httpReq != nil {
 		outputBytes = int64(len(httpReq.Body))
