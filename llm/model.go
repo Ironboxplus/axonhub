@@ -802,6 +802,11 @@ type Usage struct {
 	// Output only. A detailed breakdown of the token count for each modality in the candidates.
 	// For gemini models only.
 	CompletionModalityTokenDetails []ModalityTokenCount `json:"completion_modality_token_details,omitempty"`
+
+	// Recovered reports that Normalize repaired an internally inconsistent
+	// provider usage object. It is intentionally not serialized to provider or
+	// client protocols; gateways can use it for diagnostics and accounting.
+	Recovered bool `json:"-"`
 }
 
 func (u *Usage) GetCompletionTokens() *int64 {
@@ -818,6 +823,34 @@ func (u *Usage) GetPromptTokens() *int64 {
 	}
 
 	return &u.PromptTokens
+}
+
+// Normalize makes provider usage safe for accounting and clients that expect
+// non-null detail objects. Provider totals are allowed to be larger than the
+// visible detail sum, but never smaller than known cached/write-cache tokens or
+// prompt+completion. The method is idempotent.
+func (u *Usage) Normalize() {
+	if u == nil {
+		return
+	}
+
+	if u.PromptTokensDetails == nil {
+		u.PromptTokensDetails = &PromptTokensDetails{}
+	}
+	if u.CompletionTokensDetails == nil {
+		u.CompletionTokensDetails = &CompletionTokensDetails{}
+	}
+
+	knownPromptTokens := u.PromptTokensDetails.CachedTokens + u.PromptTokensDetails.WriteCachedTokens
+	if u.PromptTokens < knownPromptTokens {
+		u.PromptTokens = knownPromptTokens
+		u.Recovered = true
+	}
+	minimumTotal := u.PromptTokens + u.CompletionTokens
+	if u.TotalTokens < minimumTotal {
+		u.TotalTokens = minimumTotal
+		u.Recovered = true
+	}
 }
 
 // CompletionTokensDetails Breakdown of tokens used in a completion.
