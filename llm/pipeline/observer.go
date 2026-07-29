@@ -288,6 +288,7 @@ type observedStream[T any] struct {
 	stage     Stage
 	startedAt time.Time
 	size      func(T) int64
+	current   T
 	events    int64
 	bytes     int64
 	finished  bool
@@ -309,18 +310,21 @@ func observeStream[T any](ctx context.Context, stage Stage, stream streams.Strea
 
 func (s *observedStream[T]) Next() bool {
 	if s.stream.Next() {
+		s.current = s.stream.Current()
 		s.events++
 		if s.size != nil {
-			s.bytes += s.size(s.stream.Current())
+			s.bytes += s.size(s.current)
 		}
 		return true
 	}
+	var zero T
+	s.current = zero
 	s.finished = true
 	s.finish(s.stream.Err(), Outcome(""))
 	return false
 }
 
-func (s *observedStream[T]) Current() T { return s.stream.Current() }
+func (s *observedStream[T]) Current() T { return s.current }
 func (s *observedStream[T]) Err() error { return s.stream.Err() }
 
 func (s *observedStream[T]) Close() error {
