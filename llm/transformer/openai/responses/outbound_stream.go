@@ -572,9 +572,15 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 			Message: "response failed",
 		}
 		if streamEvent.Response != nil && streamEvent.Response.Error != nil {
-			detail.Type = streamEvent.Response.Error.Type
-			detail.Code = streamEvent.Response.Error.Code
-			detail.Message = streamEvent.Response.Error.Message
+			if streamEvent.Response.Error.Type != "" {
+				detail.Type = streamEvent.Response.Error.Type
+			}
+			if streamEvent.Response.Error.Code != "" {
+				detail.Code = streamEvent.Response.Error.Code
+			}
+			if streamEvent.Response.Error.Message != "" {
+				detail.Message = streamEvent.Response.Error.Message
+			}
 		}
 		return &llm.ResponseError{Detail: detail}
 
