@@ -16,7 +16,9 @@ import (
 
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/pipeline"
+	pipelinestream "github.com/looplj/axonhub/llm/pipeline/stream"
 	"github.com/looplj/axonhub/llm/transformer/openai"
+	responsestransformer "github.com/looplj/axonhub/llm/transformer/openai/responses"
 )
 
 type observationRecorder struct {
@@ -231,6 +233,74 @@ func TestPipelineObserverAggregatesRealSSEWithoutPayloadEvents(t *testing.T) {
 	encoded, err := json.Marshal(events)
 	require.NoError(t, err)
 	require.NotContains(t, string(encoded), privateChunk)
+}
+
+func TestPipelineObserverPreservesEveryResponsesClientEventOverRealHTTP(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		require.Equal(t, "/v1/chat/completions", request.URL.Path)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		flusher, ok := w.(http.Flusher)
+		require.True(t, ok)
+		chunks := []string{
+			`{"id":"chatcmpl_responses_observer","object":"chat.completion.chunk","created":1785247203,"model":"observer-model","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}`,
+			`{"id":"chatcmpl_responses_observer","object":"chat.completion.chunk","created":1785247203,"model":"observer-model","choices":[{"index":0,"delta":{"content":"alpha"},"finish_reason":null}]}`,
+			`{"id":"chatcmpl_responses_observer","object":"chat.completion.chunk","created":1785247203,"model":"observer-model","choices":[{"index":0,"delta":{"content":"-beta"},"finish_reason":null}]}`,
+			`{"id":"chatcmpl_responses_observer","object":"chat.completion.chunk","created":1785247203,"model":"observer-model","choices":[{"index":0,"delta":{"content":"-gamma"},"finish_reason":null}]}`,
+			`{"id":"chatcmpl_responses_observer","object":"chat.completion.chunk","created":1785247203,"model":"observer-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":3,"total_tokens":7}}`,
+			`[DONE]`,
+		}
+		for _, chunk := range chunks {
+			_, err := w.Write([]byte("data: " + chunk + "\n\n"))
+			require.NoError(t, err)
+			flusher.Flush()
+		}
+	}))
+	t.Cleanup(provider.Close)
+
+	outbound, err := openai.NewOutboundTransformer(provider.URL, "responses-observer-key")
+	require.NoError(t, err)
+	executor := httpclient.NewHttpClientWithClient(provider.Client())
+	t.Cleanup(executor.CloseIdleConnections)
+	recorder := &observationRecorder{}
+
+	result, err := pipeline.NewFactory(executor).
+		Pipeline(
+			responsestransformer.NewInboundTransformer(),
+			outbound,
+			pipeline.WithMiddlewares(pipelinestream.EnsureUsage()),
+			pipeline.WithObserver(recorder),
+			pipeline.WithEmptyResponseDetection(),
+		).
+		Process(context.Background(), &httpclient.Request{
+			Method:  http.MethodPost,
+			URL:     "/v1/responses",
+			Headers: http.Header{"Content-Type": []string{"application/json"}},
+			Body:    []byte(`{"model":"observer-model","stream":true,"input":"hello"}`),
+		})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.True(t, result.Stream)
+	require.NotNil(t, result.EventStream)
+	defer result.EventStream.Close()
+
+	var sequenceNumbers []int
+	var text strings.Builder
+	for result.EventStream.Next() {
+		event := result.EventStream.Current()
+		require.NotNil(t, event)
+		var envelope map[string]any
+		require.NoError(t, json.Unmarshal(event.Data, &envelope))
+		sequenceNumbers = append(sequenceNumbers, int(envelope["sequence_number"].(float64)))
+		if envelope["type"] == "response.output_text.delta" {
+			text.WriteString(envelope["delta"].(string))
+		}
+	}
+	require.NoError(t, result.EventStream.Err())
+	require.Equal(t, "alpha-beta-gamma", text.String())
+	for i, sequenceNumber := range sequenceNumbers {
+		require.Equal(t, i, sequenceNumber, "Responses client stream dropped or reordered an event")
+	}
 }
 
 func TestPipelineObserverClassifiesRealHTTPFailureWithoutErrorBody(t *testing.T) {

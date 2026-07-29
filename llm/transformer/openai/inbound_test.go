@@ -597,6 +597,31 @@ func TestInboundTransformer_TransformStream_SkipsPureReasoningSignatureChunk(t *
 	require.Equal(t, "[DONE]", string(events[1].Data))
 }
 
+func TestInboundTransformer_TransformStream_FinishChoiceIncludesRawDelta(t *testing.T) {
+	transformer := NewInboundTransformer()
+	finishReason := "stop"
+	event, err := transformer.TransformStreamChunk(t.Context(), &llm.Response{
+		ID:     "chatcmpl-strict-delta",
+		Object: "chat.completion.chunk",
+		Model:  "grok-4.5",
+		Choices: []llm.Choice{{
+			Index:        0,
+			Delta:        &llm.Message{},
+			FinishReason: &finishReason,
+		}},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, event)
+
+	var envelope struct {
+		Choices []map[string]json.RawMessage `json:"choices"`
+	}
+	require.NoError(t, json.Unmarshal(event.Data, &envelope))
+	require.Len(t, envelope.Choices, 1)
+	require.Contains(t, envelope.Choices[0], "delta", "finish choice requires delta: %s", event.Data)
+	require.JSONEq(t, `{}`, string(envelope.Choices[0]["delta"]))
+}
+
 func TestInboundTransformer_TransformResponse(t *testing.T) {
 	transformer := NewInboundTransformer()
 

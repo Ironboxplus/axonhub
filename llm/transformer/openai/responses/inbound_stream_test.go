@@ -66,6 +66,94 @@ func TestInboundTransformer_TransformStream_EmitsRequiredEmptyOutputTextAnnotati
 	}
 }
 
+func TestInboundTransformer_TransformStream_SatisfiesStrictResponsesWireFields(t *testing.T) {
+	trans := NewInboundTransformer()
+	stream, err := trans.TransformStream(t.Context(), streams.SliceStream([]*llm.Response{
+		{
+			Object:  "chat.completion.chunk",
+			ID:      "resp_strict_wire_fields",
+			Created: 1700000000,
+			Model:   "grok-4.5",
+			Choices: []llm.Choice{{
+				Index: 0,
+				Delta: &llm.Message{Role: "assistant", ReasoningContent: lo.ToPtr("think")},
+			}},
+		},
+		{
+			Object: "chat.completion.chunk",
+			Choices: []llm.Choice{{
+				Index: 0,
+				Delta: &llm.Message{Content: llm.MessageContent{Content: lo.ToPtr("answer")}},
+			}},
+		},
+		{
+			Object: "chat.completion.chunk",
+			Choices: []llm.Choice{{
+				Index:        0,
+				Delta:        &llm.Message{},
+				FinishReason: lo.ToPtr("stop"),
+			}},
+		},
+		{Object: "chat.completion.chunk", Usage: &llm.Usage{}},
+	}))
+	require.NoError(t, err)
+
+	requiredTypes := map[StreamEventType]bool{
+		StreamEventTypeReasoningSummaryTextDelta: false,
+		StreamEventTypeReasoningSummaryTextDone:  false,
+		StreamEventTypeOutputTextDelta:           false,
+		StreamEventTypeOutputTextDone:            false,
+		StreamEventTypeContentPartAdded:          false,
+		StreamEventTypeContentPartDone:           false,
+		StreamEventTypeResponseCompleted:         false,
+	}
+	sequenceNumber := 0
+	for stream.Next() {
+		event := stream.Current()
+		var envelope map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(event.Data, &envelope))
+
+		var eventType StreamEventType
+		require.NoError(t, json.Unmarshal(envelope["type"], &eventType))
+		if _, tracked := requiredTypes[eventType]; tracked {
+			requiredTypes[eventType] = true
+		}
+
+		var actualSequence int
+		require.NoError(t, json.Unmarshal(envelope["sequence_number"], &actualSequence))
+		require.Equal(t, sequenceNumber, actualSequence)
+		sequenceNumber++
+
+		switch eventType {
+		case StreamEventTypeReasoningSummaryTextDelta, StreamEventTypeOutputTextDelta:
+			require.Contains(t, envelope, "delta", "%s requires delta: %s", eventType, event.Data)
+		case StreamEventTypeReasoningSummaryTextDone, StreamEventTypeOutputTextDone:
+			require.Contains(t, envelope, "text", "%s requires text: %s", eventType, event.Data)
+		case StreamEventTypeContentPartAdded, StreamEventTypeContentPartDone:
+			var part map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(envelope["part"], &part))
+			var partType string
+			require.NoError(t, json.Unmarshal(part["type"], &partType))
+			require.Contains(t, part, "text", "%s part requires text: %s", partType, event.Data)
+			if partType == "output_text" {
+				require.JSONEq(t, `[]`, string(part["annotations"]))
+			}
+		case StreamEventTypeOutputItemAdded, StreamEventTypeOutputItemDone:
+			var item map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(envelope["item"], &item))
+			var itemType string
+			require.NoError(t, json.Unmarshal(item["type"], &itemType))
+			if itemType == "reasoning" {
+				require.Contains(t, item, "summary", "reasoning item requires summary: %s", event.Data)
+			}
+		}
+	}
+	require.NoError(t, stream.Err())
+	for eventType, seen := range requiredTypes {
+		require.Truef(t, seen, "missing %s event", eventType)
+	}
+}
+
 // Compare each event.
 var ignoreFields = cmp.FilterPath(func(p cmp.Path) bool {
 	// Ignore dynamic fields that are generated at runtime

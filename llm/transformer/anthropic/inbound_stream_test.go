@@ -205,6 +205,80 @@ func TestInboundStream_DoesNotDuplicateTerminalEvents(t *testing.T) {
 	require.Equal(t, 1, countStreamEvents(events, "message_stop"))
 }
 
+func TestInboundStream_SatisfiesStrictAnthropicWireFields(t *testing.T) {
+	transformer := NewInboundTransformer()
+	text := "strict-wire-answer"
+	finishReason := "stop"
+	stream, err := transformer.TransformStream(t.Context(), streams.SliceStream([]*llm.Response{
+		{
+			ID:     "msg_strict_wire_fields",
+			Object: "chat.completion.chunk",
+			Model:  "claude-sonnet-4-6",
+			Choices: []llm.Choice{{
+				Index: 0,
+				Delta: &llm.Message{
+					Role:    "assistant",
+					Content: llm.MessageContent{Content: &text},
+				},
+			}},
+		},
+		{
+			ID:     "msg_strict_wire_fields",
+			Object: "chat.completion.chunk",
+			Model:  "claude-sonnet-4-6",
+			Choices: []llm.Choice{{
+				Index:        0,
+				Delta:        &llm.Message{},
+				FinishReason: &finishReason,
+			}},
+			Usage: &llm.Usage{},
+		},
+	}))
+	require.NoError(t, err)
+
+	seen := map[string]bool{
+		"content_block_start": false,
+		"content_block_delta": false,
+		"message_delta":       false,
+	}
+	for stream.Next() {
+		event := stream.Current()
+		var envelope map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(event.Data, &envelope))
+		var eventType string
+		require.NoError(t, json.Unmarshal(envelope["type"], &eventType))
+		if _, tracked := seen[eventType]; tracked {
+			seen[eventType] = true
+		}
+
+		switch eventType {
+		case "content_block_start":
+			var block map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(envelope["content_block"], &block))
+			var blockType string
+			require.NoError(t, json.Unmarshal(block["type"], &blockType))
+			if blockType == "text" {
+				require.Contains(t, block, "text", "text block requires text: %s", event.Data)
+			}
+		case "content_block_delta":
+			require.Contains(t, envelope, "delta", "content_block_delta requires delta: %s", event.Data)
+			var delta map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(envelope["delta"], &delta))
+			var deltaType string
+			require.NoError(t, json.Unmarshal(delta["type"], &deltaType))
+			if deltaType == "text_delta" {
+				require.Contains(t, delta, "text", "text_delta requires text: %s", event.Data)
+			}
+		case "message_delta":
+			require.Contains(t, envelope, "delta", "message_delta requires delta: %s", event.Data)
+		}
+	}
+	require.NoError(t, stream.Err())
+	for eventType, wasSeen := range seen {
+		require.Truef(t, wasSeen, "missing %s event", eventType)
+	}
+}
+
 func TestInboundStream_DoesNotFinalizeOnSourceError(t *testing.T) {
 	transformer := NewInboundTransformer()
 	text := "Partial"
