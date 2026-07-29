@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"sort"
 
 	"github.com/google/uuid"
 	"github.com/samber/lo"
@@ -23,6 +24,8 @@ func (t *InboundTransformer) TransformStream(
 		source:                     stream,
 		ctx:                        ctx,
 		toolCalls:                  make(map[int]*llm.ToolCall),
+		toolContentIndexes:         make(map[int]int64),
+		openToolContent:            make(map[int]bool),
 		pendingTextCitations:       nil,
 		pendingReasoningContent:    make(map[string][]string),
 		pendingReasoningSignatures: make(map[string]*string),
@@ -51,10 +54,13 @@ type anthropicInboundStream struct {
 	pendingUsage              *Usage
 	// Tool call tracking
 	toolCalls            map[int]*llm.ToolCall // Track tool calls by index
+	toolContentIndexes   map[int]int64         // Canonical tool index -> Anthropic content block index
+	openToolContent      map[int]bool          // Tool blocks that still require content_block_stop
 	currentToolCallIndex int
 	hasCurrentToolCall   bool
 
-	lastEventType string
+	lastEventType             string
+	lastContentBlockStopIndex *int64
 
 	// Buffered signature: when signature arrives before thinking starts,
 	// we hold it until thinking finishes.
@@ -140,9 +146,13 @@ func (s *anthropicInboundStream) emitBufferedReadToolArguments(toolCallIndex int
 		sanitized = arguments
 	}
 
+	contentIndex, ok := s.toolContentIndexes[toolCallIndex]
+	if !ok {
+		return nil
+	}
 	streamEvent := StreamEvent{
 		Type:  "content_block_delta",
-		Index: &s.contentIndex,
+		Index: &contentIndex,
 		Delta: &StreamDelta{
 			Type:        lo.ToPtr("input_json_delta"),
 			PartialJSON: &sanitized,
@@ -170,24 +180,52 @@ func (s *anthropicInboundStream) closeToolBlock() error {
 		return nil
 	}
 
-	if err := s.emitCurrentReadToolArguments(); err != nil {
-		return err
+	type openToolBlock struct {
+		toolIndex    int
+		contentIndex int64
+	}
+	blocks := make([]openToolBlock, 0, len(s.openToolContent))
+	for toolIndex, open := range s.openToolContent {
+		if !open {
+			continue
+		}
+		contentIndex, ok := s.toolContentIndexes[toolIndex]
+		if ok {
+			blocks = append(blocks, openToolBlock{toolIndex: toolIndex, contentIndex: contentIndex})
+		}
+	}
+	sort.Slice(blocks, func(i, j int) bool { return blocks[i].contentIndex < blocks[j].contentIndex })
+	for _, block := range blocks {
+		if err := s.emitBufferedReadToolArguments(block.toolIndex); err != nil {
+			return err
+		}
+		contentIndex := block.contentIndex
+		if err := s.enqueEvent(&StreamEvent{Type: "content_block_stop", Index: &contentIndex}); err != nil {
+			return fmt.Errorf("failed to enqueue content_block_stop event: %w", err)
+		}
+		delete(s.openToolContent, block.toolIndex)
 	}
 
 	s.hasToolContentStarted = false
 	s.hasCurrentToolCall = false
 
-	streamEvent := StreamEvent{
-		Type:  "content_block_stop",
-		Index: &s.contentIndex,
-	}
-	if err := s.enqueEvent(&streamEvent); err != nil {
-		return fmt.Errorf("failed to enqueue content_block_stop event: %w", err)
-	}
-
-	s.contentIndex += 1
-
 	return nil
+}
+
+func (s *anthropicInboundStream) openToolArgumentsComplete() bool {
+	for toolIndex, open := range s.openToolContent {
+		if !open {
+			continue
+		}
+		toolCall := s.toolCalls[toolIndex]
+		if toolCall == nil || toolCall.Function.Arguments == "" {
+			continue
+		}
+		if !json.Valid([]byte(toolCall.Function.Arguments)) {
+			return false
+		}
+	}
+	return true
 }
 
 // closeThinkingBlock ensures any open or implied thinking block is properly
@@ -480,9 +518,21 @@ func (s *anthropicInboundStream) enqueueTerminalEvents() error {
 }
 
 func (s *anthropicInboundStream) enqueEvent(ev *StreamEvent) error {
-	// Some providers have a bug that generates duplicate "content_block_stop" events. This check ignores the duplicate to ensure compatibility.
-	if s.lastEventType == "content_block_stop" && ev.Type == "content_block_stop" {
-		return nil
+	// Suppress only a repeated stop for the same block. Parallel tool calls
+	// legitimately close adjacent indexes back-to-back.
+	if ev.Type == "content_block_stop" {
+		if s.lastEventType == "content_block_stop" && ev.Index != nil &&
+			s.lastContentBlockStopIndex != nil && *ev.Index == *s.lastContentBlockStopIndex {
+			return nil
+		}
+		if ev.Index != nil {
+			index := *ev.Index
+			s.lastContentBlockStopIndex = &index
+		} else {
+			s.lastContentBlockStopIndex = nil
+		}
+	} else {
+		s.lastContentBlockStopIndex = nil
 	}
 
 	s.lastEventType = ev.Type
@@ -860,19 +910,23 @@ func (s *anthropicInboundStream) Next() bool {
 
 				// Initialize tool call if it doesn't exist
 				if _, ok := s.toolCalls[toolCallIndex]; !ok {
-					// Start a new tool use block, we should stop the previous tool use block
-					if toolCallIndex > 0 {
-						if s.hasToolContentStarted {
-							if err := s.closeToolBlock(); err != nil {
-								s.err = fmt.Errorf("failed to close previous tool block: %w", err)
-								return false
-							}
+					// Preserve the established sequential Anthropic event order whenever
+					// earlier tool arguments are already complete. If they are still a
+					// partial JSON prefix, keep their block open: Chat can interleave
+					// argument deltas for parallel calls in later chunks.
+					if s.hasToolContentStarted && s.openToolArgumentsComplete() {
+						if err := s.closeToolBlock(); err != nil {
+							s.err = fmt.Errorf("failed to close completed tool block: %w", err)
+							return false
 						}
 					}
-
 					s.hasToolContentStarted = true
 					s.currentToolCallIndex = toolCallIndex
 					s.hasCurrentToolCall = true
+					contentBlockIndex := s.contentIndex
+					s.contentIndex++
+					s.toolContentIndexes[toolCallIndex] = contentBlockIndex
+					s.openToolContent[toolCallIndex] = true
 					s.toolCalls[toolCallIndex] = &llm.ToolCall{
 						Index: toolCallIndex,
 						ID:    deltaToolCall.ID,
@@ -894,7 +948,7 @@ func (s *anthropicInboundStream) Next() bool {
 
 					streamEvent := StreamEvent{
 						Type:  "content_block_start",
-						Index: &s.contentIndex,
+						Index: &contentBlockIndex,
 						ContentBlock: &MessageContentBlock{
 							Type:   blockType,
 							ID:     deltaToolCall.ID,
@@ -919,7 +973,7 @@ func (s *anthropicInboundStream) Next() bool {
 
 						streamEvent := StreamEvent{
 							Type:  "content_block_delta",
-							Index: &s.contentIndex,
+							Index: &contentBlockIndex,
 							Delta: &StreamDelta{
 								Type:        lo.ToPtr("input_json_delta"),
 								PartialJSON: &deltaToolCall.Function.Arguments,
@@ -938,15 +992,15 @@ func (s *anthropicInboundStream) Next() bool {
 						continue
 					}
 
-					// Generate content_block_delta for input_json_delta
-					// contentBlockIndex := int64(toolCallIndex)
-					// if s.hasTextContentStarted || s.hasThinkingContentStarted {
-					// 	contentBlockIndex = s.contentIndex + 1 + int64(toolCallIndex)
-					// }
+					contentBlockIndex, ok := s.toolContentIndexes[toolCallIndex]
+					if !ok {
+						s.err = fmt.Errorf("missing Anthropic content block index for tool call %d", toolCallIndex)
+						return false
+					}
 
 					streamEvent := StreamEvent{
 						Type:  "content_block_delta",
-						Index: &s.contentIndex,
+						Index: &contentBlockIndex,
 						Delta: &StreamDelta{
 							Type:        lo.ToPtr("input_json_delta"),
 							PartialJSON: &deltaToolCall.Function.Arguments,
