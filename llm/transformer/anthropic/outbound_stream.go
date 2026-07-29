@@ -204,6 +204,7 @@ func (s *outboundStream) transformStreamChunk(event *httpclient.StreamEvent) (*l
 				},
 			}
 			setAnthropicSpecialMeta(&toolCall.TransformerMetadata, cb.Type, cb.Caller)
+			setAnthropicServerName(&toolCall.TransformerMetadata, cb.ServerName)
 			if blockIdx >= 0 {
 				setAnthropicBlockIndex(&toolCall.TransformerMetadata, blockIdx)
 			}
@@ -330,6 +331,17 @@ func (s *outboundStream) transformStreamChunk(event *httpclient.StreamEvent) (*l
 		}
 
 		if streamEvent.Delta != nil && streamEvent.Delta.StopReason != nil {
+			if anthropicStopReasonNeedsMetadata(*streamEvent.Delta.StopReason) {
+				resp.TransformerMetadata = map[string]any{
+					TransformerMetadataKeyAnthropicStopReason: *streamEvent.Delta.StopReason,
+				}
+			}
+			if streamEvent.Delta.StopSequence != nil {
+				if resp.TransformerMetadata == nil {
+					resp.TransformerMetadata = map[string]any{}
+				}
+				resp.TransformerMetadata[TransformerMetadataKeyAnthropicStopSequence] = *streamEvent.Delta.StopSequence
+			}
 			// Determine finish reason
 			var finishReason *string
 

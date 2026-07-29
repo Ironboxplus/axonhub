@@ -51,6 +51,7 @@ type anthropicInboundStream struct {
 	queueIndex                int
 	err                       error
 	stopReason                *string
+	stopSequence              *string
 	pendingUsage              *Usage
 	// Tool call tracking
 	toolCalls            map[int]*llm.ToolCall // Track tool calls by index
@@ -500,7 +501,8 @@ func (s *anthropicInboundStream) enqueueTerminalEvents() error {
 
 	if s.stopReason != nil {
 		streamEvent.Delta = &StreamDelta{
-			StopReason: s.stopReason,
+			StopReason:   s.stopReason,
+			StopSequence: s.stopSequence,
 		}
 	}
 
@@ -950,11 +952,12 @@ func (s *anthropicInboundStream) Next() bool {
 						Type:  "content_block_start",
 						Index: &contentBlockIndex,
 						ContentBlock: &MessageContentBlock{
-							Type:   blockType,
-							ID:     deltaToolCall.ID,
-							Name:   &deltaToolCall.Function.Name,
-							Input:  json.RawMessage("{}"),
-							Caller: getAnthropicCaller(deltaToolCall.TransformerMetadata),
+							Type:       blockType,
+							ID:         deltaToolCall.ID,
+							Name:       &deltaToolCall.Function.Name,
+							ServerName: getAnthropicServerName(deltaToolCall.TransformerMetadata),
+							Input:      json.RawMessage("{}"),
+							Caller:     getAnthropicCaller(deltaToolCall.TransformerMetadata),
 						},
 					}
 
@@ -1137,18 +1140,26 @@ func (s *anthropicInboundStream) Next() bool {
 				}
 			}
 
-			// Convert finish reason to Anthropic format
+			// Prefer Anthropic-native terminal metadata when this stream is being
+			// round-tripped. Mapping pause_turn through the common "stop" finish
+			// reason would otherwise silently turn it into end_turn.
 			var stopReason string
-
-			switch *choice.FinishReason {
-			case "stop":
-				stopReason = "end_turn"
-			case "length":
-				stopReason = "max_tokens"
-			case "tool_calls":
-				stopReason = "tool_use"
-			default:
-				stopReason = "end_turn"
+			if nativeReason, ok := chunk.TransformerMetadata[TransformerMetadataKeyAnthropicStopReason].(string); ok && nativeReason != "" {
+				stopReason = nativeReason
+			} else {
+				switch *choice.FinishReason {
+				case "stop":
+					stopReason = "end_turn"
+				case "length":
+					stopReason = "max_tokens"
+				case "tool_calls":
+					stopReason = "tool_use"
+				default:
+					stopReason = "end_turn"
+				}
+			}
+			if nativeSequence, ok := chunk.TransformerMetadata[TransformerMetadataKeyAnthropicStopSequence].(string); ok {
+				s.stopSequence = lo.ToPtr(nativeSequence)
 			}
 
 			// Store the stop reason, but don't generate message_delta yet

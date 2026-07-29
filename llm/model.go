@@ -474,6 +474,11 @@ type URLCitation struct {
 	URL string `json:"url,omitempty"`
 	// Title is the title of the cited source
 	Title string `json:"title,omitempty"`
+	// EncryptedIndex is opaque provider state used to continue a cited
+	// Anthropic web-search result without altering its bytes.
+	EncryptedIndex *string `json:"encrypted_index,omitempty"`
+	// CitedText is the source excerpt attached to the citation.
+	CitedText *string `json:"cited_text,omitempty"`
 }
 
 type MessageContent struct {

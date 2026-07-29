@@ -618,8 +618,6 @@ func assertCitationsDeltaBeforeContentBlockStop(t *testing.T, events []StreamEve
 			citationEventIndexes = append(citationEventIndexes, i)
 			require.NotNil(t, event.Delta.Citation)
 			actualCitations = append(actualCitations, *event.Delta.Citation)
-			require.Nil(t, event.Delta.Citation.EncryptedIndex)
-			require.Nil(t, event.Delta.Citation.CitedText)
 		}
 		if event.Type == "content_block_stop" && event.Index != nil && *event.Index == 0 && contentBlockStopIndex == -1 {
 			contentBlockStopIndex = i

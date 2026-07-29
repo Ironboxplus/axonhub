@@ -173,6 +173,15 @@ const TransformerMetadataKeyCacheControl = "anthropic_cache_control"
 // server_tool_use and web_search_tool_result without expanding the unified llm schema.
 const TransformerMetadataKeyAnthropicResponseContent = "anthropic_response_content"
 
+// TransformerMetadataKeyAnthropicStopReason and
+// TransformerMetadataKeyAnthropicStopSequence retain Anthropic-only terminal
+// semantics that cannot be represented losslessly by the common OpenAI finish
+// reason vocabulary (notably pause_turn and a concrete stop_sequence value).
+const (
+	TransformerMetadataKeyAnthropicStopReason   = "anthropic_stop_reason"
+	TransformerMetadataKeyAnthropicStopSequence = "anthropic_stop_sequence"
+)
+
 type Thinking struct {
 	Type         string `json:"type"          validate:"required,oneof=enabled disabled adaptive"`
 	BudgetTokens int64  `json:"budget_tokens,omitempty" validate:"required_if=Type enabled"`
@@ -374,6 +383,7 @@ type MessageContentBlock struct {
 	// tool_use or server_tool_use
 	ID           string          `json:"id,omitempty"`
 	Name         *string         `json:"name,omitempty"`
+	ServerName   string          `json:"server_name,omitempty"`
 	Input        json.RawMessage `json:"input,omitempty"`
 	CacheControl *CacheControl   `json:"cache_control,omitempty"`
 

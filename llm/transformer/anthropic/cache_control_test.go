@@ -70,6 +70,24 @@ func TestConvertCacheControlToAnthropic(t *testing.T) {
 	})
 }
 
+func TestConvertToolsAnthropicPreservesNativeToolCacheControl(t *testing.T) {
+	maxUses := int64(3)
+	tools := convertToolsAnthropic([]llm.Tool{{
+		Type: llm.ToolTypeWebSearch,
+		CacheControl: &llm.CacheControl{
+			Type: "ephemeral",
+			TTL:  "1h",
+		},
+		WebSearch: &llm.WebSearch{MaxUses: &maxUses},
+	}}, &Config{Type: PlatformDirect})
+
+	require.Len(t, tools, 1)
+	require.Equal(t, ToolTypeWebSearch20250305, tools[0].Type)
+	require.NotNil(t, tools[0].CacheControl)
+	require.Equal(t, "ephemeral", tools[0].CacheControl.Type)
+	require.Equal(t, "1h", tools[0].CacheControl.TTL)
+}
+
 func TestInboundTransformer_CacheControl(t *testing.T) {
 	transformer := NewInboundTransformer()
 

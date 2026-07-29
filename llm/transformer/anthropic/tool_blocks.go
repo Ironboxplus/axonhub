@@ -23,6 +23,10 @@ const (
 	// (direct / code_execution_20250825 / code_execution_20260120 / ...).
 	TransformerMetadataKeyAnthropicCaller = "anthropic_caller"
 
+	// TransformerMetadataKeyAnthropicServerName stores mcp_tool_use.server_name
+	// while the block travels through the provider-neutral ToolCall shape.
+	TransformerMetadataKeyAnthropicServerName = "anthropic_server_name"
+
 	// TransformerMetadataKeyAnthropicToolResultContent stores the original
 	// *_tool_result content object as json.RawMessage so it round-trips
 	// byte-identical.
@@ -121,6 +125,19 @@ func asJSONRawMessage(v any) json.RawMessage {
 
 func getAnthropicCaller(src map[string]any) json.RawMessage {
 	return asJSONRawMessage(src[TransformerMetadataKeyAnthropicCaller])
+}
+
+func setAnthropicServerName(dst *map[string]any, serverName string) {
+	if serverName == "" {
+		return
+	}
+	ensureMetaMap(dst)
+	(*dst)[TransformerMetadataKeyAnthropicServerName] = serverName
+}
+
+func getAnthropicServerName(src map[string]any) string {
+	serverName, _ := src[TransformerMetadataKeyAnthropicServerName].(string)
+	return serverName
 }
 
 func getAnthropicToolResultContent(src map[string]any) json.RawMessage {

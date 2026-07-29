@@ -575,8 +575,10 @@ func TestConvertToLlmResponse_WithTextBlockCitations(t *testing.T) {
 		{
 			Type: "url_citation",
 			URLCitation: &llm.URLCitation{
-				URL:   "https://example.com/a",
-				Title: "Example A",
+				URL:            "https://example.com/a",
+				Title:          "Example A",
+				EncryptedIndex: lo.ToPtr("secret"),
+				CitedText:      lo.ToPtr("quoted"),
 			},
 		},
 		{

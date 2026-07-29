@@ -234,6 +234,7 @@ func convertToLLMRequest(anthropicReq *MessageRequest) (*llm.Request, error) {
 							CacheControl: convertToLLMCacheControl(block.CacheControl),
 						}
 						setAnthropicSpecialMeta(&tc.TransformerMetadata, block.Type, block.Caller)
+						setAnthropicServerName(&tc.TransformerMetadata, block.ServerName)
 						setAnthropicBlockIndex(&tc.TransformerMetadata, blockIdx)
 						chatMsg.ToolCalls = append(chatMsg.ToolCalls, tc)
 						hasContent = true
@@ -424,6 +425,8 @@ func citationFromLLMAnnotation(annotation llm.Annotation, metadata map[string]an
 	if annotation.URLCitation != nil {
 		citation.URL = annotation.URLCitation.URL
 		citation.Title = annotation.URLCitation.Title
+		citation.EncryptedIndex = annotation.URLCitation.EncryptedIndex
+		citation.CitedText = annotation.URLCitation.CitedText
 	}
 
 	return citation, true
@@ -654,11 +657,12 @@ func convertToAnthropicResponse(chatResp *llm.Response) *Message {
 				}
 
 				appendOrdered(toolCall.TransformerMetadata, MessageContentBlock{
-					Type:   blockType,
-					ID:     toolCall.ID,
-					Name:   &toolCall.Function.Name,
-					Input:  input,
-					Caller: getAnthropicCaller(toolCall.TransformerMetadata),
+					Type:       blockType,
+					ID:         toolCall.ID,
+					Name:       &toolCall.Function.Name,
+					ServerName: getAnthropicServerName(toolCall.TransformerMetadata),
+					Input:      input,
+					Caller:     getAnthropicCaller(toolCall.TransformerMetadata),
 				})
 			}
 
@@ -679,8 +683,12 @@ func convertToAnthropicResponse(chatResp *llm.Response) *Message {
 			resp.Content = mergeAnthropicResponseContentBlocks(contentBlocks, chatResp.TransformerMetadata, message.Annotations)
 		}
 
-		// Convert finish reason
-		if choice.FinishReason != nil {
+		// Prefer the provider-native terminal reason when an Anthropic response
+		// is round-tripped. The common finish-reason vocabulary collapses
+		// pause_turn and stop_sequence into "stop", which is not reversible.
+		if stopReason, ok := chatResp.TransformerMetadata[TransformerMetadataKeyAnthropicStopReason].(string); ok && stopReason != "" {
+			resp.StopReason = lo.ToPtr(stopReason)
+		} else if choice.FinishReason != nil {
 			switch *choice.FinishReason {
 			case "stop":
 				stopReason := "end_turn"
@@ -702,6 +710,9 @@ func convertToAnthropicResponse(chatResp *llm.Response) *Message {
 				stopReason = "tool_use"
 			}
 			resp.StopReason = &stopReason
+		}
+		if stopSequence, ok := chatResp.TransformerMetadata[TransformerMetadataKeyAnthropicStopSequence].(string); ok {
+			resp.StopSequence = lo.ToPtr(stopSequence)
 		}
 	}
 

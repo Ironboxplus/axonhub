@@ -239,8 +239,9 @@ func convertToolsAnthropic(tools []llm.Tool, config *Config) []Tool {
 			}
 
 			anthropicTool := Tool{
-				Type: ToolTypeWebSearch20250305,
-				Name: WebSearchFunctionName,
+				Type:         ToolTypeWebSearch20250305,
+				Name:         WebSearchFunctionName,
+				CacheControl: convertToAnthropicCacheControl(tool.CacheControl),
 			}
 			// Copy web search parameters if available
 			if tool.WebSearch != nil {
@@ -943,10 +944,12 @@ func llmAnnotationFromCitation(citation TextCitation) (llm.Annotation, bool) {
 	}
 
 	annotation := llm.Annotation{Type: citation.Type}
-	if citation.URL != "" || citation.Title != "" {
+	if citation.URL != "" || citation.Title != "" || citation.EncryptedIndex != nil || citation.CitedText != nil {
 		annotation.URLCitation = &llm.URLCitation{
-			URL:   citation.URL,
-			Title: citation.Title,
+			URL:            citation.URL,
+			Title:          citation.Title,
+			EncryptedIndex: citation.EncryptedIndex,
+			CitedText:      citation.CitedText,
 		}
 	}
 
@@ -1156,11 +1159,32 @@ func convertToLlmResponse(anthropicResp *Message, platformType PlatformType) *ll
 	resp.Choices = []llm.Choice{choice}
 
 	resp.Usage = convertToLlmUsage(anthropicResp.Usage, platformType)
+	if anthropicResp.StopReason != nil && anthropicStopReasonNeedsMetadata(*anthropicResp.StopReason) {
+		if transformerMetadata == nil {
+			transformerMetadata = map[string]any{}
+		}
+		transformerMetadata[TransformerMetadataKeyAnthropicStopReason] = *anthropicResp.StopReason
+	}
+	if anthropicResp.StopSequence != nil {
+		if transformerMetadata == nil {
+			transformerMetadata = map[string]any{}
+		}
+		transformerMetadata[TransformerMetadataKeyAnthropicStopSequence] = *anthropicResp.StopSequence
+	}
 	if transformerMetadata != nil {
 		resp.TransformerMetadata = transformerMetadata
 	}
 
 	return resp
+}
+
+func anthropicStopReasonNeedsMetadata(stopReason string) bool {
+	switch stopReason {
+	case "end_turn", "max_tokens", "tool_use":
+		return false
+	default:
+		return stopReason != ""
+	}
 }
 
 // toolCallFromAnthropicBlock builds an llm.ToolCall from an Anthropic
@@ -1180,6 +1204,7 @@ func toolCallFromAnthropicBlock(block MessageContentBlock) llm.ToolCall {
 		CacheControl: convertToLLMCacheControl(block.CacheControl),
 	}
 	setAnthropicSpecialMeta(&tc.TransformerMetadata, block.Type, block.Caller)
+	setAnthropicServerName(&tc.TransformerMetadata, block.ServerName)
 
 	return tc
 }
@@ -1198,6 +1223,7 @@ func toolUseBlockFromLLM(toolCall llm.ToolCall) MessageContentBlock {
 		Type:         blockType,
 		ID:           toolCall.ID,
 		Name:         &toolCall.Function.Name,
+		ServerName:   getAnthropicServerName(toolCall.TransformerMetadata),
 		Input:        xjson.SafeJSONRawMessage(toolCall.Function.Arguments),
 		CacheControl: convertToAnthropicCacheControl(toolCall.CacheControl),
 		Caller:       getAnthropicCaller(toolCall.TransformerMetadata),
