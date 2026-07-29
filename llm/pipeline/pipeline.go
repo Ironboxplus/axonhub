@@ -66,6 +66,19 @@ func WithMiddlewares(decorators ...Middleware) Option {
 	}
 }
 
+// WithSingleAttemptRequestReuse lets an orchestrator reuse the request graph
+// returned by inbound middleware for the one and only provider dispatch. It is
+// intended for callers that already create a fresh request per outer attempt.
+//
+// Axon keeps request cloning as the default. If Axon-level retry is configured,
+// the pipeline also ignores this optimization and isolates every retry so a
+// failed transformer cannot contaminate the next attempt.
+func WithSingleAttemptRequestReuse() Option {
+	return func(p *pipeline) {
+		p.singleAttemptRequestReuse = true
+	}
+}
+
 // WithObserver configures privacy-safe, stage-level pipeline observation.
 // The observer is optional; a nil observer leaves the hot path uninstrumented.
 func WithObserver(observer Observer) Option {
@@ -125,17 +138,18 @@ func (f *Factory) Pipeline(
 
 // pipeline implements the main pipeline logic with retry capabilities.
 type pipeline struct {
-	Executor                Executor
-	Inbound                 transformer.Inbound
-	Outbound                transformer.Outbound
-	middlewares             []Middleware
-	maxChannelRetries       int
-	maxSameChannelRetries   int
-	retryDelay              time.Duration
-	emptyResponseDetection  bool
-	streamFirstEventTimeout time.Duration
-	nonStreamTimeout        time.Duration
-	observer                Observer
+	Executor                  Executor
+	Inbound                   transformer.Inbound
+	Outbound                  transformer.Outbound
+	middlewares               []Middleware
+	maxChannelRetries         int
+	maxSameChannelRetries     int
+	retryDelay                time.Duration
+	emptyResponseDetection    bool
+	streamFirstEventTimeout   time.Duration
+	nonStreamTimeout          time.Duration
+	observer                  Observer
+	singleAttemptRequestReuse bool
 }
 
 type Result struct {
@@ -304,10 +318,13 @@ func (p *pipeline) Process(ctx context.Context, request *httpclient.Request) (*R
 		if trace != nil {
 			trace.attempt.Store(int64(attempt))
 		}
-		// Outbound transformers and attempt middleware may enrich or normalize
-		// mutable request fields. Give every retry/channel attempt an isolated
-		// graph so a failed provider cannot contaminate the next attempt.
-		attemptRequest := llmRequest.Clone()
+		// Outbound transformers may enrich mutable request fields. The default
+		// isolates each dispatch. A caller that owns outer retry isolation can
+		// explicitly reuse the prepared graph when Axon itself cannot retry.
+		attemptRequest := llmRequest
+		if !p.singleAttemptRequestReuse || p.maxChannelRetries > 0 || p.maxSameChannelRetries > 0 {
+			attemptRequest = llmRequest.Clone()
+		}
 
 		result, err := p.processRequest(ctx, attemptRequest)
 		if err == nil {
