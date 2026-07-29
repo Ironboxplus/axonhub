@@ -23,6 +23,7 @@
       "content": [
         {
           "type": "output_text",
+          "annotations": [],
           "text": "Hello! I'm an AI assistant designed to help with a wide range of tasks, including answering math questions and providing current weather information. For your project, I'll first calculate the product of 25 and 4, and then I'll retrieve the current weather conditions in Tokyo.\n\nI'll be using dedicated tools for these tasks:\n\n1. A calculation tool to find the product of 25 multiplied by 4.\n2. A weather information tool to get the latest weather update for Tokyo.\n\nLet's start with the calculations and weather retrieval. I'll execute both tasks simultaneously to save time."
         }
       ],

@@ -86,6 +86,16 @@ func newAggregatedContentPart() *aggregatedContentPart {
 	}
 }
 
+func cloneContentPartAnnotations(contentType string, annotations []Annotation) []Annotation {
+	if len(annotations) > 0 {
+		return append([]Annotation(nil), annotations...)
+	}
+	if contentType == "output_text" {
+		return []Annotation{}
+	}
+	return nil
+}
+
 func ensureContentPart(item *aggregatedItem, contentIndex int) *aggregatedContentPart {
 	if item == nil || contentIndex < 0 {
 		return nil
@@ -291,7 +301,7 @@ func (a *streamAggregator) processEvent(ev *StreamEvent) {
 				if ev.Part.Text != "" {
 					contentPart.Text.WriteString(ev.Part.Text)
 				}
-				contentPart.Annotations = append([]Annotation(nil), ev.Part.Annotations...)
+				contentPart.Annotations = cloneContentPartAnnotations(ev.Part.Type, ev.Part.Annotations)
 			}
 
 			item.Content = append(item.Content, contentPart)
@@ -493,7 +503,7 @@ func (a *streamAggregator) processEvent(ev *StreamEvent) {
 							applyDoneText(part.Text, *contentItem.Text)
 						}
 						if contentItem.Annotations != nil {
-							part.Annotations = append([]Annotation(nil), contentItem.Annotations...)
+							part.Annotations = cloneContentPartAnnotations(contentItem.Type, contentItem.Annotations)
 						}
 					}
 				}
@@ -607,7 +617,7 @@ func (a *streamAggregator) buildResponse() *Response {
 					contentItems = append(contentItems, Item{
 						Type:        cp.Type,
 						Text:        &text,
-						Annotations: append([]Annotation(nil), cp.Annotations...),
+						Annotations: cloneContentPartAnnotations(cp.Type, cp.Annotations),
 					})
 				}
 

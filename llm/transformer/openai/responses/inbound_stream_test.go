@@ -1,6 +1,7 @@
 package responses
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"testing"
@@ -13,6 +14,57 @@ import (
 	"github.com/looplj/axonhub/llm/internal/pkg/xtest"
 	"github.com/looplj/axonhub/llm/streams"
 )
+
+func TestInboundTransformer_TransformStream_EmitsRequiredEmptyOutputTextAnnotations(t *testing.T) {
+	trans := NewInboundTransformer()
+	stream, err := trans.TransformStream(t.Context(), streams.SliceStream([]*llm.Response{
+		{
+			Object:  "chat.completion.chunk",
+			ID:      "resp_required_annotations",
+			Created: 1700000000,
+			Model:   "grok-4.5",
+			Choices: []llm.Choice{{
+				Index: 0,
+				Delta: &llm.Message{
+					Role:    "assistant",
+					Content: llm.MessageContent{Content: lo.ToPtr("hello")},
+				},
+			}},
+		},
+		{
+			Object: "chat.completion.chunk",
+			Choices: []llm.Choice{{
+				Index:        0,
+				Delta:        &llm.Message{},
+				FinishReason: lo.ToPtr("stop"),
+			}},
+		},
+		{Object: "chat.completion.chunk", Usage: &llm.Usage{}},
+	}))
+	require.NoError(t, err)
+
+	wantTypes := map[StreamEventType]bool{
+		StreamEventTypeContentPartAdded:  false,
+		StreamEventTypeContentPartDone:   false,
+		StreamEventTypeOutputItemDone:    false,
+		StreamEventTypeResponseCompleted: false,
+	}
+	for stream.Next() {
+		event := stream.Current()
+		var decoded StreamEvent
+		require.NoError(t, json.Unmarshal(event.Data, &decoded))
+		if _, required := wantTypes[decoded.Type]; !required {
+			continue
+		}
+		wantTypes[decoded.Type] = true
+		require.Truef(t, bytes.Contains(event.Data, []byte(`"annotations":[]`)),
+			"%s must serialize empty output_text annotations: %s", decoded.Type, event.Data)
+	}
+	require.NoError(t, stream.Err())
+	for eventType, seen := range wantTypes {
+		require.Truef(t, seen, "missing %s event", eventType)
+	}
+}
 
 // Compare each event.
 var ignoreFields = cmp.FilterPath(func(p cmp.Path) bool {
@@ -140,6 +192,65 @@ func TestInboundTransformer_StreamTransformation_WithTestData(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestInboundTransformer_TransformStream_ResponseCompletedIncludesEmptyOutputTextAnnotations(t *testing.T) {
+	trans := NewInboundTransformer()
+	stream, err := trans.TransformStream(t.Context(), streams.SliceStream([]*llm.Response{
+		{
+			Object:  "chat.completion.chunk",
+			ID:      "resp_annotations_required",
+			Created: 1700000000,
+			Model:   "gpt-5",
+			Choices: []llm.Choice{{
+				Index: 0,
+				Delta: &llm.Message{
+					Role:    "assistant",
+					Content: llm.MessageContent{Content: lo.ToPtr("hello")},
+				},
+			}},
+		},
+		{
+			Object:  "chat.completion.chunk",
+			ID:      "resp_annotations_required",
+			Created: 1700000000,
+			Model:   "gpt-5",
+			Choices: []llm.Choice{{
+				Index:        0,
+				Delta:        &llm.Message{},
+				FinishReason: lo.ToPtr("stop"),
+			}},
+		},
+		{
+			Object:  "chat.completion.chunk",
+			ID:      "resp_annotations_required",
+			Created: 1700000000,
+			Model:   "gpt-5",
+			Usage:   &llm.Usage{PromptTokens: 1, CompletionTokens: 1, TotalTokens: 2},
+		},
+	}))
+	require.NoError(t, err)
+
+	var completedJSON map[string]any
+	for stream.Next() {
+		event := stream.Current()
+		var envelope map[string]any
+		require.NoError(t, json.Unmarshal(event.Data, &envelope))
+		if envelope["type"] == string(StreamEventTypeResponseCompleted) {
+			completedJSON = envelope
+		}
+	}
+	require.NoError(t, stream.Err())
+	require.NotNil(t, completedJSON)
+
+	response := completedJSON["response"].(map[string]any)
+	output := response["output"].([]any)
+	message := output[0].(map[string]any)
+	content := message["content"].([]any)
+	outputText := content[0].(map[string]any)
+	annotations, present := outputText["annotations"]
+	require.True(t, present, "Responses output_text must include annotations even when empty")
+	require.Empty(t, annotations)
 }
 
 func TestInboundTransformer_TransformStream_KeepsResponsesReasoningItemsSeparate(t *testing.T) {
