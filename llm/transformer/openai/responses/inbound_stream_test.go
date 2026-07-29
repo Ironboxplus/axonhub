@@ -13,6 +13,7 @@ import (
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/internal/pkg/xtest"
 	"github.com/looplj/axonhub/llm/streams"
+	"github.com/looplj/axonhub/llm/transformer/shared"
 )
 
 func TestInboundTransformer_TransformStream_EmitsRequiredEmptyOutputTextAnnotations(t *testing.T) {
@@ -649,6 +650,29 @@ func TestInboundTransformer_TransformStream_EmitsUpstreamErrorEvents(t *testing.
 				require.NotNil(t, failed.Response.Error)
 				require.Equal(t, "stream_error", failed.Response.Error.Code)
 				require.Equal(t, "upstream boom", failed.Response.Error.Message)
+			},
+		},
+		{
+			name: "preserves incomplete stream classification after response starts",
+			source: &errorResponseStream{
+				items: []*llm.Response{{
+					ID:      "resp_incomplete",
+					Model:   "gpt-test",
+					Created: 123,
+				}},
+				err: shared.ErrStreamIncomplete,
+			},
+			wantTypes: []StreamEventType{
+				StreamEventTypeResponseCreated,
+				StreamEventTypeResponseInProgress,
+				StreamEventTypeResponseFailed,
+			},
+			assert: func(t *testing.T, events []StreamEvent) {
+				failed := events[len(events)-1]
+				require.NotNil(t, failed.Response)
+				require.NotNil(t, failed.Response.Error)
+				require.Equal(t, "incomplete_stream", failed.Response.Error.Code)
+				require.Equal(t, "stream ended without terminal event", failed.Response.Error.Message)
 			},
 		},
 	}

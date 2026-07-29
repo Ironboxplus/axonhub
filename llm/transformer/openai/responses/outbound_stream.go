@@ -3,7 +3,6 @@ package responses
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -19,7 +18,11 @@ import (
 
 // ErrStreamIncomplete is returned when the stream ends without a terminal event
 // (response.completed, response.failed, response.cancelled, or response.incomplete).
-var ErrStreamIncomplete = errors.New("stream ended without terminal event")
+//
+// Keep this public alias for compatibility while sharing one sentinel across
+// every provider protocol. That preserves the incomplete_stream classification
+// after Chat or Anthropic streams pass through the Responses inbound adapter.
+var ErrStreamIncomplete = shared.ErrStreamIncomplete
 
 // TransformStream transforms OpenAI Responses API SSE events to unified llm.Response stream.
 func (t *OutboundTransformer) TransformStream(
