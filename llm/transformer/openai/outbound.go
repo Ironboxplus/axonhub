@@ -17,6 +17,7 @@ import (
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/streams"
 	"github.com/looplj/axonhub/llm/transformer"
+	"github.com/looplj/axonhub/llm/transformer/shared"
 )
 
 // PlatformType represents the platform type for OpenAI API.
@@ -318,9 +319,26 @@ func (t *OutboundTransformer) TransformStream(ctx context.Context, req *httpclie
 	//
 	// Note: TransformStreamChunk only returns nil for events with explicit "choices":[]
 	// in the raw JSON. Events without a choices key (nil slice) are passed through.
-	return streams.NoNil(streams.MapErr(stream, func(event *httpclient.StreamEvent) (*llm.Response, error) {
+	guardedStream := shared.RequireTerminalEvent(stream, isOpenAIChatTerminalEvent)
+	return streams.NoNil(streams.MapErr(guardedStream, func(event *httpclient.StreamEvent) (*llm.Response, error) {
 		return t.TransformStreamChunk(ctx, event)
 	})), nil
+}
+
+func isOpenAIChatTerminalEvent(event *httpclient.StreamEvent) bool {
+	if event == nil {
+		return false
+	}
+	if bytes.HasPrefix(bytes.TrimSpace(event.Data), []byte("[DONE]")) {
+		return true
+	}
+	finishReasons := gjson.GetBytes(event.Data, "choices.#.finish_reason")
+	for _, reason := range finishReasons.Array() {
+		if reason.Exists() && reason.Type != gjson.Null && reason.String() != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *OutboundTransformer) TransformStreamChunk(

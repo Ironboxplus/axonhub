@@ -19,13 +19,21 @@ func (t *OutboundTransformer) TransformStream(
 	req *httpclient.Request,
 	stream streams.Stream[*httpclient.StreamEvent],
 ) (streams.Stream[*llm.Response], error) {
+	guardedStream := shared.RequireTerminalEvent(stream, isAnthropicTerminalEvent)
 	// Filter out unnecessary stream events to optimize performance
-	filteredStream := streams.Filter(stream, filterStreamEvent)
+	filteredStream := streams.Filter(guardedStream, filterStreamEvent)
 
 	// Append the DONE event to the filtered stream
 	streamWithDone := streams.AppendStream(filteredStream, lo.ToPtr(llm.DoneStreamEvent))
 
 	return streams.NoNil(newOutboundStream(streamWithDone, t.config.Type)), nil
+}
+
+func isAnthropicTerminalEvent(event *httpclient.StreamEvent) bool {
+	if event == nil {
+		return false
+	}
+	return event.Type == "message_stop" || gjson.GetBytes(event.Data, "type").String() == "message_stop"
 }
 
 // filterStreamEvent determines if a stream event should be processed

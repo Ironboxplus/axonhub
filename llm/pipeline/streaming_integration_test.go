@@ -669,7 +669,6 @@ func TestPipeline_NonStreaming_AutoAggregateUpgradedStream_EmptyAggregatedBody(t
 	require.ErrorContains(t, err, "empty aggregated body")
 }
 
-
 func TestPipeline_NonStreaming_AutoAggregateUpgradedStream_EmptyJSONObjectAggregatedBodyAllowed(t *testing.T) {
 	ctx := context.Background()
 
@@ -683,7 +682,10 @@ func TestPipeline_NonStreaming_AutoAggregateUpgradedStream_EmptyJSONObjectAggreg
 		doStreamFunc: func(ctx context.Context, request *httpclient.Request) (streams.Stream[*httpclient.StreamEvent], error) {
 			require.Equal(t, http.MethodPost, request.Method)
 			require.Contains(t, request.URL, "/chat/completions")
-			return streams.SliceStream([]*httpclient.StreamEvent{{Data: []byte(`{"stub":true}`)}}), nil
+			return streams.SliceStream([]*httpclient.StreamEvent{
+				{Data: []byte(`{"stub":true}`)},
+				{Data: []byte(`[DONE]`)},
+			}), nil
 		},
 	}
 

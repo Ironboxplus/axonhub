@@ -395,6 +395,7 @@ func TestClaudeCodeTransformer_TransformStream(t *testing.T) {
 					},
 				}),
 			},
+			{Type: "message_stop", Data: mustMarshal(map[string]any{"type": "message_stop"})},
 		}
 
 		// Create a mock stream
@@ -455,6 +456,7 @@ func TestClaudeCodeTransformer_TransformStream(t *testing.T) {
 					},
 				}),
 			},
+			{Type: "message_stop", Data: mustMarshal(map[string]any{"type": "message_stop"})},
 		}
 
 		mockStream := newMockHTTPStream(events)
