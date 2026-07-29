@@ -565,15 +565,18 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 		}
 
 	case StreamEventTypeResponseFailed:
-		// Response failed
 		s.responseCompleted = true
-		finishReason := "error"
-		resp.Choices = []llm.Choice{
-			{
-				Index:        0,
-				FinishReason: &finishReason,
-			},
+		detail := llm.ErrorDetail{
+			Type:    "server_error",
+			Code:    "response_failed",
+			Message: "response failed",
 		}
+		if streamEvent.Response != nil && streamEvent.Response.Error != nil {
+			detail.Type = streamEvent.Response.Error.Type
+			detail.Code = streamEvent.Response.Error.Code
+			detail.Message = streamEvent.Response.Error.Message
+		}
+		return &llm.ResponseError{Detail: detail}
 
 	case StreamEventTypeResponseIncomplete:
 		// Response incomplete (e.g., max tokens)
