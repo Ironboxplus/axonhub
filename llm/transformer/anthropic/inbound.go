@@ -165,7 +165,7 @@ func (t *InboundTransformer) TransformError(ctx context.Context, rawErr error) *
 			StatusCode: http.StatusUnprocessableEntity,
 			Status:     http.StatusText(http.StatusUnprocessableEntity),
 			Body: xjson.MustMarshal(
-				&AnthropicError{Type: "invalid_model_error", StatusCode: http.StatusUnprocessableEntity, RequestID: "", Error: ErrorDetail{Message: rawErr.Error()}},
+				&AnthropicError{Type: "error", StatusCode: http.StatusUnprocessableEntity, RequestID: "", Error: ErrorDetail{Type: "invalid_model_error", Message: rawErr.Error()}},
 			),
 		}
 	}
@@ -176,7 +176,7 @@ func (t *InboundTransformer) TransformError(ctx context.Context, rawErr error) *
 			Status:     http.StatusText(llmErr.StatusCode),
 			Body: xjson.MustMarshal(
 				&AnthropicError{
-					Type:       llmErr.Detail.Type,
+					Type:       "error",
 					StatusCode: llmErr.StatusCode,
 					RequestID:  llmErr.Detail.RequestID,
 					Error:      ErrorDetail{Type: llmErr.Detail.Type, Message: llmErr.Detail.Message},
@@ -196,7 +196,7 @@ func (t *InboundTransformer) TransformError(ctx context.Context, rawErr error) *
 			Status:     http.StatusText(http.StatusBadRequest),
 			Body: xjson.MustMarshal(
 				&AnthropicError{
-					Type:       "invalid_request_error",
+					Type:       "error",
 					StatusCode: http.StatusBadRequest,
 					RequestID:  "",
 					Error:      ErrorDetail{Type: "invalid_request_error", Message: rawErr.Error()},
@@ -210,7 +210,7 @@ func (t *InboundTransformer) TransformError(ctx context.Context, rawErr error) *
 		Status:     http.StatusText(http.StatusInternalServerError),
 		Body: xjson.MustMarshal(
 			&AnthropicError{
-				Type:       "internal_server_error",
+				Type:       "error",
 				StatusCode: http.StatusInternalServerError,
 				RequestID:  "",
 				Error:      ErrorDetail{Type: "internal_server_error", Message: rawErr.Error()},

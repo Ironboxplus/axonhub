@@ -3,6 +3,8 @@ package anthropic
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"testing"
 
@@ -11,6 +13,7 @@ import (
 
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/httpclient"
+	basetransformer "github.com/looplj/axonhub/llm/transformer"
 )
 
 func TestInboundTransformer_TransformRequest(t *testing.T) {
@@ -2064,7 +2067,34 @@ func TestInboundTransformer_TransformError(t *testing.T) {
 			expected: &httpclient.Error{
 				StatusCode: http.StatusInternalServerError,
 				Status:     "Internal Server Error",
-				Body:       []byte(`{"type":"test_error","error":{"message":"some error","type":"test_error"},"request_id":"123456"}`),
+				Body:       []byte(`{"type":"error","error":{"message":"some error","type":"test_error"},"request_id":"123456"}`),
+			},
+		},
+		{
+			name:   "invalid model",
+			llmErr: fmt.Errorf("%w: unavailable", basetransformer.ErrInvalidModel),
+			expected: &httpclient.Error{
+				StatusCode: http.StatusUnprocessableEntity,
+				Status:     "Unprocessable Entity",
+				Body:       []byte(`{"type":"error","error":{"message":"model not found: unavailable","type":"invalid_model_error"},"request_id":""}`),
+			},
+		},
+		{
+			name:   "invalid request",
+			llmErr: fmt.Errorf("%w: malformed input", basetransformer.ErrInvalidRequest),
+			expected: &httpclient.Error{
+				StatusCode: http.StatusBadRequest,
+				Status:     "Bad Request",
+				Body:       []byte(`{"type":"error","error":{"message":"invalid request: malformed input","type":"invalid_request_error"},"request_id":""}`),
+			},
+		},
+		{
+			name:   "unclassified error",
+			llmErr: errors.New("unclassified failure"),
+			expected: &httpclient.Error{
+				StatusCode: http.StatusInternalServerError,
+				Status:     "Internal Server Error",
+				Body:       []byte(`{"type":"error","error":{"message":"unclassified failure","type":"internal_server_error"},"request_id":""}`),
 			},
 		},
 		{

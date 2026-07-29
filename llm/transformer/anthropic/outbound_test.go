@@ -902,6 +902,21 @@ func TestOutboundTransformer_TransformError(t *testing.T) {
 		expected *llm.ResponseError
 	}{
 		{
+			name: "canonical anthropic rate limit error",
+			httpErr: &httpclient.Error{
+				StatusCode: http.StatusTooManyRequests,
+				Body:       []byte(`{"type":"error","error":{"type":"rate_limit_error","message":"rate limited"},"request_id":"req_rate"}`),
+			},
+			expected: &llm.ResponseError{
+				StatusCode: http.StatusTooManyRequests,
+				Detail: llm.ErrorDetail{
+					Type:      "rate_limit_error",
+					Message:   "rate limited",
+					RequestID: "req_rate",
+				},
+			},
+		},
+		{
 			name: "http error with json body",
 			httpErr: &httpclient.Error{
 				StatusCode: http.StatusBadRequest,
@@ -943,8 +958,12 @@ func TestOutboundTransformer_TransformError(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			result := transformer.TransformError(context.Background(), tt.httpErr)
 			require.NotNil(t, result)
+			if tt.expected.StatusCode != 0 {
+				require.Equal(t, tt.expected.StatusCode, result.StatusCode)
+			}
 			require.Equal(t, tt.expected.Detail.Type, result.Detail.Type)
 			require.Equal(t, tt.expected.Detail.Message, result.Detail.Message)
+			require.Equal(t, tt.expected.Detail.RequestID, result.Detail.RequestID)
 		})
 	}
 }

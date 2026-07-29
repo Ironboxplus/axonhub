@@ -384,10 +384,14 @@ func (t *OutboundTransformer) TransformError(ctx context.Context, rawErr *httpcl
 	aErr, err := xjson.To[AnthropicError](rawErr.Body)
 	if err == nil && aErr.Error.Message != "" {
 		// Successfully parsed as Anthropic error format
+		errorType := aErr.Error.Type
+		if errorType == "" {
+			errorType = "api_error"
+		}
 		return &llm.ResponseError{
 			StatusCode: rawErr.StatusCode,
 			Detail: llm.ErrorDetail{
-				Type:      "api_error",
+				Type:      errorType,
 				Message:   aErr.Error.Message,
 				RequestID: aErr.RequestID,
 			},
