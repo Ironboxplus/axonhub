@@ -67,6 +67,35 @@ func TestOutboundCustomizeExecutorUsesCurrentExecutor(t *testing.T) {
 	require.Equal(t, "http://127.0.0.1:18080", secondProxy.String())
 }
 
+func TestWebSocketExecutorRegistrySharesPoolAcrossTransformerInstances(t *testing.T) {
+	registry := NewWebSocketExecutorRegistry()
+	t.Cleanup(func() { require.NoError(t, registry.Close()) })
+	native := &http.Client{}
+	firstWrapper := httpclient.NewHttpClientWithClient(native)
+	secondWrapper := httpclient.NewHttpClientWithClient(native)
+	otherWrapper := httpclient.NewHttpClientWithClient(&http.Client{})
+
+	newOutbound := func() *OutboundTransformer {
+		outbound, err := NewOutboundTransformerWithConfig(&Config{
+			BaseURL: "https://api.openai.com/v1", APIKeyProvider: auth.NewStaticKeyProvider("test-key"),
+			Transport: TransportWebSocket, WebSocketExecutorRegistry: registry,
+		})
+		require.NoError(t, err)
+		return outbound
+	}
+
+	first, ok := newOutbound().CustomizeExecutor(firstWrapper).(*WebSocketExecutor)
+	require.True(t, ok)
+	second, ok := newOutbound().CustomizeExecutor(secondWrapper).(*WebSocketExecutor)
+	require.True(t, ok)
+	other, ok := newOutbound().CustomizeExecutor(otherWrapper).(*WebSocketExecutor)
+	require.True(t, ok)
+
+	require.Same(t, first, second)
+	require.NotSame(t, first, other)
+	require.Same(t, firstWrapper, first.Inner())
+}
+
 func TestWebSocketExecutorDoStreamSendsResponseCreate(t *testing.T) {
 	upgrader := websocket.Upgrader{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -435,6 +464,128 @@ func TestWebSocketExecutorReusesConnectionForSameSession(t *testing.T) {
 	}
 
 	require.Equal(t, int32(1), upgrades.Load())
+}
+
+func TestWebSocketExecutorSeparatesSameSessionByTrustedScope(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	var upgrades atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upgrade := upgrades.Add(1)
+		conn, err := upgrader.Upgrade(w, r, nil)
+		require.NoError(t, err)
+		defer conn.Close()
+
+		var payload map[string]any
+		require.NoError(t, conn.ReadJSON(&payload))
+		require.Equal(t, "response.create", payload["type"])
+		require.NoError(t, conn.WriteJSON(map[string]any{
+			"type": "response.completed",
+			"response": map[string]any{
+				"id":         fmt.Sprintf("resp_scope_%d", upgrade),
+				"object":     "response",
+				"created_at": 1700000000,
+				"model":      "gpt-5",
+				"status":     "completed",
+				"output":     []any{},
+			},
+		}))
+	}))
+	defer server.Close()
+
+	executor := NewWebSocketExecutor(nil)
+	defer func() { require.NoError(t, executor.Close()) }()
+	for _, scope := range []string{"api-key:17", "api-key:18"} {
+		ctx := shared.WithSessionScope(context.Background(), scope)
+		stream, err := executor.DoStream(ctx, &httpclient.Request{
+			Method: http.MethodPost,
+			URL:    "http" + strings.TrimPrefix(server.URL, "http") + "/v1/responses",
+			Headers: http.Header{
+				webSocketSessionHeader: []string{"same-client-session"},
+			},
+			Auth: &httpclient.AuthConfig{Type: httpclient.AuthTypeBearer, APIKey: "test-key"},
+			Body: []byte(`{"model":"gpt-5","input":[{"role":"user","content":"hello"}]}`),
+		})
+		require.NoError(t, err)
+		require.True(t, stream.Next())
+		require.Equal(t, "response.completed", stream.Current().Type)
+		require.False(t, stream.Next())
+		require.NoError(t, stream.Err())
+		require.NoError(t, stream.Close())
+	}
+
+	require.Equal(t, int32(2), upgrades.Load())
+}
+
+func TestWebSocketExecutorExpiredConnectionReconnectsWithFullContext(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	var upgrades atomic.Int32
+	payloads := make(chan map[string]any, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upgrade := upgrades.Add(1)
+		conn, err := upgrader.Upgrade(w, r, nil)
+		require.NoError(t, err)
+		defer conn.Close()
+
+		var payload map[string]any
+		if err := conn.ReadJSON(&payload); err != nil {
+			return
+		}
+		payloads <- payload
+		require.NoError(t, conn.WriteJSON(map[string]any{
+			"type": "response.completed",
+			"response": map[string]any{
+				"id":         fmt.Sprintf("resp_expired_%d", upgrade),
+				"object":     "response",
+				"created_at": 1700000000,
+				"model":      "gpt-5",
+				"status":     "completed",
+				"output":     []any{},
+			},
+		}))
+		_, _, _ = conn.ReadMessage()
+	}))
+	defer server.Close()
+
+	executor := NewWebSocketExecutor(nil)
+	executor.idleTTL = time.Hour
+	executor.maxLifetime = 15 * time.Millisecond
+	defer func() { require.NoError(t, executor.Close()) }()
+	ctx := shared.WithSessionScope(context.Background(), "api-key:17")
+	inputs := []string{
+		`[{"role":"user","content":"first"}]`,
+		`[{"role":"user","content":"first"},{"role":"user","content":"second"}]`,
+	}
+	for turn, input := range inputs {
+		stream, err := executor.DoStream(ctx, &httpclient.Request{
+			Method: http.MethodPost,
+			URL:    "http" + strings.TrimPrefix(server.URL, "http") + "/v1/responses",
+			Headers: http.Header{
+				webSocketSessionHeader: []string{"expiring-session"},
+			},
+			Auth: &httpclient.AuthConfig{Type: httpclient.AuthTypeBearer, APIKey: "test-key"},
+			Body: []byte(fmt.Sprintf(`{"model":"gpt-5","input":%s}`, input)),
+		})
+		require.NoError(t, err)
+		require.True(t, stream.Next())
+		require.Equal(t, "response.completed", stream.Current().Type)
+		require.False(t, stream.Next())
+		require.NoError(t, stream.Err())
+		require.NoError(t, stream.Close())
+		if turn == 0 {
+			time.Sleep(30 * time.Millisecond)
+		}
+	}
+
+	first, second := <-payloads, <-payloads
+	require.NotContains(t, first, "previous_response_id")
+	require.NotContains(t, second, "previous_response_id")
+	firstInput, ok := first["input"].([]any)
+	require.True(t, ok)
+	require.Len(t, firstInput, 1)
+	secondInput, ok := second["input"].([]any)
+	require.True(t, ok)
+	require.Len(t, secondInput, 2, "a fresh connection must receive full context instead of a stale incremental suffix")
+	require.Equal(t, int32(2), upgrades.Load())
 }
 
 func TestWebSocketExecutorDoesNotPoolWithoutSession(t *testing.T) {

@@ -183,6 +183,9 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 	if len(llmReq.Messages) == 0 {
 		return nil, fmt.Errorf("%w: messages are required", transformer.ErrInvalidRequest)
 	}
+	if err := validateCanonicalChatRequest(llmReq); err != nil {
+		return nil, fmt.Errorf("%w: %v", transformer.ErrInvalidRequest, err)
+	}
 
 	// Determine which reasoning field to use, default to ReasoningFieldContent.
 	// reasoning_content is the standard field used by most providers (OpenAI o-series,
@@ -292,8 +295,9 @@ func (t *OutboundTransformer) TransformResponse(
 		return nil, fmt.Errorf("failed to unmarshal chat completion response: %w", err)
 	}
 
-	// Convert to unified llm.Response
-	return oaiResp.ToLLMResponse(), nil
+	// Convert to unified llm.Response. Canonical Output is authoritative for
+	// lifecycle persistence and every cross-protocol renderer.
+	return oaiResp.ToLLMResponseChecked(httpResp.Body)
 }
 
 func (t *OutboundTransformer) TransformStream(ctx context.Context, req *httpclient.Request, stream streams.Stream[*httpclient.StreamEvent]) (streams.Stream[*llm.Response], error) {
@@ -320,9 +324,10 @@ func (t *OutboundTransformer) TransformStream(ctx context.Context, req *httpclie
 	// Note: TransformStreamChunk only returns nil for events with explicit "choices":[]
 	// in the raw JSON. Events without a choices key (nil slice) are passed through.
 	guardedStream := shared.RequireTerminalEvent(stream, isOpenAIChatTerminalEvent)
-	return streams.NoNil(streams.MapErr(guardedStream, func(event *httpclient.StreamEvent) (*llm.Response, error) {
+	legacy := streams.NoNil(streams.MapErr(guardedStream, func(event *httpclient.StreamEvent) (*llm.Response, error) {
 		return t.TransformStreamChunk(ctx, event)
-	})), nil
+	}))
+	return newChatCanonicalStream(legacy), nil
 }
 
 func isOpenAIChatTerminalEvent(event *httpclient.StreamEvent) bool {
@@ -356,15 +361,16 @@ func (t *OutboundTransformer) TransformStreamChunk(
 		return nil, streamErr
 	}
 
-	// Create a synthetic HTTP response for compatibility with existing logic
-	httpResp := &httpclient.Response{
-		Body: event.Data,
+	// A stream chunk is not a complete Chat response: tool identity and JSON
+	// arguments may be split across multiple chunks. Decode only the wire
+	// projection here; the canonical stream state machine validates the
+	// assembled lifecycle and rejects incomplete terminal output.
+	var chunk Response
+	if err := json.Unmarshal(event.Data, &chunk); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal chat completion stream chunk: %w", err)
 	}
-
-	resp, err := t.TransformResponse(ctx, httpResp)
-	if err != nil {
-		return nil, err
-	}
+	resp := chunk.ToLLMResponse()
+	resp.APIFormat = llm.APIFormatOpenAIChatCompletion
 
 	// Normalize empty finish_reason to nil. Some OpenAI-compatible providers
 	// (e.g. Sensenova) emit finish_reason:"" in every stream chunk. An empty

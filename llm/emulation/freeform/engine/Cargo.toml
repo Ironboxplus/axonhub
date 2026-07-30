@@ -1,0 +1,18 @@
+[package]
+name = "axon-llguidance"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+llguidance = { version = "=1.7.6", default-features = false, features = ["lark", "wasm", "ahash"] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = 3
+panic = "abort"
+strip = "symbols"

@@ -287,11 +287,13 @@ type webSocketLease struct {
 	pooled        *pooledWebSocketConn
 	reused        bool
 	nextFullInput []json.RawMessage
+	incremental   bool
 	once          sync.Once
 }
 
 func (e *WebSocketExecutor) acquirePreparedLease(ctx context.Context, request *httpclient.Request, wsURL string, headers http.Header, payload map[string]any) (*webSocketLease, error) {
 	originalPayload := clonePayloadMap(payload)
+	reconnected := false
 	lease, err := e.acquire(ctx, request, wsURL, headers)
 	if err != nil {
 		return nil, err
@@ -305,6 +307,7 @@ func (e *WebSocketExecutor) acquirePreparedLease(ctx context.Context, request *h
 		}
 
 		restorePayloadMap(payload, originalPayload)
+		reconnected = true
 		lease, err = e.acquire(ctx, request, wsURL, headers)
 		if err != nil {
 			return nil, err
@@ -314,6 +317,13 @@ func (e *WebSocketExecutor) acquirePreparedLease(ctx context.Context, request *h
 			return nil, err
 		}
 	}
+	pipeline.RecordResponsesWebSocketRequest(
+		ctx,
+		lease.reused,
+		reconnected,
+		lease.incremental,
+		len(lease.nextFullInput) > 0 && !lease.incremental,
+	)
 
 	return lease, nil
 }
@@ -866,6 +876,7 @@ func prepareWebSocketPayloadForLease(payload map[string]any, lease *webSocketLea
 
 	payload["input"] = suffix
 	payload["previous_response_id"] = previousResponseID
+	lease.incremental = true
 
 	return nil
 }

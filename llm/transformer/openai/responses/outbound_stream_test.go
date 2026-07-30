@@ -83,8 +83,11 @@ func TestOutboundTransformer_StreamTransformation_WithTestData(t *testing.T) {
 
 			// exclude the last DONE event
 			for i, expectedEvent := range expectedEvents[:len(expectedEvents)-1] {
-				if !xtest.Equal(expectedEvent, actualLLMResponses[i]) {
-					t.Fatalf("event %d mismatch:\n%s", i, cmp.Diff(expectedEvent, actualLLMResponses[i]))
+				legacyActual := *actualLLMResponses[i]
+				legacyActual.Events = nil
+				legacyActual.APIFormat = ""
+				if !xtest.Equal(expectedEvent, &legacyActual) {
+					t.Fatalf("event %d mismatch:\n%s", i, cmp.Diff(expectedEvent, &legacyActual))
 				}
 			}
 
@@ -287,9 +290,10 @@ func TestResponsesTransformer_StreamRoundTrip_PreservesCompactionSummary(t *test
 	require.Equal(t, "encrypted-summary", lo.FromPtr(compactDone.EncryptedContent))
 	require.NotNil(t, completed)
 	require.Equal(t, "resp_compact_1", completed.ID)
-	require.Len(t, completed.Output, 1)
-	require.Equal(t, "compaction_summary", completed.Output[0].Type)
-	require.Equal(t, "encrypted-summary", lo.FromPtr(completed.Output[0].EncryptedContent))
+	require.Len(t, completed.Output, 2)
+	require.Equal(t, "message", completed.Output[0].Type)
+	require.Equal(t, "compaction_summary", completed.Output[1].Type)
+	require.Equal(t, "encrypted-summary", lo.FromPtr(completed.Output[1].EncryptedContent))
 }
 
 func TestOutboundTransformer_TransformStream_ResponseCancelledCompletes(t *testing.T) {

@@ -81,6 +81,53 @@ func TestMessageContentBlockUnmarshalJSON_WithCitations(t *testing.T) {
 	}, block.Citations)
 }
 
+func TestMessageContentBlockJSON_DocumentCitationsObject(t *testing.T) {
+	raw := `{
+		"type":"document",
+		"source":{"type":"content","content":[{"type":"text","text":"source text"}]},
+		"title":"report.txt",
+		"context":"quarterly report",
+		"citations":{"enabled":true},
+		"cache_control":{"type":"ephemeral"}
+	}`
+	var block MessageContentBlock
+	require.NoError(t, json.Unmarshal([]byte(raw), &block))
+	require.Equal(t, "document", block.Type)
+	require.NotNil(t, block.Source)
+	require.Equal(t, "content", block.Source.Type)
+	require.JSONEq(t, `[{"type":"text","text":"source text"}]`, string(block.Source.Content))
+	require.Equal(t, "report.txt", block.Title)
+	require.NotNil(t, block.DocumentCitations)
+	require.True(t, block.DocumentCitations.Enabled)
+	require.Empty(t, block.Citations)
+
+	roundTrip, err := json.Marshal(block)
+	require.NoError(t, err)
+	require.JSONEq(t, raw, string(roundTrip))
+}
+
+func TestMessageContentUnmarshalJSON_PreservesObjectServerToolResult(t *testing.T) {
+	raw := []byte(`{
+		"type":"web_fetch_result",
+		"url":"https://example.com/article",
+		"retrieved_at":"2026-07-30T00:00:00Z",
+		"content":{
+			"type":"document",
+			"source":{"type":"text","media_type":"text/plain","data":"Article content"}
+		}
+	}`)
+
+	var content MessageContent
+	require.NoError(t, json.Unmarshal(raw, &content))
+	require.NotNil(t, content.ObjectContent)
+	require.Equal(t, "web_fetch_result", content.ObjectContent.Type)
+	require.JSONEq(t, string(raw), string(content.Raw))
+
+	roundTrip, err := json.Marshal(content)
+	require.NoError(t, err)
+	require.JSONEq(t, string(raw), string(roundTrip))
+}
+
 func TestStreamDeltaMarshalJSON_OmitsSignatureForThinkingDelta(t *testing.T) {
 	data, err := json.Marshal(StreamDelta{
 		Type:      lo.ToPtr("thinking_delta"),

@@ -292,6 +292,52 @@ func (p *pipeline) stream(
 	request *httpclient.Request,
 	firstEventTimeout time.Duration,
 ) (streams.Stream[*httpclient.StreamEvent], error) {
+	round, err := p.streamRound(ctx, executor, request, firstEventTimeout)
+	if err != nil {
+		return nil, err
+	}
+	return p.finalizeStream(ctx, round.publicStream())
+}
+
+type streamRound struct {
+	stream          streams.Stream[*llm.Response]
+	firstEventGuard *firstEventTimeoutGuard
+}
+
+func (round *streamRound) publicStream() streams.Stream[*llm.Response] {
+	if round == nil || round.stream == nil {
+		return nil
+	}
+	if round.firstEventGuard == nil {
+		return round.stream
+	}
+	return &cancelOnCloseLlmStream{stream: round.stream, cancel: round.firstEventGuard.cancelStream}
+}
+
+type cancelOnCloseLlmStream struct {
+	stream streams.Stream[*llm.Response]
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (stream *cancelOnCloseLlmStream) Next() bool             { return stream.stream.Next() }
+func (stream *cancelOnCloseLlmStream) Current() *llm.Response { return stream.stream.Current() }
+func (stream *cancelOnCloseLlmStream) Err() error             { return stream.stream.Err() }
+func (stream *cancelOnCloseLlmStream) Close() error {
+	err := stream.stream.Close()
+	stream.once.Do(stream.cancel)
+	return err
+}
+
+// streamRound returns a validated canonical provider stream before public LLM
+// middleware and client encoding. Gateway emulation may consume an internal
+// round here without exposing its synthetic calls or terminal event.
+func (p *pipeline) streamRound(
+	ctx context.Context,
+	executor Executor,
+	request *httpclient.Request,
+	firstEventTimeout time.Duration,
+) (*streamRound, error) {
 	streamCtx, firstEventGuard := newFirstEventTimeoutGuard(ctx, firstEventTimeout)
 
 	startedAt := observationStart(ctx)
@@ -367,28 +413,13 @@ func (p *pipeline) stream(
 
 		return nil, WrapUpstreamError(err)
 	}
+	llmStream = observeConversionRestoreStream(ctx, p.Outbound, request, llmStream)
 
 	llmStream = observeStream(ctx, StageUnifiedStream, llmStream, unifiedStreamEventSize)
-	rawLlmStream := llmStream
 
-	// Apply LLM stream middlewares
-	startedAt = observationStart(ctx)
-	llmStream, err = p.applyLlmStreamMiddlewares(ctx, llmStream)
-	observeStage(ctx, StageUnifiedStreamMiddleware, startedAt, err, observationData{})
-	if err != nil {
-		rawLlmStream.Close()
-		err = firstEventGuard.finishBeforeFirstEvent(err)
-		p.applyRawErrorResponseMiddlewares(ctx, err)
-
-		if errors.Is(err, ErrStreamFirstEventTimeout) {
-			return nil, err
-		}
-
-		return nil, fmt.Errorf("failed to apply llm stream middlewares: %w", err)
-	}
-
-	// Check stream start before the handler commits the response. This enforces
-	// first-event timeout, empty-response detection, and pre-content retry.
+	// Validate the provider stream before gateway emulation or public response
+	// middleware. The pre-read events are prepended, so downstream consumers
+	// still observe the exact canonical sequence.
 	if p.emptyResponseDetection || firstEventTimeout > 0 || p.hasStreamRetryBudget() {
 		rawLlmStream := llmStream
 
@@ -410,12 +441,32 @@ func (p *pipeline) stream(
 		firstEventGuard.stop()
 	}
 
+	return &streamRound{stream: llmStream, firstEventGuard: firstEventGuard}, nil
+}
+
+func (p *pipeline) finalizeStream(ctx context.Context, llmStream streams.Stream[*llm.Response]) (streams.Stream[*httpclient.StreamEvent], error) {
+	if llmStream == nil {
+		return nil, errors.New("canonical provider stream is nil")
+	}
+	rawLlmStream := llmStream
+
+	// Apply LLM stream middlewares
+	startedAt := observationStart(ctx)
+	var err error
+	llmStream, err = p.applyLlmStreamMiddlewares(ctx, llmStream)
+	observeStage(ctx, StageUnifiedStreamMiddleware, startedAt, err, observationData{})
+	if err != nil {
+		rawLlmStream.Close()
+		p.applyRawErrorResponseMiddlewares(ctx, err)
+
+		return nil, fmt.Errorf("failed to apply llm stream middlewares: %w", err)
+	}
+
 	startedAt = observationStart(ctx)
 	inboundStream, err := p.Inbound.TransformStream(ctx, llmStream)
 	observeStage(ctx, StageClientStreamTransform, startedAt, err, observationData{})
 	if err != nil {
 		llmStream.Close()
-		firstEventGuard.cancelStream()
 		p.applyRawErrorResponseMiddlewares(ctx, err)
 
 		slog.ErrorContext(ctx, "failed to transform client stream",
@@ -431,20 +482,12 @@ func (p *pipeline) stream(
 	observeStage(ctx, StageClientStreamMiddleware, startedAt, err, observationData{})
 	if err != nil {
 		rawInboundStream.Close()
-		firstEventGuard.cancelStream()
 		p.applyRawErrorResponseMiddlewares(ctx, err)
 
 		return nil, fmt.Errorf("failed to apply inbound raw stream middlewares: %w", err)
 	}
 
 	inboundStream = observeStream(ctx, StageClientStream, inboundStream, rawStreamEventSize)
-
-	if firstEventGuard != nil {
-		inboundStream = &cancelOnCloseStream{
-			stream: inboundStream,
-			cancel: firstEventGuard.cancelStream,
-		}
-	}
 
 	return inboundStream, nil
 }

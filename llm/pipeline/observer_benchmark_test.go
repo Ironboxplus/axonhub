@@ -4,6 +4,8 @@ import (
 	"context"
 	"sync/atomic"
 	"testing"
+
+	"github.com/looplj/axonhub/llm"
 )
 
 type benchmarkObserver struct {
@@ -38,5 +40,41 @@ func BenchmarkObservationEnabled(b *testing.B) {
 	b.StopTimer()
 	if got := observer.events.Load(); got != int64(b.N) {
 		b.Fatalf("observed events = %d, want %d", got, b.N)
+	}
+}
+
+func BenchmarkResponsesWebSocketObservationDisabled(b *testing.B) {
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		RecordResponsesWebSocketRequest(ctx, true, false, true, false)
+	}
+}
+
+func BenchmarkResponsesWebSocketObservationEnabled(b *testing.B) {
+	ctx := withPipelineTrace(context.Background(), newPipelineTrace(&benchmarkObserver{}, "openai/responses"))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		RecordResponsesWebSocketRequest(ctx, true, false, true, false)
+	}
+}
+
+func BenchmarkHostedExecutionObservationDisabled(b *testing.B) {
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		RecordHostedExecution(ctx, llm.ToolKindComputer)
+	}
+}
+
+func BenchmarkHostedExecutionObservationEnabled(b *testing.B) {
+	ctx := withPipelineTrace(context.Background(), newPipelineTrace(&benchmarkObserver{}, "openai/responses"))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		RecordHostedExecution(ctx, llm.ToolKindComputer)
 	}
 }

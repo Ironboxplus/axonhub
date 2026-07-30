@@ -77,6 +77,15 @@ func (t *InboundTransformer) TransformRequest(
 	chatReq.RawRequest = httpReq
 	chatReq.RequestType = llm.RequestTypeChat
 	chatReq.APIFormat = llm.APIFormatOpenAIChatCompletion
+	canonicalInput, canonicalTools, err := requestToCanonical(&oaiReq, httpReq.Body)
+	if err != nil {
+		return nil, fmt.Errorf("%w: decode Chat canonical items: %w", transformer.ErrInvalidRequest, err)
+	}
+	chatReq.Input = canonicalInput
+	chatReq.ToolDefinitions = canonicalTools
+	if err := llm.PopulateCanonicalFromLegacy(chatReq); err != nil {
+		return nil, fmt.Errorf("%w: invalid canonical lifecycle: %w", transformer.ErrInvalidRequest, err)
+	}
 
 	return chatReq, nil
 }
@@ -90,8 +99,16 @@ func (t *InboundTransformer) TransformResponse(
 		return nil, fmt.Errorf("chat completion response is nil")
 	}
 
-	// Convert to OpenAI Response format
-	oaiResp := ResponseFromLLM(chatResp)
+	// Convert to OpenAI Response format. Canonical Output is authoritative on
+	// cross-protocol routes; relying only on the legacy Choices projection can
+	// silently erase typed tool calls.
+	oaiResp, encodedCanonical, err := canonicalResponseToChat(chatResp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode canonical Chat response: %w", err)
+	}
+	if !encodedCanonical {
+		oaiResp = ResponseFromLLM(chatResp)
+	}
 
 	body, err := json.Marshal(oaiResp)
 	if err != nil {
@@ -113,9 +130,7 @@ func (t *InboundTransformer) TransformStream(
 	ctx context.Context,
 	stream streams.Stream[*llm.Response],
 ) (streams.Stream[*httpclient.StreamEvent], error) {
-	return streams.NoNil(streams.MapErr(stream, func(chunk *llm.Response) (*httpclient.StreamEvent, error) {
-		return t.TransformStreamChunk(ctx, chunk)
-	})), nil
+	return newCanonicalChatInboundStream(ctx, t, stream), nil
 }
 
 func (t *InboundTransformer) TransformStreamChunk(

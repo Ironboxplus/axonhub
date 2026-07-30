@@ -37,15 +37,22 @@ type streamAggregator struct {
 
 // aggregatedItem holds the accumulated state for an output item.
 type aggregatedItem struct {
-	ID               string
-	Type             string
-	Status           string
-	Role             string
-	CallID           string
-	Name             string
-	Namespace        string
-	Arguments        *strings.Builder
-	EncryptedContent *string
+	ID                string
+	Type              string
+	Status            string
+	Role              string
+	CallID            string
+	Name              string
+	Namespace         string
+	Arguments         *strings.Builder
+	EncryptedContent  *string
+	ServerLabel       string
+	Tools             []MCPListedTool
+	ApprovalRequestID string
+	Approve           *bool
+	Reason            string
+	Error             *string
+	Output            *Input
 
 	// For custom_tool_call type
 	Input *string
@@ -276,6 +283,13 @@ func (a *streamAggregator) processEvent(ev *StreamEvent) {
 			item.Arguments.WriteString(ev.Item.Arguments)
 			item.EncryptedContent = ev.Item.EncryptedContent
 			item.Input = ev.Item.Input
+			item.ServerLabel = ev.Item.ServerLabel
+			item.Tools = cloneMCPListedTools(ev.Item.Tools)
+			item.ApprovalRequestID = ev.Item.ApprovalRequestID
+			item.Approve = ev.Item.Approve
+			item.Reason = ev.Item.Reason
+			item.Error = ev.Item.Error
+			item.Output = ev.Item.Output
 
 			if len(ev.Item.Summary) > 0 {
 				for idx, s := range ev.Item.Summary {
@@ -349,6 +363,36 @@ func (a *streamAggregator) processEvent(ev *StreamEvent) {
 					item.Arguments.WriteString(ev.Arguments)
 				}
 			}
+		}
+
+	case StreamEventTypeMCPCallArgumentsDelta:
+		if ev.ItemID != nil {
+			if item := a.getItemForEvent(ev.OutputIndex, ev.ItemID); item != nil {
+				item.Arguments.WriteString(ev.Delta)
+			}
+		}
+
+	case StreamEventTypeMCPCallArgumentsDone:
+		if ev.ItemID != nil {
+			if item := a.getItemForEvent(ev.OutputIndex, ev.ItemID); item != nil {
+				item.Arguments.Reset()
+				item.Arguments.WriteString(ev.Arguments)
+			}
+		}
+
+	case StreamEventTypeMCPCallInProgress, StreamEventTypeMCPListToolsInProgress:
+		if item := a.getItemForEvent(ev.OutputIndex, ev.ItemID); item != nil {
+			item.Status = "in_progress"
+		}
+
+	case StreamEventTypeMCPCallCompleted, StreamEventTypeMCPListToolsCompleted:
+		if item := a.getItemForEvent(ev.OutputIndex, ev.ItemID); item != nil {
+			item.Status = "completed"
+		}
+
+	case StreamEventTypeMCPCallFailed, StreamEventTypeMCPListToolsFailed:
+		if item := a.getItemForEvent(ev.OutputIndex, ev.ItemID); item != nil {
+			item.Status = "failed"
 		}
 
 	case StreamEventTypeCustomToolCallInputDelta:
@@ -524,6 +568,13 @@ func (a *streamAggregator) processEvent(ev *StreamEvent) {
 				if ev.Item.Result != nil {
 					item.Result = ev.Item.Result
 				}
+				item.ServerLabel = ev.Item.ServerLabel
+				item.Tools = cloneMCPListedTools(ev.Item.Tools)
+				item.ApprovalRequestID = ev.Item.ApprovalRequestID
+				item.Approve = ev.Item.Approve
+				item.Reason = ev.Item.Reason
+				item.Error = ev.Item.Error
+				item.Output = ev.Item.Output
 			}
 		}
 
@@ -712,6 +763,31 @@ func (a *streamAggregator) buildResponse() *Response {
 					EncryptedContent: item.EncryptedContent,
 				})
 
+			case "mcp_list_tools":
+				output = append(output, Item{
+					ID: item.ID, Type: item.Type, Status: lo.ToPtr(item.Status),
+					ServerLabel: item.ServerLabel, Tools: cloneMCPListedTools(item.Tools), Error: item.Error,
+				})
+
+			case "mcp_approval_request":
+				output = append(output, Item{
+					ID: item.ID, Type: item.Type, Status: lo.ToPtr(item.Status),
+					ServerLabel: item.ServerLabel, Name: item.Name, Arguments: item.Arguments.String(),
+				})
+
+			case "mcp_approval_response":
+				output = append(output, Item{
+					ID: item.ID, Type: item.Type, Status: lo.ToPtr(item.Status),
+					ApprovalRequestID: item.ApprovalRequestID, Approve: item.Approve, Reason: item.Reason,
+				})
+
+			case "mcp_call":
+				output = append(output, Item{
+					ID: item.ID, Type: item.Type, Status: lo.ToPtr(item.Status),
+					ServerLabel: item.ServerLabel, Name: item.Name, ApprovalRequestID: item.ApprovalRequestID,
+					Arguments: item.Arguments.String(), Output: item.Output, Error: item.Error,
+				})
+
 			default:
 				// Generic item
 				output = append(output, Item{
@@ -736,4 +812,16 @@ func (a *streamAggregator) buildResponse() *Response {
 		Error:              a.responseError,
 		IncompleteDetails:  a.incompleteDetails,
 	}
+}
+
+func cloneMCPListedTools(tools []MCPListedTool) []MCPListedTool {
+	if len(tools) == 0 {
+		return nil
+	}
+	clone := append([]MCPListedTool(nil), tools...)
+	for index := range clone {
+		clone[index].InputSchema = append(json.RawMessage(nil), tools[index].InputSchema...)
+		clone[index].Annotations = append(json.RawMessage(nil), tools[index].Annotations...)
+	}
+	return clone
 }

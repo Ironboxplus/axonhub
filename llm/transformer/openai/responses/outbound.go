@@ -52,6 +52,11 @@ type Config struct {
 	// Transport selects the upstream transport for Responses API requests.
 	// Empty and "http" use the existing HTTP/SSE transport; "websocket" uses Responses WebSocket mode.
 	Transport string `json:"transport,omitempty"`
+
+	// WebSocketExecutorRegistry optionally owns connection pools across
+	// short-lived transformer instances. It is intended for orchestrators that
+	// construct a fresh outbound transformer for every routing attempt.
+	WebSocketExecutorRegistry *WebSocketExecutorRegistry `json:"-"`
 }
 
 func NewOutboundTransformer(baseURL, apiKey string) (*OutboundTransformer, error) {
@@ -95,6 +100,9 @@ func NewOutboundTransformerWithConfig(config *Config) (*OutboundTransformer, err
 func (t *OutboundTransformer) CustomizeExecutor(executor pipeline.Executor) pipeline.Executor {
 	if t == nil || t.config == nil || t.config.Transport != TransportWebSocket {
 		return executor
+	}
+	if t.config.WebSocketExecutorRegistry != nil {
+		return t.config.WebSocketExecutorRegistry.executorFor(executor)
 	}
 
 	if !ExecutorComparable(executor) {
@@ -247,16 +255,30 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 			continue
 		}
 	}
+	if canonicalTools, ok, err := canonicalRequestTools(llmReq); err != nil {
+		return nil, fmt.Errorf("failed to encode canonical tools: %w", err)
+	} else if ok {
+		tools = canonicalTools
+	}
 
+	input := convertInputFromMessages(llmReq.Messages, llmReq.TransformOptions)
+	instructions := convertInstructionsFromMessages(llmReq.Messages)
+	if canonicalInput, canonicalInstructions, ok, err := canonicalRequestInput(llmReq); err != nil {
+		return nil, fmt.Errorf("failed to encode canonical input: %w", err)
+	} else if ok {
+		input = canonicalInput
+		instructions = canonicalInstructions
+	}
 	payload := Request{
 		Model:                llmReq.Model,
-		Input:                convertInputFromMessages(llmReq.Messages, llmReq.TransformOptions),
-		Instructions:         convertInstructionsFromMessages(llmReq.Messages),
+		Input:                input,
+		Instructions:         instructions,
 		Tools:                tools,
 		ParallelToolCalls:    llmReq.ParallelToolCalls,
 		Stream:               llmReq.Stream,
 		Text:                 convertToTextOptions(llmReq),
-		Store:                llmReq.Store,
+		Background:           lifecycleBackground(llmReq),
+		Store:                lifecycleStore(llmReq),
 		ServiceTier:          llmReq.ServiceTier,
 		SafetyIdentifier:     llmReq.SafetyIdentifier,
 		User:                 llmReq.User,
@@ -268,7 +290,8 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 		StreamOptions:        convertStreamOptions(llmReq.StreamOptions, llmReq.TransformerMetadata),
 		Reasoning:            convertReasoning(llmReq),
 		PromptCacheKey:       llmReq.PromptCacheKey,
-		PreviousResponseID:   llmReq.PreviousResponseID,
+		PreviousResponseID:   canonicalPreviousResponseID(llmReq),
+		Conversation:         canonicalResponsesConversation(llmReq),
 		Include:              xmap.GetStringSlice(llmReq.TransformerMetadata, "include"),
 		MaxToolCalls:         xmap.GetInt64Ptr(llmReq.TransformerMetadata, "max_tool_calls"),
 		PromptCacheRetention: xmap.GetStringPtr(llmReq.TransformerMetadata, "prompt_cache_retention"),
@@ -328,6 +351,40 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 	}
 
 	return httpReq, nil
+}
+
+func lifecycleBackground(request *llm.Request) *bool {
+	if request == nil {
+		return nil
+	}
+	return request.Lifecycle.Background
+}
+
+func lifecycleStore(request *llm.Request) *bool {
+	if request == nil {
+		return nil
+	}
+	if request.Lifecycle.Store != nil {
+		return request.Lifecycle.Store
+	}
+	return request.Store
+}
+
+func canonicalPreviousResponseID(request *llm.Request) *string {
+	if request == nil {
+		return nil
+	}
+	if request.Conversation != nil && request.Conversation.ParentID != "" {
+		return lo.ToPtr(request.Conversation.ParentID)
+	}
+	return request.PreviousResponseID
+}
+
+func canonicalResponsesConversation(request *llm.Request) *Conversation {
+	if request == nil || request.Conversation == nil || request.Conversation.ID == "" {
+		return nil
+	}
+	return &Conversation{ID: lo.ToPtr(request.Conversation.ID)}
 }
 
 // buildFullRequestURL constructs the appropriate URL based on the platform.
@@ -419,6 +476,23 @@ func (t *OutboundTransformer) transformStandardResponse(
 		Choices:             make([]llm.Choice, 0),
 		TransformerMetadata: map[string]any{},
 	}
+	llmResp.Lifecycle.Background = resp.Background
+	if resp.Status != nil {
+		switch *resp.Status {
+		case "queued":
+			llmResp.Status = llm.ResponseStatusQueued
+		case "in_progress":
+			llmResp.Status = llm.ResponseStatusInProgress
+		case "completed":
+			llmResp.Status = llm.ResponseStatusCompleted
+		case "incomplete":
+			llmResp.Status = llm.ResponseStatusIncomplete
+		case "failed":
+			llmResp.Status = llm.ResponseStatusFailed
+		case "canceled", "cancelled":
+			llmResp.Status = llm.ResponseStatusCancelled
+		}
+	}
 
 	// Convert usage if present
 	if resp.Usage != nil {
@@ -427,6 +501,21 @@ func (t *OutboundTransformer) transformStandardResponse(
 
 	if httpResp.Request != nil && httpResp.Request.TransformerMetadata != nil {
 		llmResp.TransformerMetadata = maps.Clone(httpResp.Request.TransformerMetadata)
+	}
+
+	llmResp.Output = make([]llm.Item, 0, len(resp.Output))
+	for index := range resp.Output {
+		raw, err := json.Marshal(resp.Output[index])
+		if err != nil {
+			return nil, fmt.Errorf("marshal Responses output item %d: %w", index, err)
+		}
+		item, err := responseItemToCanonical(&resp.Output[index], raw, index)
+		if err != nil {
+			return nil, fmt.Errorf("decode Responses output item %d: %w", index, err)
+		}
+		if item != nil {
+			llmResp.Output = append(llmResp.Output, *item)
+		}
 	}
 
 	msg := convertOutputToMessage(resp.Output, llmResp.TransformerMetadata)

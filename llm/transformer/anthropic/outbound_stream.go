@@ -3,6 +3,7 @@ package anthropic
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/samber/lo"
@@ -20,11 +21,10 @@ func (t *OutboundTransformer) TransformStream(
 	stream streams.Stream[*httpclient.StreamEvent],
 ) (streams.Stream[*llm.Response], error) {
 	guardedStream := shared.RequireTerminalEvent(stream, isAnthropicTerminalEvent)
-	// Filter out unnecessary stream events to optimize performance
-	filteredStream := streams.Filter(guardedStream, filterStreamEvent)
-
-	// Append the DONE event to the filtered stream
-	streamWithDone := streams.AppendStream(filteredStream, lo.ToPtr(llm.DoneStreamEvent))
+	// Append the transport sentinel after the provider's semantic terminal.
+	// Canonical decoding sees every non-empty event; unknown behavioral events
+	// must fail explicitly instead of disappearing in a pre-decode filter.
+	streamWithDone := streams.AppendStream(guardedStream, lo.ToPtr(llm.DoneStreamEvent))
 
 	return streams.NoNil(newOutboundStream(streamWithDone, t.config.Type)), nil
 }
@@ -34,26 +34,6 @@ func isAnthropicTerminalEvent(event *httpclient.StreamEvent) bool {
 		return false
 	}
 	return event.Type == "message_stop" || gjson.GetBytes(event.Data, "type").String() == "message_stop"
-}
-
-// filterStreamEvent determines if a stream event should be processed
-// Filters out unnecessary events like ping, content_block_start, and content_block_stop.
-func filterStreamEvent(event *httpclient.StreamEvent) bool {
-	if event == nil || len(event.Data) == 0 {
-		return false
-	}
-
-	// Only process events that contribute to the OpenAI response format
-	switch event.Type {
-	case "message_start", "content_block_start", "content_block_delta", "message_delta", "message_stop":
-		return true
-	case "error":
-		return true
-	case "ping", "content_block_stop":
-		return false // Skip these events as they're not needed for OpenAI format
-	default:
-		return false // Skip unknown event types
-	}
 }
 
 // streamState holds the state for a streaming session.
@@ -69,15 +49,19 @@ type streamState struct {
 
 // outboundStream wraps a stream and maintains state during processing.
 type outboundStream struct {
-	stream  streams.Stream[*httpclient.StreamEvent]
-	state   *streamState
-	current *llm.Response
-	err     error
+	stream            streams.Stream[*httpclient.StreamEvent]
+	state             *streamState
+	canonical         *anthropicCanonicalDecoder
+	pendingCanonical  []llm.Event
+	current           *llm.Response
+	err               error
+	incompleteHandled bool
 }
 
 func newOutboundStream(stream streams.Stream[*httpclient.StreamEvent], platformType PlatformType) *outboundStream {
 	return &outboundStream{
-		stream: stream,
+		stream:    stream,
+		canonical: newAnthropicCanonicalDecoder(),
 		state: &streamState{
 			toolCalls:    make(map[int]*llm.ToolCall),
 			toolIndex:    -1,
@@ -96,8 +80,30 @@ func (s *outboundStream) Next() bool {
 			return false
 		}
 
+		if resp != nil && resp != llm.DoneResponse {
+			resp.APIFormat = llm.APIFormatAnthropicMessage
+			if len(s.pendingCanonical) > 0 {
+				resp.Events = append(resp.Events, s.pendingCanonical...)
+				s.pendingCanonical = nil
+			}
+		}
 		s.current = resp
 
+		return true
+	}
+	if !s.incompleteHandled && errors.Is(s.stream.Err(), shared.ErrStreamIncomplete) {
+		events, err := s.canonical.incomplete()
+		if err != nil {
+			s.err = err
+			return false
+		}
+		reason := "length"
+		s.current = &llm.Response{
+			Object: "chat.completion.chunk", ID: s.state.streamID, Model: s.state.streamModel,
+			APIFormat: llm.APIFormatAnthropicMessage, Usage: s.state.streamUsage, Events: events,
+			Choices: []llm.Choice{{Index: 0, Delta: &llm.Message{}, FinishReason: &reason}},
+		}
+		s.incompleteHandled = true
 		return true
 	}
 
@@ -134,6 +140,11 @@ func (s *outboundStream) transformStreamChunk(event *httpclient.StreamEvent) (*l
 	if err != nil {
 		return nil, fmt.Errorf("failed to unmarshal anthropic stream event: %w", err)
 	}
+	canonicalEvents, err := s.canonical.decode(&streamEvent, s.state.platformType)
+	if err != nil {
+		return nil, err
+	}
+	s.pendingCanonical = append(s.pendingCanonical, canonicalEvents...)
 
 	// Convert the stream event to ChatCompletionResponse
 	resp := &llm.Response{
@@ -395,6 +406,11 @@ func (s *outboundStream) transformStreamChunk(event *httpclient.StreamEvent) (*l
 			resp.Usage = state.streamUsage
 		}
 
+	case "content_block_stop", "ping":
+		// Canonical lifecycle consumes these events. The legacy Chat projection
+		// has no direct chunk for them.
+		return nil, nil
+
 	default:
 		// This should not happen due to filtering, but handle gracefully
 		return nil, fmt.Errorf("unexpected stream event type: %s", streamEvent.Type)
@@ -468,6 +484,9 @@ func (s *outboundStream) Current() *llm.Response {
 func (s *outboundStream) Err() error {
 	if s.err != nil {
 		return s.err
+	}
+	if s.incompleteHandled {
+		return nil
 	}
 
 	return s.stream.Err()

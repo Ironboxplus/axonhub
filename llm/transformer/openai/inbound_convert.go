@@ -243,6 +243,9 @@ func (p MessageContentPart) ToLLMPart() llm.MessageContentPart {
 			Data:   p.InputAudio.Data,
 		}
 	}
+	if p.File != nil {
+		part.File = &llm.File{FileData: p.File.FileData, FileID: p.File.FileID, Filename: p.File.Filename}
+	}
 
 	return part
 }

@@ -25,6 +25,15 @@ type Usage struct {
 
 	// For moonshot anthropic endpoint, it uses cached tokens instead of cache read input tokens.
 	CachedTokens int64 `json:"cached_tokens,omitempty"`
+
+	ServerToolUse *ServerToolUsage `json:"server_tool_use,omitempty"`
+}
+
+type ServerToolUsage struct {
+	WebSearchRequests     int64 `json:"web_search_requests,omitempty"`
+	WebFetchRequests      int64 `json:"web_fetch_requests,omitempty"`
+	CodeExecutionRequests int64 `json:"code_execution_requests,omitempty"`
+	ToolSearchRequests    int64 `json:"tool_search_requests,omitempty"`
 }
 
 type CacheCreation struct {
@@ -74,6 +83,14 @@ func convertToLlmUsage(usage *Usage, platformType PlatformType) *llm.Usage {
 		CompletionTokensDetails: &llm.CompletionTokensDetails{},
 		TotalTokens:             promptTokens + usage.OutputTokens,
 	}
+	if usage.ServerToolUse != nil {
+		u.ServerToolUsage = &llm.ServerToolUsage{
+			WebSearchRequests:     usage.ServerToolUse.WebSearchRequests,
+			WebFetchRequests:      usage.ServerToolUse.WebFetchRequests,
+			CodeExecutionRequests: usage.ServerToolUse.CodeExecutionRequests,
+			ToolSearchRequests:    usage.ServerToolUse.ToolSearchRequests,
+		}
+	}
 
 	if usage.CacheReadInputTokens > 0 || usage.CacheCreationInputTokens > 0 ||
 		usage.CacheCreation.Ephemeral5mInputTokens > 0 || usage.CacheCreation.Ephemeral1hInputTokens > 0 {
@@ -92,6 +109,14 @@ func convertToAnthropicUsage(llmUsage *llm.Usage) *Usage {
 	usage := &Usage{
 		InputTokens:  llmUsage.PromptTokens,
 		OutputTokens: llmUsage.CompletionTokens,
+	}
+	if llmUsage.ServerToolUsage != nil {
+		usage.ServerToolUse = &ServerToolUsage{
+			WebSearchRequests:     llmUsage.ServerToolUsage.WebSearchRequests,
+			WebFetchRequests:      llmUsage.ServerToolUsage.WebFetchRequests,
+			CodeExecutionRequests: llmUsage.ServerToolUsage.CodeExecutionRequests,
+			ToolSearchRequests:    llmUsage.ServerToolUsage.ToolSearchRequests,
+		}
 	}
 
 	// Map detailed token information from unified model to Anthropic format

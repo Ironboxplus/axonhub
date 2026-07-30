@@ -1902,7 +1902,7 @@ func TestInboundTransformer_TransformRequest_WithReasoningInput(t *testing.T) {
 }
 
 func TestConvertToResponsesAPIResponse_AttachesAnnotationsToFirstTextItem(t *testing.T) {
-	resp := convertToResponsesAPIResponse(&llm.Response{
+	resp, err := convertToResponsesAPIResponse(&llm.Response{
 		ID:      "resp_annotations",
 		Created: 1677652288,
 		Model:   "gpt-4o",
@@ -1931,6 +1931,7 @@ func TestConvertToResponsesAPIResponse_AttachesAnnotationsToFirstTextItem(t *tes
 			FinishReason: lo.ToPtr("stop"),
 		}},
 	})
+	require.NoError(t, err)
 
 	require.Len(t, resp.Output, 1)
 	require.NotNil(t, resp.Output[0].Content)
@@ -1943,7 +1944,7 @@ func TestConvertToResponsesAPIResponse_AttachesAnnotationsToFirstTextItem(t *tes
 }
 
 func TestConvertToResponsesAPIResponse_PreservesMultipleReasoningItems(t *testing.T) {
-	resp := convertToResponsesAPIResponse(&llm.Response{
+	resp, err := convertToResponsesAPIResponse(&llm.Response{
 		ID:      "resp_reasoning_items",
 		Model:   "gpt-5",
 		Created: 1,
@@ -1965,6 +1966,7 @@ func TestConvertToResponsesAPIResponse_PreservesMultipleReasoningItems(t *testin
 			},
 		}},
 	})
+	require.NoError(t, err)
 
 	require.Len(t, resp.Output, 3)
 	require.Equal(t, "reasoning", resp.Output[0].Type)

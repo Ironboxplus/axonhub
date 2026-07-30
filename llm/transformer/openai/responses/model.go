@@ -23,10 +23,15 @@ type ImageGeneration struct {
 }
 
 type Tool struct {
-	// Any of "function", "image_generation", "custom", "web_search", "namespace".
+	// Raw preserves native Responses tool configuration fields that Axon does
+	// not interpret. Only provider/client built-ins populate it; ordinary
+	// function and custom tools continue to use the typed representation.
+	Raw json.RawMessage `json:"-"`
+	// Any of "function", "image_generation", "custom", "web_search", "namespace", "mcp".
 	Type        string `json:"type,omitempty"`
 	Name        string `json:"name,omitempty"`
 	Description string `json:"description,omitempty"`
+	Execution   string `json:"execution,omitempty"`
 
 	// This field is from variant [FunctionTool].
 	Parameters map[string]any `json:"parameters,omitempty"`
@@ -65,6 +70,52 @@ type Tool struct {
 	Quality string `json:"quality,omitempty"`
 	// This field is for ImageGeneration
 	Size string `json:"size,omitempty"`
+
+	// These fields are for remote MCP tools. Authorization and Headers are
+	// extracted into llm.ToolExecutionSecrets immediately after decoding.
+	ServerLabel       string            `json:"server_label,omitempty"`
+	ServerDescription string            `json:"server_description,omitempty"`
+	ServerURL         string            `json:"server_url,omitempty"`
+	ConnectorID       string            `json:"connector_id,omitempty"`
+	TunnelID          string            `json:"tunnel_id,omitempty"`
+	Authorization     string            `json:"authorization,omitempty"`
+	Headers           map[string]string `json:"headers,omitempty"`
+	DeferLoading      *bool             `json:"defer_loading,omitempty"`
+	AllowedCallers    []string          `json:"allowed_callers,omitempty"`
+	AllowedTools      json.RawMessage   `json:"allowed_tools,omitempty"`
+	RequireApproval   json.RawMessage   `json:"require_approval,omitempty"`
+
+	// Native built-in configuration. Raw remains authoritative on identity
+	// routes, while these fields provide the portable subset used by encoders.
+	VectorStoreIDs []string        `json:"vector_store_ids,omitempty"`
+	MaxNumResults  *int64          `json:"max_num_results,omitempty"`
+	RankingOptions json.RawMessage `json:"ranking_options,omitempty"`
+	Container      json.RawMessage `json:"container,omitempty"`
+	DisplayWidth   *int64          `json:"display_width,omitempty"`
+	DisplayHeight  *int64          `json:"display_height,omitempty"`
+	Environment    string          `json:"environment,omitempty"`
+}
+
+func (tool *Tool) UnmarshalJSON(data []byte) error {
+	type toolWire Tool
+	var wire toolWire
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*tool = Tool(wire)
+	switch tool.Type {
+	case "file_search", "code_interpreter", "computer_use_preview", "computer", "shell", "apply_patch":
+		tool.Raw = append(json.RawMessage(nil), data...)
+	}
+	return nil
+}
+
+func (tool Tool) MarshalJSON() ([]byte, error) {
+	if len(tool.Raw) > 0 && json.Valid(tool.Raw) {
+		return append([]byte(nil), tool.Raw...), nil
+	}
+	type toolWire Tool
+	return json.Marshal(toolWire(tool))
 }
 
 type WebSearchFilters struct {
@@ -149,7 +200,7 @@ type Request struct {
 	Truncation *string `json:"truncation,omitempty"`
 
 	// The conversation that this response belongs to.
-	// Conversation *Conversation `json:"conversation,omitempty"`
+	Conversation *Conversation `json:"conversation,omitempty"`
 
 	// An integer between 0 and 20 specifying the number of most likely tokens to return.
 	TopLogprobs *int64 `json:"top_logprobs,omitempty"`
@@ -199,8 +250,9 @@ type ToolChoice struct {
 }
 
 type ToolOption struct {
-	Type string `json:"type"`
-	Name string `json:"name"`
+	Type        string `json:"type"`
+	Name        string `json:"name,omitempty"`
+	ServerLabel string `json:"server_label,omitempty"`
 }
 
 type ToolChoiceAlias ToolChoice
@@ -446,6 +498,27 @@ type WebSearchAction struct {
 	Sources []WebSearchSource `json:"sources,omitempty"`
 }
 
+type LocalShellAction struct {
+	Type             string            `json:"type"`
+	Command          []string          `json:"command"`
+	TimeoutMS        *uint64           `json:"timeout_ms,omitempty"`
+	WorkingDirectory *string           `json:"working_directory,omitempty"`
+	Env              map[string]string `json:"env,omitempty"`
+	User             *string           `json:"user,omitempty"`
+}
+
+type ComputerSafetyCheck struct {
+	ID      string `json:"id,omitempty"`
+	Code    string `json:"code,omitempty"`
+	Message string `json:"message,omitempty"`
+}
+
+type ComputerScreenshot struct {
+	Type     string `json:"type"`
+	FileID   string `json:"file_id,omitempty"`
+	ImageURL string `json:"image_url,omitempty"`
+}
+
 // ItemAction is the polymorphic "action" field of an output item.
 // ImageGenerationAction and WebSearch are mutually exclusive;
 // if both are set, ImageGenerationAction takes precedence during marshaling.
@@ -453,6 +526,8 @@ type ItemAction struct {
 	// ImageGenerationAction holds the bare-string action for image_generation_call items
 	// (e.g. "generate", "edit").
 	ImageGenerationAction string
+	// LocalShell holds the structured action for local_shell_call items.
+	LocalShell *LocalShellAction
 	// WebSearch holds the structured action for web_search_call items.
 	WebSearch *WebSearchAction
 }
@@ -465,6 +540,10 @@ func NewImageGenerationAction(action string) *ItemAction {
 // NewWebSearchAction creates an ItemAction with a structured WebSearchAction value.
 func NewWebSearchAction(action *WebSearchAction) *ItemAction {
 	return &ItemAction{WebSearch: action}
+}
+
+func NewLocalShellAction(action *LocalShellAction) *ItemAction {
+	return &ItemAction{LocalShell: action}
 }
 
 // IsImageGeneration reports whether this action represents an image_generation_call string action.
@@ -482,8 +561,23 @@ func (a *ItemAction) UnmarshalJSON(data []byte) error {
 	var str string
 	if err := json.Unmarshal(data, &str); err == nil {
 		a.ImageGenerationAction = str
+		a.LocalShell = nil
 		a.WebSearch = nil
 
+		return nil
+	}
+
+	var discriminator struct {
+		Command json.RawMessage `json:"command"`
+	}
+	if err := json.Unmarshal(data, &discriminator); err == nil && len(discriminator.Command) > 0 {
+		var action LocalShellAction
+		if err := json.Unmarshal(data, &action); err != nil {
+			return err
+		}
+		a.ImageGenerationAction = ""
+		a.LocalShell = &action
+		a.WebSearch = nil
 		return nil
 	}
 
@@ -491,6 +585,7 @@ func (a *ItemAction) UnmarshalJSON(data []byte) error {
 	var obj WebSearchAction
 	if err := json.Unmarshal(data, &obj); err == nil {
 		a.ImageGenerationAction = ""
+		a.LocalShell = nil
 		a.WebSearch = &obj
 
 		return nil
@@ -502,6 +597,9 @@ func (a *ItemAction) UnmarshalJSON(data []byte) error {
 func (a ItemAction) MarshalJSON() ([]byte, error) {
 	if a.ImageGenerationAction != "" {
 		return json.Marshal(a.ImageGenerationAction)
+	}
+	if a.LocalShell != nil {
+		return json.Marshal(a.LocalShell)
 	}
 
 	if a.WebSearch != nil {
@@ -543,6 +641,12 @@ type Item struct {
 	// The detail of the image. high, low, or auto, for input_image type.
 	Detail *string `json:"detail,omitempty"`
 
+	// Document input fields for input_file. Exactly one source field is set.
+	FileData string `json:"file_data,omitempty"`
+	FileID   string `json:"file_id,omitempty"`
+	FileURL  string `json:"file_url,omitempty"`
+	Filename string `json:"filename,omitempty"`
+
 	// Text for output_text/input_text type.
 	Text *string `json:"text,omitempty"`
 
@@ -558,13 +662,15 @@ type Item struct {
 	Size *string `json:"size,omitempty"`
 
 	// Result for image_generation_call type.
-	Result *string `json:"result,omitempty"`
+	Result        *string `json:"result,omitempty"`
+	RevisedPrompt string  `json:"revised_prompt,omitempty"`
 
 	// Function call fields
 	CallID    string `json:"call_id,omitempty"`
 	Name      string `json:"name,omitempty"`
 	Namespace string `json:"namespace,omitempty"`
 	Arguments string `json:"arguments,omitempty"`
+	Execution string `json:"execution,omitempty"`
 
 	// Custom tool call fields (for type="custom_tool_call")
 	// Input is the freeform input text generated by the model for custom tool calls.
@@ -572,6 +678,21 @@ type Item struct {
 
 	// Output for function_call_output/custom_tool_call_output type.
 	Output *Input `json:"output,omitempty"`
+	// ComputerOutput is the object-shaped output branch used by
+	// computer_call_output. Item's custom JSON codec owns the shared key.
+	ComputerOutput *ComputerScreenshot `json:"-"`
+
+	// MCP lifecycle fields.
+	ServerLabel string          `json:"server_label,omitempty"`
+	Tools       []MCPListedTool `json:"tools,omitempty"`
+	// AdditionalTools is the typed tool catalog carried by a Responses Lite
+	// input item. It shares the wire key "tools" with MCP discovery results,
+	// so Item's custom JSON codec selects the correct union branch by Type.
+	AdditionalTools   []Tool  `json:"-"`
+	ApprovalRequestID string  `json:"approval_request_id,omitempty"`
+	Approve           *bool   `json:"approve,omitempty"`
+	Reason            string  `json:"reason,omitempty"`
+	Error             *string `json:"error,omitempty"`
 
 	// Reasoning fields (for type="reasoning")
 	// Reasoning summary content - array of summary text items.
@@ -584,6 +705,22 @@ type Item struct {
 	// Action is the polymorphic "action" field: web_search_call uses an object,
 	// image_generation_call uses a bare string. See ItemAction.
 	Action *ItemAction `json:"action,omitempty"`
+	// ComputerAction is the unmodified object-shaped computer action. Keeping
+	// it as JSON avoids losing new action variants while canonical code still
+	// treats it as behavioral input.
+	ComputerAction           json.RawMessage       `json:"-"`
+	Operation                json.RawMessage       `json:"operation,omitempty"`
+	PendingSafetyChecks      []ComputerSafetyCheck `json:"pending_safety_checks,omitempty"`
+	AcknowledgedSafetyChecks []ComputerSafetyCheck `json:"acknowledged_safety_checks,omitempty"`
+
+	// Provider-hosted file-search/code-interpreter lifecycle fields.
+	Queries         []string        `json:"queries,omitempty"`
+	Results         json.RawMessage `json:"results,omitempty"`
+	Code            *string         `json:"code,omitempty"`
+	ContainerID     *string         `json:"container_id,omitempty"`
+	Outputs         json.RawMessage `json:"outputs,omitempty"`
+	RawOutput       json.RawMessage `json:"-"`
+	MaxOutputLength *int64          `json:"max_output_length,omitempty"`
 
 	// Compaction fields (for type="compaction")
 	// The identifier of the actor that created the item.
@@ -595,6 +732,8 @@ func (item *Item) UnmarshalJSON(data []byte) error {
 	raw := struct {
 		itemAlias
 		Arguments json.RawMessage `json:"arguments"`
+		Action    json.RawMessage `json:"action"`
+		Output    json.RawMessage `json:"output"`
 	}{}
 
 	if err := json.Unmarshal(data, &raw); err != nil {
@@ -602,6 +741,50 @@ func (item *Item) UnmarshalJSON(data []byte) error {
 	}
 
 	*item = Item(raw.itemAlias)
+	if len(raw.Action) > 0 && !bytes.Equal(raw.Action, []byte("null")) {
+		if item.Type == "computer_call" || item.Type == "shell_call" {
+			if !json.Valid(raw.Action) {
+				return fmt.Errorf("computer_call action must be valid JSON")
+			}
+			item.ComputerAction = append(json.RawMessage(nil), raw.Action...)
+		} else {
+			var action ItemAction
+			if err := json.Unmarshal(raw.Action, &action); err != nil {
+				return err
+			}
+			item.Action = &action
+		}
+	}
+	if len(raw.Output) > 0 && !bytes.Equal(raw.Output, []byte("null")) {
+		if item.Type == "computer_call_output" {
+			var output ComputerScreenshot
+			if err := json.Unmarshal(raw.Output, &output); err != nil {
+				return err
+			}
+			item.ComputerOutput = &output
+		} else if item.Type == "shell_call_output" {
+			if !json.Valid(raw.Output) {
+				return fmt.Errorf("shell_call_output output must be valid JSON")
+			}
+			item.RawOutput = append(json.RawMessage(nil), raw.Output...)
+		} else {
+			var output Input
+			if err := json.Unmarshal(raw.Output, &output); err != nil {
+				return err
+			}
+			item.Output = &output
+		}
+	}
+	if item.Type == "additional_tools" || item.Type == "tool_search_output" {
+		var additional struct {
+			Tools []Tool `json:"tools"`
+		}
+		if err := json.Unmarshal(data, &additional); err != nil {
+			return err
+		}
+		item.AdditionalTools = additional.Tools
+		item.Tools = nil
+	}
 	if len(raw.Arguments) == 0 || bytes.Equal(raw.Arguments, []byte("null")) {
 		return nil
 	}
@@ -625,7 +808,63 @@ func (item *Item) UnmarshalJSON(data []byte) error {
 func (item Item) MarshalJSON() ([]byte, error) {
 	type itemAlias Item
 
-	if item.Type == "function_call" {
+	if item.Type == "computer_call" || item.Type == "shell_call" {
+		action := item.ComputerAction
+		if len(action) == 0 {
+			action = json.RawMessage(`{}`)
+		}
+		if !json.Valid(action) {
+			return nil, fmt.Errorf("computer_call action must be valid JSON")
+		}
+		return json.Marshal(struct {
+			itemAlias
+			Action json.RawMessage `json:"action"`
+		}{itemAlias: itemAlias(item), Action: action})
+	}
+
+	if item.Type == "computer_call_output" {
+		return json.Marshal(struct {
+			itemAlias
+			Output *ComputerScreenshot `json:"output"`
+		}{itemAlias: itemAlias(item), Output: item.ComputerOutput})
+	}
+
+	if item.Type == "shell_call_output" {
+		output := item.RawOutput
+		if len(output) == 0 {
+			output = json.RawMessage(`[]`)
+		}
+		if !json.Valid(output) {
+			return nil, fmt.Errorf("shell_call_output output must be valid JSON")
+		}
+		return json.Marshal(struct {
+			itemAlias
+			Output json.RawMessage `json:"output"`
+		}{itemAlias: itemAlias(item), Output: output})
+	}
+
+	if item.Type == "additional_tools" || item.Type == "tool_search_output" {
+		return json.Marshal(struct {
+			itemAlias
+			Tools []Tool `json:"tools"`
+		}{itemAlias: itemAlias(item), Tools: item.AdditionalTools})
+	}
+
+	if item.Type == "tool_search_call" {
+		arguments := json.RawMessage(item.Arguments)
+		if len(arguments) == 0 {
+			arguments = json.RawMessage(`{}`)
+		}
+		if !json.Valid(arguments) {
+			return nil, fmt.Errorf("tool_search_call arguments must be valid JSON")
+		}
+		return json.Marshal(struct {
+			itemAlias
+			Arguments json.RawMessage `json:"arguments"`
+		}{itemAlias: itemAlias(item), Arguments: arguments})
+	}
+
+	if item.Type == "function_call" || item.Type == "mcp_call" || item.Type == "mcp_approval_request" {
 		type functionCallItem struct {
 			itemAlias
 
@@ -636,6 +875,17 @@ func (item Item) MarshalJSON() ([]byte, error) {
 			itemAlias: itemAlias(item),
 			Arguments: item.Arguments,
 		})
+	}
+
+	if item.Type == "mcp_list_tools" {
+		tools := item.Tools
+		if tools == nil {
+			tools = []MCPListedTool{}
+		}
+		return json.Marshal(struct {
+			itemAlias
+			Tools []MCPListedTool `json:"tools"`
+		}{itemAlias: itemAlias(item), Tools: tools})
 	}
 
 	if item.Type == "custom_tool_call" {
@@ -695,6 +945,16 @@ func (item Item) MarshalJSON() ([]byte, error) {
 		itemAlias: itemAlias(item),
 		Summary:   summary,
 	})
+}
+
+// MCPListedTool is the Responses wire representation of an MCP discovery
+// result. Raw JSON retains arbitrary JSON Schema and MCP annotation objects
+// without routing them through a provider-private sidecar.
+type MCPListedTool struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	InputSchema json.RawMessage `json:"input_schema"`
+	Annotations json.RawMessage `json:"annotations,omitempty"`
 }
 
 // isOutputMessageContent checks if Content.Items contains output message content items.

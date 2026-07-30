@@ -27,6 +27,7 @@ func (t *InboundTransformer) TransformStream(
 		toolCalls:           make(map[int]*llm.ToolCall),
 		transformerMetadata: make(map[string]any),
 		pendingReasoning:    make(map[string][]string),
+		canonical:           newCanonicalStreamEncoder(),
 	}, nil
 }
 
@@ -77,6 +78,7 @@ type responsesInboundStream struct {
 	usage               *llm.Usage
 	aggregator          *streamAggregator
 	transformerMetadata map[string]any
+	canonical           *canonicalStreamEncoder
 
 	// Event queue
 	eventQueue []*httpclient.StreamEvent
@@ -89,7 +91,7 @@ type responsesInboundStream struct {
 }
 
 func (s *responsesInboundStream) enqueueEvent(ev *StreamEvent) error {
-	ev.SequenceNumber = s.sequenceNumber
+	ev.SequenceNumber = lo.ToPtr(s.sequenceNumber)
 	s.sequenceNumber++
 
 	eventData, err := json.Marshal(ev)
@@ -178,11 +180,6 @@ func (s *responsesInboundStream) Next() bool {
 		return s.Next() // Try next chunk
 	}
 
-	// Handle [DONE] marker
-	if chunk.Object == "[DONE]" {
-		return s.Next() // Try next chunk
-	}
-
 	// Initialize response metadata from first chunk
 	if s.responseID == "" && chunk.ID != "" {
 		s.responseID = chunk.ID
@@ -204,6 +201,22 @@ func (s *responsesInboundStream) Next() bool {
 
 	if len(chunk.TransformerMetadata) > 0 {
 		s.mergeTransformerMetadata(chunk.TransformerMetadata)
+	}
+
+	if len(chunk.Events) > 0 {
+		for _, event := range chunk.Events {
+			if err := s.canonical.encode(s, event); err != nil {
+				s.err = err
+				return false
+			}
+		}
+		return s.Next()
+	}
+
+	// Handle [DONE] marker after canonical events. A protocol decoder may use
+	// the transport sentinel chunk to carry a synthesized terminal event.
+	if chunk.Object == "[DONE]" {
+		return s.Next() // Try next chunk
 	}
 
 	// Generate response.created event if this is the first chunk

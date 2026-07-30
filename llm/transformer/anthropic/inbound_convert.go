@@ -159,6 +159,13 @@ func convertToLLMRequest(anthropicReq *MessageRequest) (*llm.Request, error) {
 						contentParts = append(contentParts, part)
 						hasContent = true
 					}
+				case "document":
+					if document := anthropicDocumentToCanonical(&block); document != nil {
+						part := llm.MessageContentPart{Type: "document", Document: document, CacheControl: document.CacheControl}
+						setAnthropicBlockIndex(&part.TransformerMetadata, blockIdx)
+						contentParts = append(contentParts, part)
+						hasContent = true
+					}
 				case "tool_result":
 					hasToolResult = true
 					// TODO: support other result types
@@ -376,6 +383,16 @@ func convertToLLMRequest(anthropicReq *MessageRequest) (*llm.Request, error) {
 		}
 	}
 
+	canonicalInput, canonicalTools, err := anthropicRequestToCanonical(anthropicReq)
+	if err != nil {
+		return nil, err
+	}
+	chatReq.Input = canonicalInput
+	chatReq.ToolDefinitions = canonicalTools
+
+	if err := llm.PopulateCanonicalFromLegacy(chatReq); err != nil {
+		return nil, err
+	}
 	return chatReq, nil
 }
 

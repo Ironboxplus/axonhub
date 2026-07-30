@@ -1,0 +1,43 @@
+{
+  "model": "conversion-fixture-model",
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Apply the requested patch."
+        }
+      ]
+    },
+    {
+      "type": "custom_tool_call",
+      "call_id": "call_patch_001",
+      "name": "apply_patch",
+      "input": "*** Begin Patch\n*** End Patch\n"
+    },
+    {
+      "type": "custom_tool_call_output",
+      "call_id": "call_patch_001",
+      "output": "Done!"
+    }
+  ],
+  "tools": [
+    {
+      "type": "custom",
+      "name": "apply_patch",
+      "description": "Apply a patch to the workspace.",
+      "format": {
+        "type": "grammar",
+        "syntax": "lark",
+        "definition": "start: /[\\s\\S]+/"
+      }
+    }
+  ],
+  "tool_choice": {
+    "type": "custom",
+    "name": "apply_patch"
+  },
+  "stream": false
+}

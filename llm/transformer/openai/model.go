@@ -288,6 +288,15 @@ type MessageContentPart struct {
 	ImageURL   *ImageURL   `json:"image_url,omitempty"`
 	VideoURL   *VideoURL   `json:"video_url,omitempty"`
 	InputAudio *InputAudio `json:"input_audio,omitempty"`
+	File       *File       `json:"file,omitempty"`
+}
+
+// File is the Chat Completions document input payload. FileData and FileID
+// are mutually exclusive on the wire.
+type File struct {
+	FileData string `json:"file_data,omitempty"`
+	FileID   string `json:"file_id,omitempty"`
+	Filename string `json:"filename,omitempty"`
 }
 
 // ImageURL represents an image URL with optional detail level.

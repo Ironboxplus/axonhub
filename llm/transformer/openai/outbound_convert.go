@@ -47,6 +47,9 @@ func RequestFromLLM(r *llm.Request, reasoningField ReasoningField) *Request {
 	req.Messages = lo.Map(r.Messages, func(m llm.Message, _ int) Message {
 		return MessageFromLLMWithConfig(m, reasoningField)
 	})
+	if canonicalMessages, ok := canonicalRequestMessages(r, reasoningField); ok {
+		req.Messages = canonicalMessages
+	}
 
 	// Convert Stop
 	if r.Stop != nil {
@@ -69,6 +72,9 @@ func RequestFromLLM(r *llm.Request, reasoningField ReasoningField) *Request {
 	req.Tools = lo.FilterMap(r.Tools, func(t llm.Tool, _ int) (Tool, bool) {
 		return ToolFromLLM(t), t.Type == llm.ToolTypeFunction
 	})
+	if canonicalTools, ok := canonicalRequestTools(r); ok {
+		req.Tools = canonicalTools
+	}
 
 	// Convert ToolChoice
 	if r.ToolChoice != nil {
@@ -295,6 +301,9 @@ func MessageContentPartFromLLM(p llm.MessageContentPart) MessageContentPart {
 			Data:   p.InputAudio.Data,
 		}
 	}
+	if p.File != nil {
+		part.File = &File{FileData: p.File.FileData, FileID: p.File.FileID, Filename: p.File.Filename}
+	}
 
 	return part
 }
@@ -337,6 +346,56 @@ func ToolCallFromLLM(tc llm.ToolCall) ToolCall {
 
 // ToLLMResponse converts OpenAI Response to unified llm.Response.
 func (r *Response) ToLLMResponse() *llm.Response {
+	return r.toLLMResponseLegacy()
+}
+
+// ToLLMResponseChecked converts a complete Chat response and rejects any
+// response that cannot be represented in the canonical Output model.
+func (r *Response) ToLLMResponseChecked(rawBody ...[]byte) (*llm.Response, error) {
+	resp := r.toLLMResponseLegacy()
+	if resp == nil {
+		return nil, nil
+	}
+	var sourceBody []byte
+	if len(rawBody) > 0 {
+		sourceBody = rawBody[0]
+	}
+	output, err := responseToCanonical(r, sourceBody)
+	if err != nil {
+		return nil, err
+	}
+	resp.Output = output
+	resp.Status = canonicalChatResponseStatus(r)
+	return resp, nil
+}
+
+func canonicalChatResponseStatus(response *Response) llm.ResponseStatus {
+	if response == nil {
+		return ""
+	}
+	status := llm.ResponseStatusCompleted
+	for index := range response.Choices {
+		finish := response.Choices[index].FinishReason
+		if finish == nil {
+			return llm.ResponseStatusIncomplete
+		}
+		switch terminalEventKind(*finish) {
+		case llm.EventKindResponseIncomplete:
+			status = llm.ResponseStatusIncomplete
+		case llm.EventKindResponseCancelled:
+			status = llm.ResponseStatusCancelled
+		}
+	}
+	if response.Error != nil {
+		return llm.ResponseStatusFailed
+	}
+	return status
+}
+
+// toLLMResponseLegacy is the compatibility projection used by incremental
+// Chat chunks. A chunk is intentionally not validated as a complete response;
+// the canonical stream state machine validates the assembled lifecycle.
+func (r *Response) toLLMResponseLegacy() *llm.Response {
 	if r == nil {
 		return nil
 	}

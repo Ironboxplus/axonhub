@@ -73,6 +73,10 @@ func TestOutboundTransformer_TransformResponse_WithTestData(t *testing.T) {
 				if expected.Usage != nil && expected.Usage.PromptTokensDetails != nil && anthropicResp.Usage != nil {
 					expected.Usage.PromptTokensDetails.WriteCachedTokens = anthropicResp.Usage.CacheCreationInputTokens
 				}
+				// Canonical Output is not serialized in this legacy JSON golden;
+				// canonical_response_test.go owns its direct decoder contract.
+				expected.Output = result.Output
+				expected.Status = result.Status
 
 				if !xtest.Equal(expected, *result, cmpopts.IgnoreFields(llm.Message{}, "ReasoningSignature")) {
 					t.Fatalf("responses are not equal %s", cmp.Diff(expected, *result))

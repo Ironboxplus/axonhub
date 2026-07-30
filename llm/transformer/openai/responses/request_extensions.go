@@ -85,7 +85,7 @@ func buildRepresentedToolSignatures(tools []Tool) []string {
 			}
 			continue
 		}
-		if !isStructurallyRepresentedToolType(tool.Type) {
+		if !isStructurallyRepresentedTool(tool) {
 			continue
 		}
 		signatures = append(signatures, responseToolSignature(tool))
@@ -101,7 +101,7 @@ func buildRawOnlyToolFragments(tools []Tool, rawTools []json.RawMessage) []llm.O
 
 	fragments := make([]llm.OpenAIResponsesRawFragment, 0, len(tools))
 	for i := range tools {
-		if i >= len(rawTools) || len(rawTools[i]) == 0 || isStructurallyRepresentedToolType(tools[i].Type) {
+		if i >= len(rawTools) || len(rawTools[i]) == 0 || isStructurallyRepresentedTool(tools[i]) {
 			continue
 		}
 
@@ -124,7 +124,7 @@ func representedNamespaceToolCount(tool Tool) int {
 
 	count := 0
 	for _, subTool := range tool.Tools {
-		if subTool.Type == "function" {
+		if subTool.Type == "function" || subTool.Type == "custom" {
 			count++
 		}
 	}
@@ -134,11 +134,19 @@ func representedNamespaceToolCount(tool Tool) int {
 
 func isStructurallyRepresentedToolType(toolType string) bool {
 	switch toolType {
-	case "function", "image_generation", "web_search", "custom":
+	case "function", "image_generation", "web_search", "custom", "mcp", "namespace", "local_shell", "tool_search",
+		"file_search", "code_interpreter", "computer", "computer_use_preview", "shell", "apply_patch":
 		return true
 	default:
 		return false
 	}
+}
+
+func isStructurallyRepresentedTool(tool Tool) bool {
+	if tool.Type == "tool_search" {
+		return tool.Execution == string(llm.ExecutionOwnerClient)
+	}
+	return isStructurallyRepresentedToolType(tool.Type)
 }
 
 func responseToolSignature(tool Tool) string {
@@ -155,7 +163,7 @@ func rawUnsupportedToolChoice(choice *ToolChoice, rawChoice json.RawMessage) jso
 		return nil
 	}
 
-	if len(choice.Tools) > 0 {
+	if len(choice.Tools) > 0 && (choice.Type == nil || *choice.Type != "allowed_tools") {
 		return cloneRaw(rawChoice)
 	}
 
@@ -170,7 +178,7 @@ func buildRawOnlyInputFragments(input Input, rawItems []json.RawMessage) []llm.O
 	fragments := make([]llm.OpenAIResponsesRawFragment, 0)
 	for i := range input.Items {
 		item := input.Items[i]
-		if i >= len(rawItems) || len(rawItems[i]) == 0 || isStructurallyRepresentedInputItem(item.Type) {
+		if i >= len(rawItems) || len(rawItems[i]) == 0 || isStructurallyRepresentedInputItemValue(item) {
 			continue
 		}
 
@@ -189,11 +197,23 @@ func buildRawOnlyInputFragments(input Input, rawItems []json.RawMessage) []llm.O
 func isStructurallyRepresentedInputItem(itemType string) bool {
 	switch itemType {
 	case "", "message", "input_text", "input_image", "function_call", "function_call_output",
-		"custom_tool_call", "custom_tool_call_output", "reasoning", "compaction", "compaction_summary":
+		"custom_tool_call", "custom_tool_call_output", "mcp_list_tools", "mcp_approval_request",
+		"mcp_approval_response", "mcp_call", "web_search_call", "image_generation_call", "local_shell_call",
+		"local_shell_call_output", "computer_call", "computer_call_output", "file_search_call", "code_interpreter_call",
+		"shell_call", "shell_call_output", "apply_patch_call", "apply_patch_call_output",
+		"tool_search_call", "tool_search_output", "reasoning",
+		"compaction", "compaction_summary", "additional_tools":
 		return true
 	default:
 		return false
 	}
+}
+
+func isStructurallyRepresentedInputItemValue(item Item) bool {
+	if item.Type == "tool_search_call" || item.Type == "tool_search_output" {
+		return item.Execution == string(llm.ExecutionOwnerClient)
+	}
+	return isStructurallyRepresentedInputItem(item.Type)
 }
 
 func openAIResponsesRequestExtensions(llmReq *llm.Request) *llm.OpenAIResponsesRequestExtensions {

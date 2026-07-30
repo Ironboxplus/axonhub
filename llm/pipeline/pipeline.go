@@ -44,6 +44,35 @@ type ChannelCustomizedExecutor interface {
 	CustomizeExecutor(Executor) Executor
 }
 
+type conversionSummaryReporter interface {
+	ConversionSummaryFromRequest(*httpclient.Request) (llm.ConversionTraceSummary, bool)
+	ConversionSummaryFromResponse(*llm.Response) (llm.ConversionTraceSummary, bool)
+}
+
+type conversionDebugReporter interface {
+	ConversionDebugFromRequest(*httpclient.Request) (*llm.ConversionDebugTrace, bool)
+	ConversionDebugFromResponse(*llm.Response) (*llm.ConversionDebugTrace, bool)
+}
+
+func outboundCapability[T any](outbound transformer.Outbound) (T, bool) {
+	var zero T
+	for outbound != nil {
+		if capability, ok := any(outbound).(T); ok {
+			return capability, true
+		}
+		wrapper, ok := outbound.(transformer.OutboundWrapper)
+		if !ok {
+			break
+		}
+		next := wrapper.UnwrapOutbound()
+		if next == nil || next == outbound {
+			break
+		}
+		outbound = next
+	}
+	return zero, false
+}
+
 // Option defines a pipeline configuration option.
 type Option func(*pipeline)
 
@@ -150,6 +179,7 @@ type pipeline struct {
 	nonStreamTimeout          time.Duration
 	observer                  Observer
 	singleAttemptRequestReuse bool
+	toolLoopController        ToolLoopController
 }
 
 type Result struct {
@@ -283,6 +313,9 @@ func (p *pipeline) Process(ctx context.Context, request *httpclient.Request) (*R
 	// TransformRequest. Do not call APIFormat before that selection boundary.
 	trace := newPipelineTrace(p.observer, "")
 	ctx = withPipelineTrace(ctx, trace)
+	if trace != nil {
+		ctx = llm.WithConversionTrace(ctx)
+	}
 
 	// Step 1: Transform httpclient.Request to llm.Request using inbound transformer
 	startedAt := observationStart(ctx)
@@ -344,7 +377,7 @@ func (p *pipeline) Process(ctx context.Context, request *httpclient.Request) (*R
 
 		// 1. Try same-channel retry first if supported
 		if !timeoutRetry {
-			if channelRetryable, ok := p.Outbound.(ChannelRetryable); ok {
+			if channelRetryable, ok := outboundCapability[ChannelRetryable](p.Outbound); ok {
 				if sameChannelRetries < p.getMaxSameChannelRetries() && channelRetryable.CanRetry(lastErr) {
 					if err := channelRetryable.PrepareForRetry(ctx); err == nil {
 						sameChannelRetries++
@@ -368,7 +401,7 @@ func (p *pipeline) Process(ctx context.Context, request *httpclient.Request) (*R
 
 		// 2. If same-channel retry not possible/exhausted, try channel switching
 		if !canRetry {
-			if retryable, ok := p.Outbound.(Retryable); ok {
+			if retryable, ok := outboundCapability[Retryable](p.Outbound); ok {
 				if channelSwitches < p.maxChannelRetries && retryable.HasMoreChannels() {
 					if err := retryable.NextChannel(ctx); err == nil {
 						channelSwitches++
@@ -414,49 +447,13 @@ func (p *pipeline) Process(ctx context.Context, request *httpclient.Request) (*R
 
 func (p *pipeline) processRequest(ctx context.Context, request *llm.Request) (*Result, error) {
 	originalWantStream := request.Stream != nil && *request.Stream
-
-	startedAt := observationStart(ctx)
-	httpReq, err := p.Outbound.TransformRequest(ctx, request)
-	if err == nil {
-		if trace := traceFromContext(ctx); trace != nil {
-			trace.setOutboundAPIFormat(p.Outbound.APIFormat())
-		}
+	if p.toolLoopController != nil && isToolLoopRequest(request) {
+		return p.processToolLoop(ctx, request, originalWantStream)
 	}
-	outputBytes := int64(0)
-	if httpReq != nil {
-		outputBytes = int64(len(httpReq.Body))
-	}
-	observeStage(ctx, StageOutboundTransform, startedAt, err, observationData{outputBytes: outputBytes})
+	round, err := p.prepareProviderRound(ctx, request)
 	if err != nil {
-		return nil, fmt.Errorf("failed to transform request: %w", err)
+		return nil, err
 	}
-
-	httpReq = httpclient.MergeInboundRequest(httpReq, request.RawRequest)
-
-	httpReq, err = httpclient.FinalizeAuthHeaders(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("invalid authentication config: %w", err)
-	}
-
-	// Apply raw request middlewares
-	startedAt = observationStart(ctx)
-	httpReq, err = p.applyRawRequestMiddlewares(ctx, httpReq)
-	outputBytes = 0
-	if httpReq != nil {
-		outputBytes = int64(len(httpReq.Body))
-	}
-	observeStage(ctx, StageOutboundMiddleware, startedAt, err, observationData{outputBytes: outputBytes})
-	if err != nil {
-		p.applyRawErrorResponseMiddlewares(ctx, err)
-
-		return nil, fmt.Errorf("failed to apply raw request middlewares: %w", err)
-	}
-
-	executor := p.Executor
-	if c, ok := p.Outbound.(ChannelCustomizedExecutor); ok {
-		executor = c.CustomizeExecutor(executor)
-	}
-
 	effectiveWantStream := request.Stream != nil && *request.Stream
 
 	var result *Result
@@ -466,7 +463,7 @@ func (p *pipeline) processRequest(ctx context.Context, request *llm.Request) (*R
 			Stream: true,
 		}
 
-		stream, err := p.stream(ctx, executor, httpReq, p.streamFirstEventTimeout)
+		stream, err := p.stream(ctx, round.executor, round.request, p.streamFirstEventTimeout)
 		if err != nil {
 			return nil, fmt.Errorf("failed to stream request: %w", err)
 		}
@@ -478,7 +475,7 @@ func (p *pipeline) processRequest(ctx context.Context, request *llm.Request) (*R
 		}
 
 		timeoutCtx, cancel := p.withNonStreamTimeout(ctx)
-		response, err := p.autoAggregateStream(timeoutCtx, executor, httpReq)
+		response, err := p.autoAggregateStream(timeoutCtx, round.executor, round.request)
 		cancel()
 		if err != nil {
 			if p.isNonStreamTimeout(timeoutCtx) {
@@ -495,7 +492,7 @@ func (p *pipeline) processRequest(ctx context.Context, request *llm.Request) (*R
 		}
 
 		timeoutCtx, cancel := p.withNonStreamTimeout(ctx)
-		response, err := p.notStream(timeoutCtx, executor, httpReq)
+		response, err := p.notStream(timeoutCtx, round.executor, round.request)
 		if err != nil {
 			cancel()
 			if p.isNonStreamTimeout(timeoutCtx) {
@@ -520,6 +517,113 @@ func (p *pipeline) processRequest(ctx context.Context, request *llm.Request) (*R
 	}
 
 	return result, nil
+}
+
+func (p *pipeline) processToolLoop(ctx context.Context, request *llm.Request, wantStream bool) (*Result, error) {
+	startedAt := observationStart(ctx)
+	rounds := &canonicalRoundTripper{pipeline: p}
+	if wantStream {
+		canonicalStream, err := p.toolLoopController.Stream(ctx, request, rounds)
+		if err != nil {
+			observeStage(ctx, StageConversionEmulation, startedAt, err, observationData{emulation: emulationSummary(ctx)})
+			return nil, fmt.Errorf("gateway tool loop stream failed: %w", err)
+		}
+		canonicalStream = observeEmulationStream(ctx, startedAt, canonicalStream)
+		clientStream, err := p.finalizeStream(ctx, canonicalStream)
+		if err != nil {
+			return nil, err
+		}
+		return &Result{Stream: true, EventStream: clientStream}, nil
+	}
+
+	timeoutCtx, cancel := p.withNonStreamTimeout(ctx)
+	response, err := p.toolLoopController.Complete(timeoutCtx, request, rounds)
+	observeStage(timeoutCtx, StageConversionEmulation, startedAt, err, observationData{emulation: emulationSummary(timeoutCtx)})
+	if err != nil {
+		cancel()
+		if p.isNonStreamTimeout(timeoutCtx) {
+			return nil, ErrNonStreamResponseTimeout
+		}
+		return nil, fmt.Errorf("gateway tool loop failed: %w", err)
+	}
+	finalResponse, err := p.finalizeNotStream(timeoutCtx, response)
+	cancel()
+	if err != nil {
+		if p.isNonStreamTimeout(timeoutCtx) {
+			return nil, ErrNonStreamResponseTimeout
+		}
+		return nil, err
+	}
+	return &Result{Stream: false, Response: finalResponse}, nil
+}
+
+type preparedProviderRound struct {
+	request  *httpclient.Request
+	executor Executor
+}
+
+// prepareProviderRound owns every provider-attempt concern that must repeat
+// for an internal gateway-emulation round: target encoding, conversion plan,
+// inbound transport merge, authentication, raw request middleware, and any
+// provider-specific executor customization.
+func (p *pipeline) prepareProviderRound(ctx context.Context, request *llm.Request) (*preparedProviderRound, error) {
+
+	startedAt := observationStart(ctx)
+	httpReq, err := p.Outbound.TransformRequest(ctx, request)
+	if err == nil {
+		if trace := traceFromContext(ctx); trace != nil {
+			trace.setOutboundAPIFormat(p.Outbound.APIFormat())
+		}
+	}
+	outputBytes := int64(0)
+	if httpReq != nil {
+		outputBytes = int64(len(httpReq.Body))
+	}
+	observeStage(ctx, StageOutboundTransform, startedAt, err, observationData{outputBytes: outputBytes})
+	if err != nil {
+		return nil, fmt.Errorf("failed to transform request: %w", err)
+	}
+	conversionData := observationData{}
+	if reporter, ok := outboundCapability[conversionSummaryReporter](p.Outbound); ok {
+		if summary, found := reporter.ConversionSummaryFromRequest(httpReq); found {
+			conversionData.conversion = &summary
+		}
+	}
+	if reporter, ok := outboundCapability[conversionDebugReporter](p.Outbound); ok {
+		if debug, found := reporter.ConversionDebugFromRequest(httpReq); found {
+			conversionData.conversionDebug = debug
+		}
+	}
+	if conversionData.conversion != nil || conversionData.conversionDebug != nil {
+		observeStage(ctx, StageConversionPlan, time.Time{}, nil, conversionData)
+	}
+
+	httpReq = httpclient.MergeInboundRequest(httpReq, request.RawRequest)
+
+	httpReq, err = httpclient.FinalizeAuthHeaders(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("invalid authentication config: %w", err)
+	}
+
+	// Apply raw request middlewares
+	startedAt = observationStart(ctx)
+	httpReq, err = p.applyRawRequestMiddlewares(ctx, httpReq)
+	outputBytes = 0
+	if httpReq != nil {
+		outputBytes = int64(len(httpReq.Body))
+	}
+	observeStage(ctx, StageOutboundMiddleware, startedAt, err, observationData{outputBytes: outputBytes})
+	if err != nil {
+		p.applyRawErrorResponseMiddlewares(ctx, err)
+
+		return nil, fmt.Errorf("failed to apply raw request middlewares: %w", err)
+	}
+
+	executor := p.Executor
+	if c, ok := outboundCapability[ChannelCustomizedExecutor](p.Outbound); ok {
+		executor = c.CustomizeExecutor(executor)
+	}
+	return &preparedProviderRound{request: httpReq, executor: executor}, nil
 }
 
 type cancelOnCloseReadCloser struct {

@@ -61,6 +61,15 @@ type Outbound interface {
 	AggregateStreamChunks(ctx context.Context, req *httpclient.Request, chunks []*httpclient.StreamEvent) ([]byte, llm.ResponseMeta, error)
 }
 
+// OutboundWrapper is implemented by provider-neutral decorators around an
+// Outbound. Pipeline uses it only to discover optional provider capabilities
+// (custom executors and retry controls) on the wrapped transformer; semantic
+// request and response transforms still flow through every decorator.
+type OutboundWrapper interface {
+	Outbound
+	UnwrapOutbound() Outbound
+}
+
 // VideoTaskOutbound is an optional extension interface for outbound transformers that support
 // video task query/delete operations (async task model).
 type VideoTaskOutbound interface {

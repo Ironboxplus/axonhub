@@ -1,6 +1,7 @@
 package anthropic
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 
@@ -210,6 +211,9 @@ type ToolChoice struct {
 
 // Tool represents a tool definition for Anthropic API.
 type Tool struct {
+	// Raw preserves version-specific native tool fields that Axon does not need
+	// to interpret. It is consumed by the canonical sidecar on identity routes.
+	Raw json.RawMessage `json:"-"`
 	// Type is used for native tools (e.g., "web_search_20250305").
 	// For custom/function tools, this field is omitted.
 	Type         string          `json:"type,omitempty"`
@@ -217,6 +221,9 @@ type Tool struct {
 	Description  string          `json:"description,omitempty"`
 	InputSchema  json.RawMessage `json:"input_schema,omitempty"`
 	CacheControl *CacheControl   `json:"cache_control,omitempty"`
+	// DeferLoading keeps a tool definition in the request-side catalog while
+	// excluding it from the model context until tool search selects it.
+	DeferLoading *bool `json:"defer_loading,omitempty"`
 
 	// Params for web_search_20250305 tool.
 
@@ -233,6 +240,37 @@ type Tool struct {
 	// UserLocation Parameters for the user's location. Used to provide more relevant search
 	// results.
 	UserLocation WebSearchToolUserLocation `json:"user_location,omitzero"`
+
+	// Params for versioned web_fetch tools.
+	Citations         *WebFetchCitations `json:"citations,omitempty"`
+	MaxContentTokens  *int64             `json:"max_content_tokens,omitempty"`
+	UseCache          *bool              `json:"use_cache,omitempty"`
+	ResponseInclusion string             `json:"response_inclusion,omitempty"`
+}
+
+func (tool *Tool) UnmarshalJSON(data []byte) error {
+	type toolWire Tool
+	var wire toolWire
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*tool = Tool(wire)
+	if tool.Type != "" {
+		tool.Raw = append(json.RawMessage(nil), data...)
+	}
+	return nil
+}
+
+func (tool Tool) MarshalJSON() ([]byte, error) {
+	if len(tool.Raw) > 0 && json.Valid(tool.Raw) {
+		return append([]byte(nil), tool.Raw...), nil
+	}
+	type toolWire Tool
+	return json.Marshal(toolWire(tool))
+}
+
+type WebFetchCitations struct {
+	Enabled bool `json:"enabled"`
 }
 
 type WebSearchToolUserLocation struct {
@@ -279,6 +317,10 @@ type MessageParam struct {
 type MessageContent struct {
 	Content         *string               `json:"content,omitempty"`
 	MultipleContent []MessageContentBlock `json:"multiple_content,omitempty"`
+	// ObjectContent is the object branch used by Anthropic server-tool results
+	// such as web_fetch_result and bash_code_execution_result. It remains a
+	// typed view for canonical decoding while Raw preserves every provider field.
+	ObjectContent *MessageContentBlock `json:"-"`
 
 	// Raw, when non-nil, is emitted verbatim by MarshalJSON. It is used to
 	// round-trip *_tool_result content bytes without losing unknown fields.
@@ -324,6 +366,9 @@ func (c MessageContent) MarshalJSON() ([]byte, error) {
 	if c.Content != nil {
 		return json.Marshal(c.Content)
 	}
+	if c.ObjectContent != nil {
+		return json.Marshal(c.ObjectContent)
+	}
 
 	return json.Marshal(c.MultipleContent)
 }
@@ -332,6 +377,10 @@ func (c *MessageContent) UnmarshalJSON(data []byte) error {
 	if string(data) == "null" {
 		return fmt.Errorf("content cannot be null")
 	}
+	c.Content = nil
+	c.MultipleContent = nil
+	c.ObjectContent = nil
+	c.Raw = nil
 
 	var blocks []MessageContentBlock
 
@@ -353,6 +402,15 @@ func (c *MessageContent) UnmarshalJSON(data []byte) error {
 		return nil
 	}
 
+	trimmed := bytes.TrimSpace(data)
+	var object MessageContentBlock
+	err = json.Unmarshal(trimmed, &object)
+	if err == nil && len(trimmed) > 0 && trimmed[0] == '{' {
+		c.ObjectContent = &object
+		c.Raw = append(c.Raw[:0], trimmed...)
+		return nil
+	}
+
 	return fmt.Errorf("invalid content type")
 }
 
@@ -364,8 +422,10 @@ type MessageContentBlock struct {
 	// Text will be present if type is "text".
 	Text *string `json:"text,omitempty"`
 
-	// Citations will be present if type is "text".
-	Citations []TextCitation `json:"citations,omitempty"`
+	// Citations is the output-text citation array. DocumentCitations owns the
+	// object-shaped request field with the same wire key.
+	Citations         []TextCitation     `json:"-"`
+	DocumentCitations *DocumentCitations `json:"-"`
 
 	// Thinking will be present if type is "thinking".
 	Thinking *string `json:"thinking,omitempty"`
@@ -378,6 +438,9 @@ type MessageContentBlock struct {
 
 	// Image will be present if type is "image".
 	Source *ImageSource `json:"source,omitempty"`
+	// Context is document metadata; Title is shared with provider-native
+	// result blocks below because both use the same wire key.
+	Context string `json:"context,omitempty"`
 
 	// Tool use request
 	// tool_use or server_tool_use
@@ -404,6 +467,10 @@ type MessageContentBlock struct {
 	// *_tool_result). It is kept as json.RawMessage to avoid version-matrix
 	// churn (direct / code_execution_20250825 / code_execution_20260120 / ...).
 	Caller json.RawMessage `json:"caller,omitempty"`
+}
+
+type DocumentCitations struct {
+	Enabled bool `json:"enabled"`
 }
 
 // TextCitation represents a citation attached to an Anthropic text block.
@@ -434,25 +501,62 @@ func (b MessageContentBlock) MarshalJSON() ([]byte, error) {
 		})
 	}
 
-	return json.Marshal(blockAlias(b))
+	var citations any
+	if b.DocumentCitations != nil {
+		citations = b.DocumentCitations
+	} else if len(b.Citations) > 0 {
+		citations = b.Citations
+	}
+	return json.Marshal(struct {
+		blockAlias
+		Citations any `json:"citations,omitempty"`
+	}{blockAlias: blockAlias(b), Citations: citations})
 }
 
-// ImageSource represents image source for Anthropic.
+func (b *MessageContentBlock) UnmarshalJSON(data []byte) error {
+	type blockAlias MessageContentBlock
+	var wire struct {
+		blockAlias
+		Citations json.RawMessage `json:"citations"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*b = MessageContentBlock(wire.blockAlias)
+	trimmed := bytes.TrimSpace(wire.Citations)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	switch trimmed[0] {
+	case '[':
+		return json.Unmarshal(trimmed, &b.Citations)
+	case '{':
+		return json.Unmarshal(trimmed, &b.DocumentCitations)
+	default:
+		return fmt.Errorf("invalid citations field")
+	}
+}
+
+// ImageSource is the shared Anthropic image/document source union.
 type ImageSource struct {
 	// Type is the type of image source.
 	// Available values: base64, url
 	Type string `json:"type"`
 	// MediaType is the media type of image.
 	// Available values: image/png, image/jpeg, image/gif, image/webp
-	MediaType string `json:"media_type"`
+	MediaType string `json:"media_type,omitempty"`
 
 	// Data is the image data.
 	// If Type is base64, Data is the base64-encoded image data.
-	Data string `json:"data"`
+	Data string `json:"data,omitempty"`
 
 	// URL is the URL of the image.
 	// It will be present if Type is url.
 	URL string `json:"url,omitempty"`
+
+	// FileID and Content are document-only source branches.
+	FileID  string          `json:"file_id,omitempty"`
+	Content json.RawMessage `json:"content,omitempty"`
 }
 
 // StreamEvent represents events in Anthropic streaming response.

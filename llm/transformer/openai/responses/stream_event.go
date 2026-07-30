@@ -32,6 +32,8 @@ const (
 
 	StreamEventTypeOutputTextDelta StreamEventType = "response.output_text.delta"
 	StreamEventTypeOutputTextDone  StreamEventType = "response.output_text.done"
+	StreamEventTypeRefusalDelta    StreamEventType = "response.refusal.delta"
+	StreamEventTypeRefusalDone     StreamEventType = "response.refusal.done"
 
 	// Function call events.
 
@@ -42,6 +44,16 @@ const (
 
 	StreamEventTypeCustomToolCallInputDelta StreamEventType = "response.custom_tool_call_input.delta"
 	StreamEventTypeCustomToolCallInputDone  StreamEventType = "response.custom_tool_call_input.done"
+
+	// MCP events.
+	StreamEventTypeMCPCallArgumentsDelta  StreamEventType = "response.mcp_call_arguments.delta"
+	StreamEventTypeMCPCallArgumentsDone   StreamEventType = "response.mcp_call_arguments.done"
+	StreamEventTypeMCPCallInProgress      StreamEventType = "response.mcp_call.in_progress"
+	StreamEventTypeMCPCallCompleted       StreamEventType = "response.mcp_call.completed"
+	StreamEventTypeMCPCallFailed          StreamEventType = "response.mcp_call.failed"
+	StreamEventTypeMCPListToolsInProgress StreamEventType = "response.mcp_list_tools.in_progress"
+	StreamEventTypeMCPListToolsCompleted  StreamEventType = "response.mcp_list_tools.completed"
+	StreamEventTypeMCPListToolsFailed     StreamEventType = "response.mcp_list_tools.failed"
 
 	// Reasoning events.
 
@@ -63,7 +75,7 @@ const (
 type StreamEvent struct {
 	// Common fields
 	Type           StreamEventType `json:"type"`
-	SequenceNumber int             `json:"sequence_number"`
+	SequenceNumber *int            `json:"sequence_number,omitempty"`
 
 	// For response.* events
 	Response *Response `json:"response,omitempty"`
@@ -117,6 +129,34 @@ type StreamEventContentPart struct {
 	Annotations []Annotation `json:"annotations,omitzero"`
 	// The refusal reason, for refusal.
 	Refusal *string `json:"refusal,omitempty"`
+}
+
+// MarshalJSON keeps the Responses wire contract that output_text parts always
+// carry an annotations array, including when it is empty. Other part kinds do
+// not gain a protocol-foreign annotations field.
+func (part StreamEventContentPart) MarshalJSON() ([]byte, error) {
+	type contentPart struct {
+		Type        string       `json:"type"`
+		Text        string       `json:"text"`
+		Annotations []Annotation `json:"annotations,omitempty"`
+		Refusal     *string      `json:"refusal,omitempty"`
+	}
+	wire := contentPart{Type: part.Type, Text: part.Text, Refusal: part.Refusal}
+	if part.Type == "output_text" {
+		wire.Annotations = part.Annotations
+		if wire.Annotations == nil {
+			wire.Annotations = []Annotation{}
+		}
+		// A dedicated shape is required because omitempty would otherwise erase
+		// the intentionally empty array.
+		return json.Marshal(struct {
+			Type        string       `json:"type"`
+			Text        string       `json:"text"`
+			Annotations []Annotation `json:"annotations"`
+			Refusal     *string      `json:"refusal,omitempty"`
+		}{wire.Type, wire.Text, wire.Annotations, wire.Refusal})
+	}
+	return json.Marshal(wire)
 }
 
 // MarshalStreamEvent marshals a StreamEvent to JSON bytes suitable for SSE.

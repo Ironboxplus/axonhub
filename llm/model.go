@@ -38,6 +38,15 @@ var (
 //   - Compact: CompactRequest for compact requests
 //   - Completion: CompletionRequest for legacy completion requests
 type Request struct {
+	// Input is the ordered canonical source of truth for the three generation
+	// protocols. Messages remains a migration compatibility view until every
+	// three-protocol encoder reads Input directly.
+	Input []Item `json:"-"`
+
+	// ToolDefinitions is the typed canonical tool registry. Tools remains the
+	// legacy wire-oriented compatibility view during the staged migration.
+	ToolDefinitions []ToolDefinition `json:"-"`
+
 	// Messages is a list of messages to send to the llm model.
 	Messages []Message `json:"messages" validator:"required,min=1"`
 
@@ -122,6 +131,16 @@ type Request struct {
 
 	// The unique ID of the previous response for multi-turn Responses API requests.
 	PreviousResponseID *string `json:"previous_response_id,omitempty"`
+
+	// Conversation is the provider-neutral conversation graph reference.
+	// ParentID represents Responses previous_response_id; ID represents an
+	// explicit conversation object. PreviousResponseID remains as a migration
+	// compatibility view until all provider adapters use this canonical field.
+	Conversation *ConversationRef `json:"-"`
+
+	// Lifecycle carries protocol-neutral storage/background intent. Pointer
+	// values preserve explicit false versus an omitted source option.
+	Lifecycle LifecycleOptions `json:"-"`
 
 	// A stable identifier used to help detect users of your application that may be
 	// violating OpenAI's usage policies. The IDs should be a string that uniquely
@@ -294,6 +313,10 @@ type Request struct {
 	// ProviderExtensions stores provider/API-format private sidecar data.
 	// It is intentionally excluded from normal JSON output to avoid leaking raw prompts or tool outputs.
 	ProviderExtensions *ProviderExtensions `json:"-"`
+
+	// ToolExecutionSecrets contains request-local executor credentials. It must
+	// never enter canonical serialization, conversion traces, or persistence.
+	ToolExecutionSecrets *ToolExecutionSecrets `json:"-"`
 }
 
 type StreamOptions struct {
@@ -470,6 +493,9 @@ type Annotation struct {
 
 // URLCitation represents a URL-based citation.
 type URLCitation struct {
+	// Type preserves the provider citation semantic when more than one native
+	// citation shape shares the same URL fields.
+	Type string `json:"type,omitempty"`
 	// URL is the citation URL
 	URL string `json:"url,omitempty"`
 	// Title is the title of the cited source
@@ -544,6 +570,8 @@ type MessageContentPart struct {
 	// Document is the document content, required when type is "document"
 	// Supports PDF and other document formats
 	Document *DocumentURL `json:"document,omitempty"`
+	// File is the OpenAI Chat Completions type="file" payload.
+	File *File `json:"file,omitempty"`
 
 	// InputAudio is the input audio content, required when type is "input_audio"
 	InputAudio *InputAudio `json:"input_audio,omitempty"`
@@ -579,14 +607,39 @@ type VideoURL struct {
 	URL string `json:"url"`
 }
 
-// DocumentURL represents a document URL (PDF, Word, etc.)
-type DocumentURL struct {
-	// URL is the URL of the document (data URL or regular URL).
-	URL string `json:"url"`
+type DocumentSourceType string
 
-	// MIMEType is the MIME type of the document.
-	// e.g. "application/pdf", "application/msword"
+const (
+	DocumentSourceBase64  DocumentSourceType = "base64"
+	DocumentSourceURL     DocumentSourceType = "url"
+	DocumentSourceFile    DocumentSourceType = "file"
+	DocumentSourceText    DocumentSourceType = "text"
+	DocumentSourceContent DocumentSourceType = "content"
+)
+
+// DocumentURL is the provider-neutral document input. SourceType selects one
+// and only one payload branch. URL without SourceType remains supported for
+// legacy callers and is interpreted as DocumentSourceURL.
+type DocumentURL struct {
+	SourceType DocumentSourceType `json:"source_type,omitempty"`
+	URL        string             `json:"url,omitempty"`
+	Data       string             `json:"data,omitempty"`
+	FileID     string             `json:"file_id,omitempty"`
+	Filename   string             `json:"filename,omitempty"`
+
 	MIMEType string `json:"mime_type,omitempty"`
+	Title    string `json:"title,omitempty"`
+	Context  string `json:"context,omitempty"`
+
+	CitationsEnabled *bool           `json:"citations_enabled,omitempty"`
+	Content          json.RawMessage `json:"content,omitempty"`
+	CacheControl     *CacheControl   `json:"cache_control,omitempty"`
+}
+
+type File struct {
+	FileData string `json:"file_data,omitempty"`
+	FileID   string `json:"file_id,omitempty"`
+	Filename string `json:"filename,omitempty"`
 }
 
 type InputAudio struct {
@@ -651,6 +704,25 @@ type ResponseFormat struct {
 //   - Compact: CompactResponse for compact responses
 //   - Completion: CompletionResponse for legacy completion responses
 type Response struct {
+	// Output is the ordered canonical response item sequence. Choices remains a
+	// migration compatibility view for legacy provider adapters.
+	Output []Item `json:"-"`
+
+	// Status is the protocol-neutral response lifecycle state used by stored
+	// and background Responses operations. Stream Events remain authoritative
+	// while a response is actively being consumed.
+	Status    ResponseStatus   `json:"-"`
+	Lifecycle LifecycleOptions `json:"-"`
+	// TerminalReason preserves a provider's behavioral stop reason (for
+	// example Anthropic pause_turn) independently of protocol-specific choices.
+	TerminalReason string `json:"-"`
+
+	// Events are the canonical streaming lifecycle events represented by this
+	// chunk. Choices/Delta remains a migration compatibility view while protocol
+	// adapters move to Events. A slice is required because a protocol may omit a
+	// start/done event that the decoder deterministically synthesizes.
+	Events []Event `json:"-"`
+
 	ID string `json:"id"`
 
 	// A list of chat completion choices. Can be more than one if `n` is greater
@@ -817,10 +889,25 @@ type Usage struct {
 	// For gemini models only.
 	CompletionModalityTokenDetails []ModalityTokenCount `json:"completion_modality_token_details,omitempty"`
 
+	// ServerToolUsage tracks provider-owned operations that are billed or
+	// metered independently from tokens. It is canonical-only: each protocol
+	// encoder explicitly projects the fields its public usage schema supports.
+	ServerToolUsage *ServerToolUsage `json:"-"`
+
 	// Recovered reports that Normalize repaired an internally inconsistent
 	// provider usage object. It is intentionally not serialized to provider or
 	// client protocols; gateways can use it for diagnostics and accounting.
 	Recovered bool `json:"-"`
+}
+
+// ServerToolUsage is the provider-neutral counter set currently exposed by
+// Anthropic's server tools. Keep these separate from token totals: a request
+// count is neither an input nor an output token.
+type ServerToolUsage struct {
+	WebSearchRequests     int64 `json:"web_search_requests,omitempty"`
+	WebFetchRequests      int64 `json:"web_fetch_requests,omitempty"`
+	CodeExecutionRequests int64 `json:"code_execution_requests,omitempty"`
+	ToolSearchRequests    int64 `json:"tool_search_requests,omitempty"`
 }
 
 func (u *Usage) GetCompletionTokens() *int64 {

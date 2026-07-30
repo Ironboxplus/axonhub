@@ -1,8 +1,10 @@
 package responses
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -30,7 +32,10 @@ func (t *OutboundTransformer) TransformStream(
 	req *httpclient.Request,
 	stream streams.Stream[*httpclient.StreamEvent],
 ) (streams.Stream[*llm.Response], error) {
-	// Append the DONE event to the stream
+	// Only append the compatibility sentinel after a semantic Responses
+	// terminal. A truncated provider stream must reach the canonical finalizer
+	// instead of being mistaken for a normal [DONE].
+	stream = shared.RequireTerminalEvent(stream, isResponsesTerminalEvent)
 	doneEvent := lo.ToPtr(llm.DoneStreamEvent)
 	streamWithDone := streams.AppendStream(stream, doneEvent)
 
@@ -41,11 +46,16 @@ func (t *OutboundTransformer) TransformStream(
 type responsesOutboundStream struct {
 	stream streams.Stream[*httpclient.StreamEvent]
 	state  *outboundStreamState
+	// canonical owns the lossless lifecycle. The legacy Choices projection is
+	// kept in this transformer until all source encoders consume Events.
+	canonical        *canonicalStreamDecoder
+	pendingCanonical []llm.Event
 
 	// Event queue
-	eventQueue []*llm.Response
-	queueIndex int
-	err        error
+	eventQueue        []*llm.Response
+	queueIndex        int
+	err               error
+	incompleteHandled bool
 
 	// Track whether the response completed successfully
 	responseCompleted bool
@@ -78,7 +88,8 @@ type outboundStreamState struct {
 
 func newResponsesOutboundStream(stream streams.Stream[*httpclient.StreamEvent]) *responsesOutboundStream {
 	return &responsesOutboundStream{
-		stream: stream,
+		stream:    stream,
+		canonical: newCanonicalStreamDecoder(),
 		state: &outboundStreamState{
 			toolCalls:                        make(map[string]*llm.ToolCall),
 			itemToCallID:                     make(map[string]string),
@@ -90,6 +101,10 @@ func newResponsesOutboundStream(stream streams.Stream[*httpclient.StreamEvent]) 
 }
 
 func (s *responsesOutboundStream) enqueue(resp *llm.Response) {
+	if resp != nil && resp != llm.DoneResponse && len(s.pendingCanonical) > 0 {
+		resp.Events = append(resp.Events, s.pendingCanonical...)
+		s.pendingCanonical = nil
+	}
 	s.eventQueue = append(s.eventQueue, resp)
 }
 
@@ -105,6 +120,20 @@ func (s *responsesOutboundStream) Next() bool {
 
 	// Try to get the next chunk from source
 	if !s.stream.Next() {
+		if !s.incompleteHandled && errors.Is(s.stream.Err(), ErrStreamIncomplete) {
+			events, err := s.canonical.decode(&StreamEvent{Type: StreamEventTypeResponseIncomplete})
+			if err != nil {
+				s.err = err
+				return false
+			}
+			s.incompleteHandled = true
+			s.responseCompleted = true
+			s.enqueue(&llm.Response{
+				ID: s.state.responseID, Model: s.state.responseModel, Created: s.state.created,
+				Object: "response.stream", APIFormat: llm.APIFormatOpenAIResponse, Events: events,
+			})
+			return s.Next()
+		}
 		// Stream ended - check if we received a terminal event
 		// If not, this is an incomplete stream (e.g., upstream EOF)
 		if s.err == nil && !s.responseCompleted && s.stream.Err() == nil {
@@ -151,6 +180,11 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 	if err != nil {
 		return fmt.Errorf("failed to unmarshal responses api stream event: %w", err)
 	}
+	canonicalEvents, err := s.canonical.decode(&streamEvent)
+	if err != nil {
+		return err
+	}
+	s.pendingCanonical = append(s.pendingCanonical, canonicalEvents...)
 
 	if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
 		slog.DebugContext(context.Background(), "received response stream event",
@@ -161,6 +195,7 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 	// Build base response
 	resp := &llm.Response{
 		Object:             "chat.completion.chunk",
+		APIFormat:          llm.APIFormatOpenAIResponse,
 		ID:                 s.state.responseID,
 		Model:              s.state.responseModel,
 		Created:            s.state.created,
@@ -553,6 +588,7 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 			s.state.usage = streamEvent.Response.Usage.ToUsage()
 			usageResp := &llm.Response{
 				Object:             "chat.completion.chunk",
+				APIFormat:          llm.APIFormatOpenAIResponse,
 				ID:                 s.state.responseID,
 				Model:              s.state.responseModel,
 				Created:            s.state.created,
@@ -676,8 +712,33 @@ func (s *responsesOutboundStream) Err() error {
 	if s.err != nil {
 		return s.err
 	}
+	if s.incompleteHandled {
+		return nil
+	}
 
 	return s.stream.Err()
+}
+
+func isResponsesTerminalEvent(event *httpclient.StreamEvent) bool {
+	if event == nil {
+		return false
+	}
+	if bytes.Equal(bytes.TrimSpace(event.Data), []byte("[DONE]")) {
+		return true
+	}
+	var wire struct {
+		Type StreamEventType `json:"type"`
+	}
+	if json.Unmarshal(event.Data, &wire) != nil {
+		return false
+	}
+	switch wire.Type {
+	case StreamEventTypeResponseCompleted, StreamEventTypeResponseFailed,
+		StreamEventTypeResponseIncomplete, StreamEventTypeResponseCancelled:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *responsesOutboundStream) Close() error {

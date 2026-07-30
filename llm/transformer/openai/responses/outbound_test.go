@@ -379,7 +379,7 @@ func TestOutboundTransformer_TransformRequest_ReplaysProviderRawInputItems(t *te
 	require.Equal(t, "message", message["type"])
 }
 
-func TestOutboundTransformer_TransformRequest_DoesNotReplayRawToolWhenToolsChanged(t *testing.T) {
+func TestOutboundTransformer_TransformRequest_DoesNotReplayRawToolWhenCanonicalToolsChanged(t *testing.T) {
 	inbound := NewInboundTransformer()
 	inboundReq := &httpclient.Request{
 		Body: []byte(`{
@@ -400,6 +400,11 @@ func TestOutboundTransformer_TransformRequest_DoesNotReplayRawToolWhenToolsChang
 			Name:       "different_tool",
 			Parameters: json.RawMessage(`{"type":"object","properties":{}}`),
 		},
+	}}
+	llmReq.ToolDefinitions = []llm.ToolDefinition{{
+		Kind: llm.ToolKindFunction, LogicalName: "different_tool",
+		Function:  &llm.FunctionDefinition{Parameters: json.RawMessage(`{"type":"object","properties":{}}`)},
+		Execution: llm.ExecutionOwnerClient,
 	}}
 
 	outbound, err := NewOutboundTransformer("https://api.openai.com", "test-api-key")

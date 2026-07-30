@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
+	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/httpclient"
 )
 
@@ -16,6 +18,30 @@ func (p *pipeline) notStream(
 	executor Executor,
 	request *httpclient.Request,
 ) (*httpclient.Response, error) {
+	round, err := p.notStreamRound(ctx, executor, request)
+	if err != nil {
+		return nil, err
+	}
+	if round.passthrough != nil {
+		return p.finalizePassthrough(ctx, round.passthrough)
+	}
+	return p.finalizeNotStream(ctx, round.response)
+}
+
+// nonStreamRound is the provider-facing half of a canonical exchange. It is
+// deliberately separated from public response middleware and client encoding
+// so gateway emulation can consume internal model rounds without persisting or
+// exposing them as public response terminals.
+type nonStreamRound struct {
+	response    *llm.Response
+	passthrough *httpclient.Response
+}
+
+func (p *pipeline) notStreamRound(
+	ctx context.Context,
+	executor Executor,
+	request *httpclient.Request,
+) (*nonStreamRound, error) {
 	startedAt := observationStart(ctx)
 	httpResp, err := executor.Do(ctx, request)
 	statusCode := 0
@@ -64,18 +90,7 @@ func (p *pipeline) notStream(
 	// semantic response transformation is intentionally skipped because the
 	// caller requested the provider's same-protocol wire representation.
 	if httpResp != nil && httpResp.BodyStream != nil {
-		startedAt = observationStart(ctx)
-		finalResp, passthroughErr := p.applyInboundRawResponseMiddlewares(ctx, httpResp)
-		statusCode = httpResp.StatusCode
-		observeStage(ctx, StageRawResponsePassthrough, startedAt, passthroughErr, observationData{
-			statusCode: statusCode,
-		})
-		if passthroughErr != nil {
-			_ = httpResp.Close()
-			p.applyRawErrorResponseMiddlewares(ctx, passthroughErr)
-			return nil, fmt.Errorf("failed to apply passthrough response middleware: %w", passthroughErr)
-		}
-		return finalResp, nil
+		return &nonStreamRound{passthrough: httpResp}, nil
 	}
 
 	startedAt = observationStart(ctx)
@@ -89,9 +104,27 @@ func (p *pipeline) notStream(
 
 		return nil, WrapUpstreamError(fmt.Errorf("failed to transform response: %w", err))
 	}
+	conversionData := observationData{}
+	if reporter, ok := outboundCapability[conversionSummaryReporter](p.Outbound); ok {
+		if summary, found := reporter.ConversionSummaryFromResponse(llmResp); found {
+			conversionData.conversion = &summary
+		}
+	}
+	if reporter, ok := outboundCapability[conversionDebugReporter](p.Outbound); ok {
+		if debug, found := reporter.ConversionDebugFromResponse(llmResp); found {
+			conversionData.conversionDebug = debug
+		}
+	}
+	if conversionData.conversion != nil || conversionData.conversionDebug != nil {
+		observeStage(ctx, StageConversionRestore, time.Time{}, nil, conversionData)
+	}
+	return &nonStreamRound{response: llmResp}, nil
+}
 
+func (p *pipeline) finalizeNotStream(ctx context.Context, llmResp *llm.Response) (*httpclient.Response, error) {
+	var err error
 	// Apply LLM response middlewares
-	startedAt = observationStart(ctx)
+	startedAt := observationStart(ctx)
 	llmResp, err = p.applyLlmResponseMiddlewares(ctx, llmResp)
 	observeStage(ctx, StageUnifiedResponseMiddleware, startedAt, err, observationData{})
 	if err != nil {
@@ -109,8 +142,8 @@ func (p *pipeline) notStream(
 
 	startedAt = observationStart(ctx)
 	finalResp, err := p.Inbound.TransformResponse(ctx, llmResp)
-	statusCode = 0
-	outputBytes = 0
+	statusCode := 0
+	outputBytes := int64(0)
 	if finalResp != nil {
 		statusCode = finalResp.StatusCode
 		outputBytes = int64(len(finalResp.Body))
@@ -145,6 +178,24 @@ func (p *pipeline) notStream(
 	}
 
 	return finalResp, nil
+}
+
+func (p *pipeline) finalizePassthrough(ctx context.Context, response *httpclient.Response) (*httpclient.Response, error) {
+	startedAt := observationStart(ctx)
+	finalResponse, err := p.applyInboundRawResponseMiddlewares(ctx, response)
+	statusCode := 0
+	if response != nil {
+		statusCode = response.StatusCode
+	}
+	observeStage(ctx, StageRawResponsePassthrough, startedAt, err, observationData{statusCode: statusCode})
+	if err != nil {
+		if response != nil {
+			_ = response.Close()
+		}
+		p.applyRawErrorResponseMiddlewares(ctx, err)
+		return nil, fmt.Errorf("failed to apply passthrough response middleware: %w", err)
+	}
+	return finalResponse, nil
 }
 
 func (p *pipeline) autoAggregateStream(

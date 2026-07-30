@@ -70,7 +70,10 @@ func (t *InboundTransformer) TransformResponse(ctx context.Context, chatResp *ll
 	}
 
 	// Convert to Responses API format
-	resp := convertToResponsesAPIResponse(chatResp)
+	resp, err := convertToResponsesAPIResponse(chatResp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode canonical Responses output: %w", err)
+	}
 
 	body, err := json.Marshal(resp)
 	if err != nil {
@@ -167,6 +170,7 @@ func (t *InboundTransformer) TransformError(ctx context.Context, rawErr error) *
 
 // convertToLLMRequest converts OpenAI Responses API Request to llm.Request.
 func convertToLLMRequest(req *Request, rawBody ...[]byte) (*llm.Request, error) {
+	conversation := responsesConversationRef(req)
 	chatReq := &llm.Request{
 		Model:               req.Model,
 		Temperature:         req.Temperature,
@@ -184,6 +188,11 @@ func convertToLLMRequest(req *Request, rawBody ...[]byte) (*llm.Request, error) 
 		ParallelToolCalls:   req.ParallelToolCalls,
 		PromptCacheKey:      req.PromptCacheKey,
 		PreviousResponseID:  req.PreviousResponseID,
+		Conversation:        conversation,
+		Lifecycle: llm.LifecycleOptions{
+			Background: req.Background,
+			Store:      req.Store,
+		},
 		TransformerMetadata: map[string]any{},
 		TransformOptions:    llm.TransformOptions{},
 	}
@@ -299,7 +308,57 @@ func convertToLLMRequest(req *Request, rawBody ...[]byte) (*llm.Request, error) 
 		attachOpenAIResponsesRequestExtensions(chatReq, req, rawBody[0])
 	}
 
+	var sourceBody []byte
+	if len(rawBody) > 0 {
+		sourceBody = rawBody[0]
+	}
+	canonicalInput, canonicalTools, err := convertRequestToCanonical(req, sourceBody)
+	if err != nil {
+		return nil, fmt.Errorf("%w: decode Responses canonical items: %w", transformer.ErrInvalidRequest, err)
+	}
+	chatReq.Input = canonicalInput
+	chatReq.ToolDefinitions = canonicalTools
+	chatReq.ToolExecutionSecrets = responsesMCPExecutionSecrets(req.Tools)
+
+	if err := llm.PopulateCanonicalFromLegacy(chatReq); err != nil {
+		return nil, fmt.Errorf("%w: invalid canonical lifecycle: %w", transformer.ErrInvalidRequest, err)
+	}
 	return chatReq, nil
+}
+
+func responsesMCPExecutionSecrets(tools []Tool) *llm.ToolExecutionSecrets {
+	var secrets *llm.ToolExecutionSecrets
+	for index := range tools {
+		tool := &tools[index]
+		if tool.Type != "mcp" || tool.ServerLabel == "" || tool.Authorization == "" && len(tool.Headers) == 0 {
+			continue
+		}
+		if secrets == nil {
+			secrets = &llm.ToolExecutionSecrets{MCP: make(map[string]llm.MCPConnectionSecrets)}
+		}
+		secrets.MCP[tool.ServerLabel] = llm.MCPConnectionSecrets{
+			Authorization: tool.Authorization,
+			Headers:       maps.Clone(tool.Headers),
+		}
+	}
+	return secrets
+}
+
+func responsesConversationRef(req *Request) *llm.ConversationRef {
+	if req == nil {
+		return nil
+	}
+	ref := &llm.ConversationRef{}
+	if req.Conversation != nil && req.Conversation.ID != nil {
+		ref.ID = *req.Conversation.ID
+	}
+	if req.PreviousResponseID != nil {
+		ref.ParentID = *req.PreviousResponseID
+	}
+	if ref.ID == "" && ref.ParentID == "" {
+		return nil
+	}
+	return ref
 }
 
 // convertToolChoiceToLLM converts Responses API ToolChoice to llm.ToolChoice.
@@ -310,14 +369,27 @@ func convertToolChoiceToLLM(src *ToolChoice) *llm.ToolChoice {
 
 	result := &llm.ToolChoice{}
 
-	if src.Mode != nil {
+	if src.Type != nil && *src.Type == "allowed_tools" {
+		mode := "auto"
+		if src.Mode != nil {
+			mode = *src.Mode
+		}
+		allowed := &llm.AllowedToolChoice{Mode: mode, Tools: make([]llm.AllowedToolRef, 0, len(src.Tools))}
+		for index := range src.Tools {
+			tool := src.Tools[index]
+			allowed.Tools = append(allowed.Tools, llm.AllowedToolRef{
+				Type: tool.Type, Name: tool.Name, ServerLabel: tool.ServerLabel,
+			})
+		}
+		result.AllowedTools = allowed
+	} else if src.Mode != nil {
 		result.ToolChoice = src.Mode
-	} else if src.Type != nil && src.Name != nil {
+	} else if src.Type != nil {
 		result.NamedToolChoice = &llm.NamedToolChoice{
 			Type: *src.Type,
-			Function: llm.ToolFunction{
-				Name: *src.Name,
-			},
+		}
+		if src.Name != nil {
+			result.NamedToolChoice.Function.Name = *src.Name
 		}
 	}
 
@@ -921,7 +993,7 @@ func attachAnnotationsToFirstTextItem(items []Item, annotations []llm.Annotation
 }
 
 // convertToResponsesAPIResponse converts llm.Response to Responses API Response.
-func convertToResponsesAPIResponse(chatResp *llm.Response) *Response {
+func convertToResponsesAPIResponse(chatResp *llm.Response) (*Response, error) {
 	resp := &Response{
 		Object:             "response",
 		ID:                 chatResp.ID,
@@ -930,10 +1002,62 @@ func convertToResponsesAPIResponse(chatResp *llm.Response) *Response {
 		Output:             append([]Item(nil), getResponseWebSearchCallsFromMetadata(chatResp.TransformerMetadata)...),
 		Status:             lo.ToPtr("completed"),
 		PreviousResponseID: chatResp.PreviousResponseID,
+		Background:         chatResp.Lifecycle.Background,
 	}
 
 	// Convert usage
 	resp.Usage = ConvertLLMUsageToResponsesUsage(chatResp.Usage)
+	if chatResp.Status != "" && len(chatResp.Output) == 0 {
+		status := string(chatResp.Status)
+		resp.Status = &status
+		resp.Output = []Item{}
+		return resp, nil
+	}
+	if len(chatResp.Output) > 0 {
+		output := make([]Item, 0, len(chatResp.Output))
+		status := string(chatResp.Status)
+		deriveStatus := status == ""
+		if status == "" {
+			status = "completed"
+		}
+		for index := range chatResp.Output {
+			canonical := &chatResp.Output[index]
+			wire, ok := canonicalItemToResponses(canonical)
+			if !ok {
+				return nil, fmt.Errorf("canonical output item %d kind %q has no Responses encoding", index, canonical.Kind)
+			}
+			if wire.ID == "" && canonical.ProtocolHints.SourceFormat != llm.APIFormatOpenAIResponse {
+				wire.ID = generateItemID()
+			}
+			ensureResponsesOutputAnnotations(&wire)
+			output = append(output, wire)
+			if canonical.Kind == llm.ItemKindHostedCall && canonical.HostedCall != nil && canonical.HostedCall.Result != nil {
+				if resultWire, resultOK := canonicalHostedResultToResponses(canonical.HostedCall.Invocation.Kind, canonical.HostedCall.Result); resultOK {
+					if resultWire.ID == "" {
+						resultWire.ID = generateItemID()
+					}
+					output = append(output, resultWire)
+				}
+			}
+			if deriveStatus {
+				switch canonical.Status {
+				case llm.ItemStatusFailed:
+					status = "failed"
+				case llm.ItemStatusIncomplete:
+					if status != "failed" {
+						status = "incomplete"
+					}
+				case llm.ItemStatusInProgress:
+					if status == "completed" {
+						status = "in_progress"
+					}
+				}
+			}
+		}
+		resp.Output = output
+		resp.Status = &status
+		return resp, nil
+	}
 
 	// Convert choices to output items
 	for _, choice := range chatResp.Choices {
@@ -1087,7 +1211,7 @@ func convertToResponsesAPIResponse(chatResp *llm.Response) *Response {
 		}
 	}
 
-	return resp
+	return resp, nil
 }
 
 // generateItemID generates a unique item ID for output items.

@@ -21,6 +21,11 @@ func convertToAnthropicRequestWithConfig(chatReq *llm.Request, config *Config) *
 	req.ToolChoice = convertToolChoiceToAnthropic(chatReq.ToolChoice)
 	req.Messages = convertMessages(chatReq, config)
 	req.StopSequences = convertStopSequences(chatReq.Stop)
+	if system, messages, tools, ok := canonicalAnthropicRequest(chatReq); ok {
+		req.System = system
+		req.Messages = messages
+		req.Tools = tools
+	}
 
 	// DeepSeek requires assistant messages in history to include a thinking block
 	// when thinking is enabled (matching their OpenAI API behavior).
@@ -909,6 +914,17 @@ func convertMultiplePartContent(msg llm.Message) (MessageContent, bool) {
 					})
 				}
 			}
+		case "document":
+			if part.Document != nil {
+				document := *part.Document
+				if document.CacheControl == nil {
+					document.CacheControl = part.CacheControl
+				}
+				converted := canonicalAnthropicContent([]llm.ContentBlock{{Kind: llm.ContentKindDocument, Document: &document}})
+				if len(converted) == 1 {
+					appendOrdered(part.TransformerMetadata, converted[0])
+				}
+			}
 		}
 	}
 
@@ -1157,6 +1173,9 @@ func convertToLlmResponse(anthropicResp *Message, platformType PlatformType) *ll
 	}
 
 	resp.Choices = []llm.Choice{choice}
+	if anthropicResp.StopReason != nil && anthropicStopReasonNeedsMetadata(*anthropicResp.StopReason) {
+		resp.TerminalReason = *anthropicResp.StopReason
+	}
 
 	resp.Usage = convertToLlmUsage(anthropicResp.Usage, platformType)
 	if anthropicResp.StopReason != nil && anthropicStopReasonNeedsMetadata(*anthropicResp.StopReason) {
@@ -1174,8 +1193,38 @@ func convertToLlmResponse(anthropicResp *Message, platformType PlatformType) *ll
 	if transformerMetadata != nil {
 		resp.TransformerMetadata = transformerMetadata
 	}
+	output, err := anthropicResponseToCanonical(anthropicResp)
+	if err == nil {
+		resp.Output = output
+	}
 
 	return resp
+}
+
+// convertToLlmResponseChecked is the provider boundary used by live traffic.
+// The legacy pointer-only helper remains for source compatibility, while this
+// path makes an unrepresentable provider response an explicit relay error.
+func convertToLlmResponseChecked(anthropicResp *Message, platformType PlatformType) (*llm.Response, error) {
+	resp := convertToLlmResponse(anthropicResp, platformType)
+	output, err := anthropicResponseToCanonical(anthropicResp)
+	if err != nil {
+		return nil, err
+	}
+	resp.Output = output
+	if anthropicResp.StopReason == nil {
+		resp.Status = llm.ResponseStatusIncomplete
+	} else {
+		if anthropicStopReasonNeedsMetadata(*anthropicResp.StopReason) {
+			resp.TerminalReason = *anthropicResp.StopReason
+		}
+		switch anthropicTerminalEvent(*anthropicResp.StopReason) {
+		case llm.EventKindResponseCompleted:
+			resp.Status = llm.ResponseStatusCompleted
+		default:
+			resp.Status = llm.ResponseStatusIncomplete
+		}
+	}
+	return resp, nil
 }
 
 func anthropicStopReasonNeedsMetadata(stopReason string) bool {

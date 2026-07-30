@@ -125,8 +125,15 @@ func (t *InboundTransformer) TransformResponse(ctx context.Context, chatResp *ll
 		return nil, fmt.Errorf("chat completion response is nil")
 	}
 
-	// Convert to Anthropic response format
-	anthropicResp := convertToAnthropicResponse(chatResp)
+	// Canonical output is authoritative for converted responses. The legacy
+	// Choices projection cannot represent provider-hosted tool lifecycles.
+	anthropicResp, encodedCanonical, err := canonicalResponseToAnthropic(chatResp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode canonical Anthropic response: %w", err)
+	}
+	if !encodedCanonical {
+		anthropicResp = convertToAnthropicResponse(chatResp)
+	}
 
 	body, err := json.Marshal(anthropicResp)
 	if err != nil {

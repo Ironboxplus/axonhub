@@ -483,10 +483,27 @@ func convertToolChoice(src *llm.ToolChoice) *ToolChoice {
 	if src.ToolChoice != nil {
 		// String mode like "none", "auto", "required"
 		result.Mode = src.ToolChoice
+	} else if src.AllowedTools != nil {
+		choiceType := "allowed_tools"
+		mode := src.AllowedTools.Mode
+		if mode == "" {
+			mode = "auto"
+		}
+		result.Type = &choiceType
+		result.Mode = &mode
+		result.Tools = make([]ToolOption, 0, len(src.AllowedTools.Tools))
+		for index := range src.AllowedTools.Tools {
+			tool := src.AllowedTools.Tools[index]
+			result.Tools = append(result.Tools, ToolOption{
+				Type: tool.Type, Name: tool.Name, ServerLabel: tool.ServerLabel,
+			})
+		}
 	} else if src.NamedToolChoice != nil {
 		// Specific tool choice
 		result.Type = &src.NamedToolChoice.Type
-		result.Name = &src.NamedToolChoice.Function.Name
+		if src.NamedToolChoice.Function.Name != "" {
+			result.Name = &src.NamedToolChoice.Function.Name
+		}
 	}
 
 	return result

@@ -93,8 +93,9 @@ type ToolFunction struct {
 //
 // Tool choice can be a string or a struct.
 type ToolChoice struct {
-	ToolChoice      *string          `json:"tool_choice,omitempty"`
-	NamedToolChoice *NamedToolChoice `json:"named_tool_choice,omitempty"`
+	ToolChoice      *string            `json:"tool_choice,omitempty"`
+	NamedToolChoice *NamedToolChoice   `json:"named_tool_choice,omitempty"`
+	AllowedTools    *AllowedToolChoice `json:"allowed_tools,omitempty"`
 }
 
 type NamedToolChoice struct {
@@ -102,9 +103,29 @@ type NamedToolChoice struct {
 	Function ToolFunction `json:"function"`
 }
 
+// AllowedToolChoice is the provider-neutral form of Responses' allowed_tools
+// selector. Protocols without this object enforce the same semantics by
+// filtering exposed definitions and projecting Mode.
+type AllowedToolChoice struct {
+	Mode  string           `json:"mode"`
+	Tools []AllowedToolRef `json:"tools"`
+}
+
+type AllowedToolRef struct {
+	Type        string `json:"type"`
+	Name        string `json:"name,omitempty"`
+	ServerLabel string `json:"server_label,omitempty"`
+}
+
 func (t ToolChoice) MarshalJSON() ([]byte, error) {
 	if t.ToolChoice != nil {
 		return json.Marshal(t.ToolChoice)
+	}
+	if t.AllowedTools != nil {
+		return json.Marshal(struct {
+			Type string `json:"type"`
+			*AllowedToolChoice
+		}{Type: "allowed_tools", AllowedToolChoice: t.AllowedTools})
 	}
 
 	return json.Marshal(t.NamedToolChoice)
@@ -116,6 +137,17 @@ func (t *ToolChoice) UnmarshalJSON(data []byte) error {
 	err := json.Unmarshal(data, &str)
 	if err == nil {
 		t.ToolChoice = &str
+		return nil
+	}
+	var kind struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(data, &kind) == nil && kind.Type == "allowed_tools" {
+		var allowed AllowedToolChoice
+		if err := json.Unmarshal(data, &allowed); err != nil {
+			return err
+		}
+		t.AllowedTools = &allowed
 		return nil
 	}
 

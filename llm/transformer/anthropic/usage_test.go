@@ -43,6 +43,24 @@ func Test_convertUsage(t *testing.T) {
 			},
 		},
 		{
+			name: "server tool request counters remain separate from tokens",
+			args: args{
+				usage: &Usage{
+					InputTokens: 10, OutputTokens: 2,
+					ServerToolUse: &ServerToolUsage{
+						WebSearchRequests: 3, WebFetchRequests: 2, CodeExecutionRequests: 1, ToolSearchRequests: 4,
+					},
+				},
+				platformType: PlatformDirect,
+			},
+			want: &llm.Usage{
+				PromptTokens: 10, CompletionTokens: 2, TotalTokens: 12,
+				ServerToolUsage: &llm.ServerToolUsage{
+					WebSearchRequests: 3, WebFetchRequests: 2, CodeExecutionRequests: 1, ToolSearchRequests: 4,
+				},
+			},
+		},
+		{
 			name: "cache read tokens greater than input tokens - Anthropic official",
 			args: args{
 				usage: &Usage{
@@ -381,6 +399,21 @@ func Test_convertToAnthropicUsage(t *testing.T) {
 			want: &Usage{
 				InputTokens:  100,
 				OutputTokens: 50,
+			},
+		},
+		{
+			name: "server tool request counters",
+			llmUsage: &llm.Usage{
+				PromptTokens: 100, CompletionTokens: 50,
+				ServerToolUsage: &llm.ServerToolUsage{
+					WebSearchRequests: 3, WebFetchRequests: 2, CodeExecutionRequests: 1, ToolSearchRequests: 4,
+				},
+			},
+			want: &Usage{
+				InputTokens: 100, OutputTokens: 50,
+				ServerToolUse: &ServerToolUsage{
+					WebSearchRequests: 3, WebFetchRequests: 2, CodeExecutionRequests: 1, ToolSearchRequests: 4,
+				},
 			},
 		},
 	}

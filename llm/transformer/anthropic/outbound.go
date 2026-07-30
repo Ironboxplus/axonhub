@@ -156,6 +156,9 @@ func (t *OutboundTransformer) TransformRequest(
 	if len(llmReq.Messages) == 0 {
 		return nil, fmt.Errorf("%w: messages are required", transformer.ErrInvalidRequest)
 	}
+	if err := validateCanonicalAnthropicRequest(llmReq); err != nil {
+		return nil, fmt.Errorf("%w: %v", transformer.ErrInvalidRequest, err)
+	}
 
 	// Validate max_tokens
 	if llmReq.MaxTokens != nil && *llmReq.MaxTokens <= 0 {
@@ -325,10 +328,9 @@ func (t *OutboundTransformer) TransformResponse(
 		return nil, fmt.Errorf("failed to unmarshal anthropic response: %w", err)
 	}
 
-	// Convert to ChatCompletionResponse
-	chatResp := convertToLlmResponse(&anthropicResp, t.config.Type)
-
-	return chatResp, nil
+	// Canonical Output is authoritative for lifecycle persistence and every
+	// cross-protocol renderer.
+	return convertToLlmResponseChecked(&anthropicResp, t.config.Type)
 }
 
 // AggregateStreamChunks aggregates Anthropic streaming response chunks into a complete response.

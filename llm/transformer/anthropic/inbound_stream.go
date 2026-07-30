@@ -29,6 +29,7 @@ func (t *InboundTransformer) TransformStream(
 		pendingTextCitations:       nil,
 		pendingReasoningContent:    make(map[string][]string),
 		pendingReasoningSignatures: make(map[string]*string),
+		canonicalEncoder:           newAnthropicCanonicalEncoder(),
 	}, nil
 }
 
@@ -77,6 +78,9 @@ type anthropicInboundStream struct {
 	// Buffered citations for the currently open text block. These are emitted as
 	// citations_delta events immediately before the text block is closed.
 	pendingTextCitations []TextCitation
+	canonicalEncoder     *anthropicCanonicalEncoder
+	canonicalMode        bool
+	identityMode         bool
 }
 
 // generateSignature generates a random signature using base64(uuid).
@@ -602,19 +606,35 @@ func (s *anthropicInboundStream) Next() bool {
 	if chunk == nil {
 		return s.Next() // Try next chunk
 	}
+	if chunk.APIFormat == llm.APIFormatAnthropicMessage {
+		s.identityMode = true
+	}
+
+	// Initialize message ID and model before canonical response_started.
+	if s.messageID == "" && chunk.ID != "" {
+		s.messageID = chunk.ID
+	}
+	if s.model == "" && chunk.Model != "" {
+		s.model = chunk.Model
+	}
+
+	if len(chunk.Events) > 0 && !s.identityMode {
+		s.canonicalMode = true
+		for _, event := range chunk.Events {
+			if err := s.canonicalEncoder.encode(s, event); err != nil {
+				s.err = err
+				return false
+			}
+		}
+		return s.Next()
+	}
+	if s.canonicalMode {
+		return s.Next()
+	}
 
 	// Handle [DONE] marker
 	if chunk.Object == "[DONE]" {
 		return s.Next() // Try next chunk
-	}
-
-	// Initialize message ID and model from first chunk
-	if s.messageID == "" && chunk.ID != "" {
-		s.messageID = chunk.ID
-	}
-
-	if s.model == "" && chunk.Model != "" {
-		s.model = chunk.Model
 	}
 
 	// Generate message_start event if this is the first chunk

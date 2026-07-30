@@ -161,6 +161,10 @@ func AggregateStreamChunks(ctx context.Context, chunks []*httpclient.StreamEvent
 					if event.Usage.CacheReadInputTokens > 0 {
 						usage.CacheReadInputTokens = event.Usage.CacheReadInputTokens
 					}
+					if event.Usage.ServerToolUse != nil {
+						serverUsage := *event.Usage.ServerToolUse
+						usage.ServerToolUse = &serverUsage
+					}
 				}
 			}
 		case "content_block_stop":

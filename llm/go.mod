@@ -14,12 +14,14 @@ require (
 	github.com/samber/lo v1.52.0
 	github.com/spf13/cast v1.10.0
 	github.com/stretchr/testify v1.11.1
+	github.com/tetratelabs/wazero v1.12.0
 	github.com/tidwall/gjson v1.18.0
 	github.com/tidwall/sjson v1.2.5
 	github.com/tmaxmax/go-sse v0.11.0
 	golang.org/x/oauth2 v0.35.0
 	golang.org/x/sync v0.21.0
 	google.golang.org/api v0.257.0
+	pgregory.net/rapid v1.3.0
 )
 
 require (

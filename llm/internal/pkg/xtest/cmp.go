@@ -55,6 +55,9 @@ func Equal(a, b any, opts ...cmp.Option) bool {
 		NilPromptTokensDetails,
 		ToolCallsTransformer,
 		cmpopts.IgnoreFields(llm.Request{}, "TransformOptions"),
+		// Canonical lifecycle events are verified by stream-specific assertions.
+		// Legacy fixture comparisons intentionally cover only the compatibility view.
+		cmpopts.IgnoreFields(llm.Response{}, "Events"),
 		cmp.Transformer("", nilString),
 		cmp.Transformer("", nilInt),
 		cmp.Comparer(jsonRawMessageComparer))

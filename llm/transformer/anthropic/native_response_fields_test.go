@@ -1,10 +1,13 @@
 package anthropic
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/require"
+
+	"github.com/looplj/axonhub/llm"
 )
 
 func TestAnthropicNativeTerminalFieldsRoundTrip(t *testing.T) {
@@ -19,12 +22,33 @@ func TestAnthropicNativeTerminalFieldsRoundTrip(t *testing.T) {
 	}
 
 	unified := convertToLlmResponse(provider, PlatformDirect)
+	require.Equal(t, "pause_turn", unified.TerminalReason)
 	restored := convertToAnthropicResponse(unified)
 
 	require.NotNil(t, restored.StopReason)
 	require.Equal(t, "pause_turn", *restored.StopReason)
 	require.NotNil(t, restored.StopSequence)
 	require.Equal(t, "<END>", *restored.StopSequence)
+}
+
+func TestAnthropicServerToolUsageJSONRoundTrip(t *testing.T) {
+	var provider Usage
+	require.NoError(t, json.Unmarshal([]byte(`{
+		"input_tokens":10,"output_tokens":2,
+		"server_tool_use":{"web_search_requests":3,"web_fetch_requests":2,"code_execution_requests":1,"tool_search_requests":4}
+	}`), &provider))
+	unified := convertToLlmUsage(&provider, PlatformDirect)
+	require.Equal(t, &llm.ServerToolUsage{
+		WebSearchRequests: 3, WebFetchRequests: 2, CodeExecutionRequests: 1, ToolSearchRequests: 4,
+	}, unified.ServerToolUsage)
+
+	restored, err := json.Marshal(convertToAnthropicUsage(unified))
+	require.NoError(t, err)
+	require.JSONEq(t, `{
+		"input_tokens":10,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,
+		"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},
+		"server_tool_use":{"web_search_requests":3,"web_fetch_requests":2,"code_execution_requests":1,"tool_search_requests":4}
+	}`, string(restored))
 }
 
 func TestAnthropicMCPServerNameRoundTrip(t *testing.T) {
