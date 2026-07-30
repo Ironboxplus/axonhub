@@ -41,6 +41,7 @@ type WebSearchInput struct {
 	Query          string                        `json:"query,omitempty"`
 	Queries        []string                      `json:"queries,omitempty"`
 	AllowedDomains []string                      `json:"allowed_domains,omitempty"`
+	BlockedDomains []string                      `json:"blocked_domains,omitempty"`
 	UserLocation   llm.WebSearchToolUserLocation `json:"user_location,omitempty"`
 }
 
@@ -55,25 +56,19 @@ type WebSearchOutput struct {
 }
 
 func NewWebSearchExecutor(config WebSearchExecutorConfig) (*WebSearchExecutor, error) {
-	endpoint, err := url.Parse(config.Endpoint)
-	if err != nil || endpoint.Scheme == "" || endpoint.Host == "" {
-		return nil, errors.New("web search executor requires an absolute endpoint")
-	}
-	if config.EndpointPolicy == nil {
-		return nil, errors.New("web search executor requires an endpoint policy")
-	}
-	if err := config.EndpointPolicy(endpoint); err != nil {
-		return nil, fmt.Errorf("web search executor endpoint rejected: %w", err)
-	}
-	client := config.Client
-	if client == nil {
-		client = http.DefaultClient
+	endpoint, client, err := policyHTTPClient("web search executor", config.Endpoint, config.Client, config.EndpointPolicy)
+	if err != nil {
+		return nil, err
 	}
 	limit := config.MaxResponseBytes
 	if limit <= 0 {
 		limit = defaultWebSearchResponseLimit
 	}
-	return &WebSearchExecutor{endpoint: endpoint, client: client, headers: config.Headers.Clone(), limit: limit}, nil
+	headers := config.Headers.Clone()
+	if headers == nil {
+		headers = make(http.Header)
+	}
+	return &WebSearchExecutor{endpoint: endpoint, client: client, headers: headers, limit: limit}, nil
 }
 
 func (*WebSearchExecutor) Kind() llm.ToolKind { return llm.ToolKindWebSearch }
@@ -177,8 +172,16 @@ func webSearchInput(definition llm.ToolDefinition, invocation llm.ToolInvocation
 		return input, errors.New("web search invocation requires query or queries")
 	}
 	if definition.Hosted != nil && definition.Hosted.WebSearch != nil {
-		input.AllowedDomains = append([]string(nil), definition.Hosted.WebSearch.AllowedDomains...)
-		input.UserLocation = definition.Hosted.WebSearch.UserLocation
+		webSearch := definition.Hosted.WebSearch
+		input.AllowedDomains = append([]string(nil), webSearch.AllowedDomains...)
+		input.BlockedDomains = append([]string(nil), webSearch.BlockedDomains...)
+		input.UserLocation = webSearch.UserLocation
+	}
+	if _, err := normalizeDomainRules(input.AllowedDomains); err != nil {
+		return input, fmt.Errorf("invalid web search allowed domains: %w", err)
+	}
+	if _, err := normalizeDomainRules(input.BlockedDomains); err != nil {
+		return input, fmt.Errorf("invalid web search blocked domains: %w", err)
 	}
 	return input, nil
 }

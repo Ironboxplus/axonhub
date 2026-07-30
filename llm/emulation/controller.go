@@ -715,11 +715,17 @@ func interruptedMCPCall(registry *mcp.Registry, call gatewayCall, status llm.Res
 }
 
 func toolResultItem(call gatewayCall, output string, failed bool) llm.Item {
+	itemStatus := llm.ItemStatusCompleted
+	resultStatus := llm.ToolResultStatusCompleted
+	if failed {
+		itemStatus = llm.ItemStatusFailed
+		resultStatus = llm.ToolResultStatusFailed
+	}
 	return llm.Item{
-		Kind: llm.ItemKindToolResult, Status: llm.ItemStatusCompleted,
+		Kind: llm.ItemKindToolResult, Status: itemStatus,
 		ToolResult: &llm.ToolResult{
 			Kind: llm.ToolKindFunction, CallID: call.item.ToolCall.CallID,
-			LogicalName: call.item.ToolCall.LogicalName, IsError: failed, Status: llm.ToolResultStatusCompleted,
+			LogicalName: call.item.ToolCall.LogicalName, IsError: failed, Status: resultStatus,
 			Content: []llm.ContentBlock{{Kind: llm.ContentKindText, Text: output}},
 		},
 	}

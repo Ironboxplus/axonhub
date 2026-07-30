@@ -97,11 +97,11 @@ func (registry *customConstraintRegistry) Close(ctx context.Context) error {
 
 func customConstraintResult(call *llm.ToolInvocation) llm.Item {
 	return llm.Item{
-		Kind: llm.ItemKindToolResult, Status: llm.ItemStatusCompleted,
+		Kind: llm.ItemKindToolResult, Status: llm.ItemStatusFailed,
 		ToolResult: &llm.ToolResult{
 			Kind: llm.ToolKindCustom, CallID: call.CallID, LogicalName: call.LogicalName,
 			Content: []llm.ContentBlock{{Kind: llm.ContentKindText, Text: customConstraintFeedback}},
-			IsError: true, Status: llm.ToolResultStatusCompleted,
+			IsError: true, Status: llm.ToolResultStatusFailed,
 		},
 	}
 }

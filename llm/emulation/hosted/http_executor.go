@@ -63,15 +63,9 @@ func NewHTTPExecutor(config HTTPExecutorConfig) (*HTTPExecutor, error) {
 	if err != nil {
 		return nil, err
 	}
-	endpoint, err := url.Parse(config.Endpoint)
-	if err != nil || endpoint.Scheme == "" || endpoint.Host == "" || endpoint.User != nil {
-		return nil, errors.New("hosted HTTP executor requires an absolute endpoint")
-	}
-	if config.EndpointPolicy == nil {
-		return nil, errors.New("hosted HTTP executor requires an endpoint policy")
-	}
-	if err := config.EndpointPolicy(endpoint); err != nil {
-		return nil, fmt.Errorf("hosted HTTP executor endpoint rejected: %w", err)
+	endpoint, client, err := policyHTTPClient("hosted HTTP executor", config.Endpoint, config.Client, config.EndpointPolicy)
+	if err != nil {
+		return nil, err
 	}
 	parameters := append(json.RawMessage(nil), config.Parameters...)
 	if len(parameters) == 0 {
@@ -79,10 +73,6 @@ func NewHTTPExecutor(config HTTPExecutorConfig) (*HTTPExecutor, error) {
 	}
 	if !json.Valid(parameters) {
 		return nil, errors.New("hosted HTTP executor parameters are invalid JSON")
-	}
-	client := config.Client
-	if client == nil {
-		client = http.DefaultClient
 	}
 	limit := config.MaxResponseBytes
 	if limit <= 0 {

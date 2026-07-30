@@ -53,25 +53,19 @@ type WebFetchOutput struct {
 }
 
 func NewWebFetchExecutor(config WebFetchExecutorConfig) (*WebFetchExecutor, error) {
-	endpoint, err := url.Parse(config.Endpoint)
-	if err != nil || endpoint.Scheme == "" || endpoint.Host == "" {
-		return nil, errors.New("web fetch executor requires an absolute endpoint")
-	}
-	if config.EndpointPolicy == nil {
-		return nil, errors.New("web fetch executor requires an endpoint policy")
-	}
-	if err := config.EndpointPolicy(endpoint); err != nil {
-		return nil, fmt.Errorf("web fetch executor endpoint rejected: %w", err)
-	}
-	client := config.Client
-	if client == nil {
-		client = http.DefaultClient
+	endpoint, client, err := policyHTTPClient("web fetch executor", config.Endpoint, config.Client, config.EndpointPolicy)
+	if err != nil {
+		return nil, err
 	}
 	limit := config.MaxResponseBytes
 	if limit <= 0 {
 		limit = defaultWebFetchResponseLimit
 	}
-	return &WebFetchExecutor{endpoint: endpoint, client: client, headers: config.Headers.Clone(), limit: limit}, nil
+	headers := config.Headers.Clone()
+	if headers == nil {
+		headers = make(http.Header)
+	}
+	return &WebFetchExecutor{endpoint: endpoint, client: client, headers: headers, limit: limit}, nil
 }
 
 func (*WebFetchExecutor) Kind() llm.ToolKind { return llm.ToolKindWebFetch }
@@ -171,6 +165,9 @@ func webFetchInput(definition llm.ToolDefinition, invocation llm.ToolInvocation)
 		input.MaxContentTokens = webFetch.MaxContentTokens
 		input.UseCache = webFetch.UseCache
 		input.ResponseInclusion = webFetch.ResponseInclusion
+	}
+	if err := enforceDomainFilters(parsed, input.AllowedDomains, input.BlockedDomains); err != nil {
+		return WebFetchInput{}, fmt.Errorf("web fetch domain policy: %w", err)
 	}
 	return input, nil
 }
