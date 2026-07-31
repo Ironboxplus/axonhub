@@ -108,7 +108,7 @@ func canonicalAnthropicStopReason(response *llm.Response, content []MessageConte
 		}
 	}
 	for index := range content {
-		if content[index].Type == "tool_use" || content[index].Type == "mcp_tool_use" {
+		if content[index].Type == "tool_use" {
 			return lo.ToPtr("tool_use")
 		}
 	}

@@ -90,6 +90,6 @@ func TestCanonicalResponseProjectsMCPGatewayLifecycleToAnthropicBlocks(t *testin
 	require.NotNil(t, message.Content[1].Content)
 	require.Contains(t, string(message.Content[1].Content.Raw), "7 units available")
 	require.NotNil(t, message.StopReason)
-	require.Equal(t, "tool_use", *message.StopReason)
+	require.Equal(t, "end_turn", *message.StopReason)
 	require.Equal(t, "done", *message.Content[2].Text)
 }
