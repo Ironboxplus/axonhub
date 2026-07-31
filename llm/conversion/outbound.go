@@ -21,18 +21,24 @@ const (
 // the attempt session is carried by the concrete outbound HTTP request, which
 // is already passed back to both non-streaming and streaming response paths.
 type Outbound struct {
-	wrapped transformer.Outbound
-	planner *Planner
+	wrapped      transformer.Outbound
+	planner      *Planner
+	continuation ContinuationBinding
 }
 
 var _ transformer.Outbound = (*Outbound)(nil)
 var _ transformer.OutboundWrapper = (*Outbound)(nil)
 
-func NewOutbound(wrapped transformer.Outbound) *Outbound {
-	return &Outbound{
-		wrapped: wrapped,
-		planner: NewPlanner(),
+func NewOutbound(wrapped transformer.Outbound, options ...OutboundOption) *Outbound {
+	outbound := &Outbound{
+		wrapped:      wrapped,
+		planner:      NewPlanner(),
+		continuation: DefaultArgumentContinuity,
 	}
+	for _, option := range options {
+		option(outbound)
+	}
+	return outbound
 }
 
 // Preflight proves that this concrete target has a complete plan before any
@@ -64,6 +70,7 @@ func (o *Outbound) TransformRequest(ctx context.Context, request *llm.Request) (
 		return nil, err
 	}
 	projected = projectCompactEmulationInput(projected, plan)
+	resolveContinuation(ctx, projected, o.continuation)
 	lowered, session, err := lower(projected, plan, trace)
 	if err != nil {
 		return nil, err
@@ -76,6 +83,7 @@ func (o *Outbound) TransformRequest(ctx context.Context, request *llm.Request) (
 	if err != nil {
 		return nil, err
 	}
+	session.continuation = o.continuation
 	setRequestSession(httpRequest, session)
 	return httpRequest, nil
 }
@@ -86,7 +94,10 @@ func (o *Outbound) TransformResponse(ctx context.Context, response *httpclient.R
 		return nil, err
 	}
 	session := sessionFromResponse(response)
-	unified = RestoreResponse(unified, session)
+	if session != nil && session.continuation == nil {
+		session.continuation = o.continuation
+	}
+	unified = RestoreResponseContext(ctx, unified, session)
 	return restoreCompactEmulation(unified, session), nil
 }
 
@@ -103,7 +114,10 @@ func (o *Outbound) TransformStream(
 	if session == nil {
 		return unified, nil
 	}
-	restorer := newStreamRestorer(session)
+	if session.continuation == nil {
+		session.continuation = o.continuation
+	}
+	restorer := newStreamRestorerContext(ctx, session)
 	// Restoration is stateful. Map evaluates its mapper from Current(), and a
 	// pipeline observer plus the source encoder may read Current more than once
 	// for the same Next call. Cache the restored value in MapErr.Next so every

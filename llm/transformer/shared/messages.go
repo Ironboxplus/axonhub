@@ -6,10 +6,9 @@ import "github.com/looplj/axonhub/llm"
 // from assistant messages and drops tool result messages that correspond to
 // those removed custom tool calls.
 //
-// This is intended for compatibility when a request originates from an OpenAI
-// Responses session and is then routed to a non-Responses channel. In that
-// case, Responses-only custom tools must be stripped from the message history
-// before the outbound transformer encodes the request for the target channel.
+// Deprecated: protocol conversion must lower custom calls instead of dropping
+// them. This exported compatibility helper remains available for downstream
+// callers that explicitly choose the historical filtering behavior.
 func FilterOutResponseCustomToolMessages(messages []llm.Message) []llm.Message {
 	if len(messages) == 0 {
 		return nil

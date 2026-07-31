@@ -1,14 +1,25 @@
 package conversion
 
 import (
+	"context"
 	"time"
 
 	"github.com/looplj/axonhub/llm"
 )
 
 func RestoreResponse(response *llm.Response, session *Session) *llm.Response {
+	return RestoreResponseContext(context.Background(), response, session)
+}
+
+// RestoreResponseContext is the production restore entry point. ctx carries the
+// trusted SessionScope used when publishing raw provider argument bytes into
+// the host ContinuationBinding for multi-turn Responses replay.
+func RestoreResponseContext(ctx context.Context, response *llm.Response, session *Session) *llm.Response {
 	if response == nil || session == nil {
 		return response
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	startedAt := time.Time{}
 	if session.traceEnabled {
@@ -20,7 +31,7 @@ func RestoreResponse(response *llm.Response, session *Session) *llm.Response {
 		restoreMessage(choice.Delta, session, llm.ConversionDirectionResponse, choice.Index)
 	}
 	restoreCanonicalOutput(response.Output, session, llm.ConversionDirectionResponse)
-	normalizeResponseIdentifiers(response, session, llm.ConversionDirectionResponse)
+	normalizeResponseIdentifiers(ctx, response, session, llm.ConversionDirectionResponse)
 	if session.traceEnabled {
 		session.addRestoreNanos(time.Since(startedAt).Nanoseconds())
 		setResponseSummary(response, session.Summary())
@@ -29,7 +40,7 @@ func RestoreResponse(response *llm.Response, session *Session) *llm.Response {
 	return response
 }
 
-func normalizeResponseIdentifiers(response *llm.Response, session *Session, direction llm.ConversionDirection) {
+func normalizeResponseIdentifiers(ctx context.Context, response *llm.Response, session *Session, direction llm.ConversionDirection) {
 	if response == nil || session == nil {
 		return
 	}
@@ -37,7 +48,15 @@ func normalizeResponseIdentifiers(response *llm.Response, session *Session, dire
 		item := &response.Output[itemIndex]
 		ref := canonicalToolRef(itemIndex)
 		if item.ToolCall != nil {
-			item.ToolCall.CallID = session.normalizeSourceCallID(item.ToolCall.CallID, direction, ref)
+			providerCallID := item.ToolCall.CallID
+			providerName := item.ToolCall.LogicalName
+			item.ToolCall.CallID = session.normalizeSourceCallID(providerCallID, direction, ref)
+			// Publish under the provider-facing name used when recording raw
+			// bytes, before identity restore rewrites LogicalName for clients.
+			session.publishProviderArgumentBytes(ctx, providerCallID, item.ToolCall.CallID, providerName)
+			if item.ToolCall.LogicalName != providerName && item.ToolCall.LogicalName != "" {
+				session.publishProviderArgumentBytes(ctx, providerCallID, item.ToolCall.CallID, item.ToolCall.LogicalName)
+			}
 		}
 		if item.ToolResult != nil {
 			item.ToolResult.CallID = session.normalizeSourceCallID(item.ToolResult.CallID, direction, ObjectRef{
@@ -60,7 +79,13 @@ func normalizeResponseIdentifiers(response *llm.Response, session *Session, dire
 			for callIndex := range message.ToolCalls {
 				call := &message.ToolCalls[callIndex]
 				ref := messageToolRef(choice.Index, call.Index)
-				call.ID = session.normalizeSourceCallID(call.ID, direction, ref)
+				providerCallID := call.ID
+				providerName := call.Function.Name
+				call.ID = session.normalizeSourceCallID(providerCallID, direction, ref)
+				session.publishProviderArgumentBytes(ctx, providerCallID, call.ID, providerName)
+				if call.Function.Name != providerName && call.Function.Name != "" {
+					session.publishProviderArgumentBytes(ctx, providerCallID, call.ID, call.Function.Name)
+				}
 				if call.ResponseCustomToolCall != nil {
 					call.ResponseCustomToolCall.CallID = session.normalizeSourceCallID(call.ResponseCustomToolCall.CallID, direction, ref)
 				}

@@ -1,6 +1,7 @@
 package conversion
 
 import (
+	"context"
 	"strings"
 	"time"
 
@@ -17,6 +18,8 @@ type streamToolState struct {
 	hasIdentity    bool
 	ref            ObjectRef
 	callID         string
+	providerCallID string
+	providerName   string
 	args           jsonValueAccumulator
 	input          string
 	finished       bool
@@ -29,6 +32,7 @@ type streamToolState struct {
 // a single stream iterator, so it needs no locks and never adds contention to
 // shared transformers.
 type streamRestorer struct {
+	ctx            context.Context
 	session        *Session
 	tools          map[streamToolKey]*streamToolState
 	order          []streamToolKey
@@ -37,7 +41,15 @@ type streamRestorer struct {
 }
 
 func newStreamRestorer(session *Session) *streamRestorer {
+	return newStreamRestorerContext(context.Background(), session)
+}
+
+func newStreamRestorerContext(ctx context.Context, session *Session) *streamRestorer {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	return &streamRestorer{
+		ctx:        ctx,
 		session:    session,
 		tools:      make(map[streamToolKey]*streamToolState),
 		eventTools: make(map[string]*streamToolState),
@@ -102,8 +114,9 @@ func (r *streamRestorer) restoreEvents(response *llm.Response) {
 				continue
 			}
 			state := &streamToolState{
-				identity: identity, hasIdentity: hasIdentity, callID: event.Snapshot.ToolCall.CallID,
-				ref: ref, schemaPaths: schemaPaths,
+				identity: identity, hasIdentity: hasIdentity, callID: event.Snapshot.ToolCall.CallID, providerCallID: event.Snapshot.ToolCall.CallID,
+				providerName: providerName,
+				ref:          ref, schemaPaths: schemaPaths,
 			}
 			r.eventTools[key] = state
 			if hasIdentity {
@@ -125,7 +138,9 @@ func (r *streamRestorer) restoreEvents(response *llm.Response) {
 					// only affected strict calls; unrelated streams stay zero-copy.
 					continue
 				}
-				restoredArguments, changed := stripOptionalNullArguments([]byte(state.schemaArgs.String()), state.schemaPaths)
+				rawArguments := []byte(state.schemaArgs.String())
+				r.session.recordProviderArgumentBytes(state.providerCallID, state.providerName, rawArguments, "")
+				restoredArguments, changed := stripOptionalNullArguments(rawArguments, state.schemaPaths)
 				state.schemaFinished = true
 				event.Delta.ArgumentsJSON = string(restoredArguments)
 				if changed {
@@ -201,6 +216,17 @@ func (r *streamRestorer) restoreEvents(response *llm.Response) {
 				continue
 			}
 			restoreInvocationSchemaArguments(event.Snapshot.ToolCall, r.session, llm.ConversionDirectionStream, state.ref)
+			if event.Snapshot.ToolCall != nil && event.Snapshot.ToolCall.Status == llm.ToolCallStatusCompleted {
+				publishName := state.providerName
+				if publishName == "" {
+					publishName = event.Snapshot.ToolCall.LogicalName
+				}
+				clientName := event.Snapshot.ToolCall.LogicalName
+				r.session.publishProviderArgumentBytes(r.ctx, state.providerCallID, state.callID, publishName)
+				if clientName != "" && clientName != publishName {
+					r.session.publishProviderArgumentBytes(r.ctx, state.providerCallID, state.callID, clientName)
+				}
+			}
 			if state.hasIdentity && !state.finished && state.args.Len() > 0 {
 				state.input, state.finished = restoreCustomInput(state.args.String(), state.callID, r.session, llm.ConversionDirectionStream, state.ref)
 				if !state.finished {
@@ -252,9 +278,10 @@ func (r *streamRestorer) restoreMessage(choiceIndex int, message *llm.Message) {
 	}
 	for callIndex := range message.ToolCalls {
 		call := &message.ToolCalls[callIndex]
+		providerCallID := call.ID
 		key := streamToolKey{choice: choiceIndex, tool: call.Index}
 		ref := messageToolRef(choiceIndex, call.Index)
-		call.ID = r.session.normalizeSourceCallID(call.ID, llm.ConversionDirectionStream, ref)
+		call.ID = r.session.normalizeSourceCallID(providerCallID, llm.ConversionDirectionStream, ref)
 		if call.ResponseCustomToolCall != nil {
 			call.ResponseCustomToolCall.CallID = r.session.normalizeSourceCallID(call.ResponseCustomToolCall.CallID, llm.ConversionDirectionStream, ref)
 		}
@@ -265,7 +292,7 @@ func (r *streamRestorer) restoreMessage(choiceIndex int, message *llm.Message) {
 		if hasIdentity || len(schemaPaths) > 0 {
 			if state == nil {
 				state = &streamToolState{
-					identity: identity, hasIdentity: hasIdentity, ref: ref, schemaPaths: schemaPaths,
+					identity: identity, hasIdentity: hasIdentity, ref: ref, schemaPaths: schemaPaths, providerCallID: providerCallID, providerName: providerName,
 				}
 				r.tools[key] = state
 				r.order = append(r.order, key)
@@ -284,7 +311,9 @@ func (r *streamRestorer) restoreMessage(choiceIndex int, message *llm.Message) {
 			fragment := call.Function.Arguments
 			call.Function.Arguments = ""
 			if state.schemaArgs.Add(fragment) {
-				restoredArguments, changed := stripOptionalNullArguments([]byte(state.schemaArgs.String()), state.schemaPaths)
+				rawArguments := []byte(state.schemaArgs.String())
+				r.session.recordProviderArgumentBytes(state.providerCallID, call.Function.Name, rawArguments, "")
+				restoredArguments, changed := stripOptionalNullArguments(rawArguments, state.schemaPaths)
 				state.schemaFinished = true
 				call.Function.Arguments = string(restoredArguments)
 				if changed {

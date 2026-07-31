@@ -10,6 +10,9 @@ func restoreInvocationSchemaArguments(call *llm.ToolInvocation, session *Session
 	if call == nil || session == nil {
 		return
 	}
+	// Always retain provider-raw bytes before any client-facing cleanup so a
+	// later Responses continuation can replay unmodified arguments.
+	session.recordProviderArgumentBytes(call.CallID, call.LogicalName, call.ArgumentsJSON, call.ArgumentsText)
 	paths := session.schemaRestoration(call.LogicalName)
 	if len(paths) == 0 {
 		return
@@ -34,6 +37,7 @@ func restoreLegacySchemaArguments(call *llm.ToolCall, session *Session, directio
 	if call == nil || session == nil || call.Function.Arguments == "" {
 		return
 	}
+	session.recordProviderArgumentBytes(call.ID, call.Function.Name, nil, call.Function.Arguments)
 	paths := session.schemaRestoration(call.Function.Name)
 	if len(paths) == 0 {
 		return

@@ -2,6 +2,7 @@ package conversion
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"strings"
@@ -23,6 +24,11 @@ type schemaRestoration struct {
 	normalizedHash [sha256.Size]byte
 }
 
+type providerArgumentRecordKey struct {
+	callID string
+	name   string
+}
+
 type compactEmulationState struct {
 	instructions string
 }
@@ -37,6 +43,8 @@ type Session struct {
 	targetCallIDs         *identifierLedger
 	sourceCallIDs         *identifierLedger
 	schemaRestorations    map[string]schemaRestoration
+	providerArgumentBytes map[providerArgumentRecordKey]json.RawMessage
+	continuation          ContinuationBinding
 	lowerNanos            atomic.Int64
 	restoreNanos          atomic.Int64
 	restoreMiss           atomic.Uint32
@@ -55,12 +63,13 @@ type Session struct {
 
 func newSession(plan *Plan, request *llm.Request, traceEnabled bool) *Session {
 	session := &Session{
-		plan:               plan,
-		bySourceName:       make(map[string]string),
-		bySyntheticName:    make(map[string]toolIdentity),
-		occupiedNames:      make(map[string]struct{}),
-		schemaRestorations: make(map[string]schemaRestoration),
-		traceEnabled:       traceEnabled,
+		plan:                  plan,
+		bySourceName:          make(map[string]string),
+		bySyntheticName:       make(map[string]toolIdentity),
+		occupiedNames:         make(map[string]struct{}),
+		schemaRestorations:    make(map[string]schemaRestoration),
+		providerArgumentBytes: make(map[providerArgumentRecordKey]json.RawMessage),
+		traceEnabled:          traceEnabled,
 	}
 	if request != nil {
 		for index := range request.ToolDefinitions {

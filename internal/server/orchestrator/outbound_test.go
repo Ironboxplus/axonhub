@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/samber/lo"
@@ -19,10 +22,13 @@ import (
 	"github.com/looplj/axonhub/internal/objects"
 	"github.com/looplj/axonhub/internal/server/biz"
 	"github.com/looplj/axonhub/llm"
+	"github.com/looplj/axonhub/llm/conversion"
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/pipeline"
 	"github.com/looplj/axonhub/llm/streams"
 	"github.com/looplj/axonhub/llm/transformer"
+	"github.com/looplj/axonhub/llm/transformer/openai"
+	"github.com/looplj/axonhub/llm/transformer/openai/responses"
 )
 
 // mockTransformer is a simple mock transformer for testing.
@@ -938,70 +944,110 @@ func TestPersistentOutboundTransformer_TransformRequest_WithPrepopulatedState(t 
 	require.Equal(t, testChannel, processor.state.CurrentCandidate.Channel)
 }
 
-func TestFilterResponseCustomToolMessagesForNonResponsesOutbound(t *testing.T) {
-	baseRequest := &llm.Request{
-		APIFormat: llm.APIFormatOpenAIResponse,
-		Messages: []llm.Message{
-			{
-				Role: "assistant",
-				ToolCalls: []llm.ToolCall{
-					{
-						ID:   "call_custom_1",
-						Type: llm.ToolTypeResponsesCustomTool,
-						ResponseCustomToolCall: &llm.ResponseCustomToolCall{
-							CallID: "call_custom_1",
-							Name:   "apply_patch",
-							Input:  "*** Begin Patch\n*** End Patch\n",
-						},
-					},
-					{
-						ID:   "call_function_1",
-						Type: llm.ToolTypeFunction,
-						Function: llm.FunctionCall{
-							Name:      "get_weather",
-							Arguments: "{}",
-						},
-					},
-				},
-			},
-			{
-				Role:       "tool",
-				ToolCallID: func() *string { v := "call_custom_1"; return &v }(),
-				Content: llm.MessageContent{
-					Content: func() *string { v := "custom"; return &v }(),
-				},
-			},
-			{
-				Role:       "tool",
-				ToolCallID: func() *string { v := "call_function_1"; return &v }(),
-				Content: llm.MessageContent{
-					Content: func() *string { v := "function"; return &v }(),
-				},
-			},
-		},
+func TestPersistentOutboundTransformerLowersResponsesCustomHistoryOverRealHTTP(t *testing.T) {
+	const patch = "*** Begin Patch\n*** End Patch\n"
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/chat/completions" {
+			http.Error(writer, "unexpected provider path", http.StatusNotFound)
+			return
+		}
+		body, err := io.ReadAll(request.Body)
+		if err != nil {
+			http.Error(writer, "read provider request", http.StatusBadRequest)
+			return
+		}
+		var payload struct {
+			Tools []struct {
+				Type     string `json:"type"`
+				Function struct {
+					Name string `json:"name"`
+				} `json:"function"`
+			} `json:"tools"`
+			Messages []struct {
+				Role       string `json:"role"`
+				ToolCallID string `json:"tool_call_id"`
+				Content    string `json:"content"`
+				ToolCalls  []struct {
+					ID       string `json:"id"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"messages"`
+		}
+		if err := json.Unmarshal(body, &payload); err != nil {
+			http.Error(writer, "decode Chat request", http.StatusBadRequest)
+			return
+		}
+		if len(payload.Tools) != 1 || payload.Tools[0].Type != "function" || payload.Tools[0].Function.Name == "" ||
+			payload.Tools[0].Function.Name == "apply_patch" {
+			http.Error(writer, "custom definition was not reversibly lowered", http.StatusBadRequest)
+			return
+		}
+		loweredName := payload.Tools[0].Function.Name
+		var sawCall, sawResult bool
+		for _, message := range payload.Messages {
+			for _, call := range message.ToolCalls {
+				if message.Role == "assistant" && call.ID == "call_patch_history" && call.Function.Name == loweredName &&
+					strings.Contains(call.Function.Arguments, "Begin Patch") {
+					sawCall = true
+				}
+			}
+			if message.Role == "tool" && message.ToolCallID == "call_patch_history" && message.Content == "patch applied" {
+				sawResult = true
+			}
+		}
+		if !sawCall || !sawResult {
+			http.Error(writer, "custom call/result history was deleted instead of lowered", http.StatusBadRequest)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(writer).Encode(map[string]any{
+			"id": "chat_custom_next", "object": "chat.completion", "model": "fixture-model",
+			"choices": []any{map[string]any{
+				"index": 0,
+				"message": map[string]any{"role": "assistant", "tool_calls": []any{map[string]any{
+					"id": "call_patch_next", "type": "function",
+					"function": map[string]any{"name": loweredName, "arguments": `{"input":"*** Begin Patch\n*** End Patch\n"}`},
+				}}},
+				"finish_reason": "tool_calls",
+			}},
+		})
+	}))
+	t.Cleanup(provider.Close)
+
+	target, err := openai.NewOutboundTransformer(provider.URL, "fixture-key")
+	require.NoError(t, err)
+	channel := &biz.Channel{
+		Channel:  &ent.Channel{ID: 1, Name: "real-chat-provider"},
+		Outbound: conversion.NewOutbound(target),
 	}
-
-	t.Run("filters when inbound is responses and outbound is not", func(t *testing.T) {
-		got := filterResponseCustomToolMessagesForNonResponsesOutbound(baseRequest, llm.APIFormatOpenAIChatCompletion)
-		require.NotSame(t, baseRequest, got)
-		require.Len(t, got.Messages, 2)
-		require.Len(t, got.Messages[0].ToolCalls, 1)
-		require.Equal(t, llm.ToolTypeFunction, got.Messages[0].ToolCalls[0].Type)
-		require.NotNil(t, got.Messages[1].ToolCallID)
-		require.Equal(t, "call_function_1", *got.Messages[1].ToolCallID)
+	persistent := &PersistentOutboundTransformer{state: &PersistenceState{
+		OriginalModel: "fixture-model",
+		ChannelModelsCandidates: []*ChannelModelsCandidate{{
+			Channel: channel, APIFormat: string(llm.APIFormatOpenAIChatCompletion),
+			Models: []biz.ChannelModelEntry{{RequestModel: "fixture-model", ActualModel: "fixture-model"}},
+		}},
+	}}
+	executor := httpclient.NewHttpClientWithClient(provider.Client())
+	t.Cleanup(executor.CloseIdleConnections)
+	result, err := pipeline.NewFactory(executor).Pipeline(responses.NewInboundTransformer(), persistent).Process(context.Background(), &httpclient.Request{
+		Method: http.MethodPost, URL: "/v1/responses", Headers: http.Header{"Content-Type": []string{"application/json"}},
+		Body: []byte(`{"model":"fixture-model","input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"continue the patch"}]},
+			{"type":"custom_tool_call","id":"item_patch_history","call_id":"call_patch_history","name":"apply_patch","input":"*** Begin Patch\\n*** End Patch\\n"},
+			{"type":"custom_tool_call_output","id":"item_patch_result","call_id":"call_patch_history","output":"patch applied"}
+		],"tools":[{"type":"custom","name":"apply_patch","description":"Patch files"}]}`),
 	})
-
-	t.Run("does not filter when outbound is responses", func(t *testing.T) {
-		got := filterResponseCustomToolMessagesForNonResponsesOutbound(baseRequest, llm.APIFormatOpenAIResponse)
-		require.Same(t, baseRequest, got)
-	})
-
-	t.Run("does not filter when inbound is not responses", func(t *testing.T) {
-		nonResponsesReq := *baseRequest
-		nonResponsesReq.APIFormat = llm.APIFormatOpenAIChatCompletion
-		got := filterResponseCustomToolMessagesForNonResponsesOutbound(&nonResponsesReq, llm.APIFormatOpenAIChatCompletion)
-		require.Same(t, &nonResponsesReq, got)
-	})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.NotNil(t, result.Response)
+	response := gjson.ParseBytes(result.Response.Body)
+	require.Equal(t, "custom_tool_call", response.Get("output.0.type").String(), string(result.Response.Body))
+	require.Equal(t, "apply_patch", response.Get("output.0.name").String(), string(result.Response.Body))
+	require.Equal(t, "call_patch_next", response.Get("output.0.call_id").String(), string(result.Response.Body))
+	require.Equal(t, patch, response.Get("output.0.input").String(), string(result.Response.Body))
 }
 
 // ========== 429 Retry-After Tests ==========
