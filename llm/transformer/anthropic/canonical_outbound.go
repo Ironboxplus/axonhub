@@ -10,7 +10,8 @@ import (
 )
 
 func validateCanonicalAnthropicRequest(request *llm.Request) error {
-	if request == nil || request.APIFormat == llm.APIFormatAnthropicMessage || len(request.Input) == 0 && len(request.ToolDefinitions) == 0 {
+	if request == nil || request.APIFormat == llm.APIFormatAnthropicMessage && !request.CanonicalEncodingRequired ||
+		len(request.Input) == 0 && len(request.ToolDefinitions) == 0 {
 		return nil
 	}
 	for index := range request.ToolDefinitions {
@@ -77,7 +78,8 @@ func canonicalAnthropicRequest(request *llm.Request) (*SystemPrompt, []MessagePa
 	// Same-protocol requests must preserve cache controls, original JSON and
 	// Anthropic-only blocks through the native compatibility representation.
 	// Canonical encoding is selected only for a real protocol conversion.
-	if request == nil || request.APIFormat == llm.APIFormatAnthropicMessage || len(request.Input) == 0 && len(request.ToolDefinitions) == 0 {
+	if request == nil || request.APIFormat == llm.APIFormatAnthropicMessage && !request.CanonicalEncodingRequired ||
+		len(request.Input) == 0 && len(request.ToolDefinitions) == 0 {
 		return nil, nil, nil, false
 	}
 	systemParts := make([]SystemPromptPart, 0)

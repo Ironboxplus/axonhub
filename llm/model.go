@@ -313,6 +313,12 @@ type Request struct {
 	// ProviderExtensions stores provider/API-format private sidecar data.
 	// It is intentionally excluded from normal JSON output to avoid leaking raw prompts or tool outputs.
 	ProviderExtensions *ProviderExtensions `json:"-"`
+	// CanonicalEncodingRequired is set by internal controllers after they
+	// materially rewrite canonical input or tool definitions. Same-protocol
+	// outbound transformers normally prefer their native compatibility view for
+	// lossless replay; this flag prevents replaying that stale view after a
+	// gateway rewrite. It is request-local control state and never reaches JSON.
+	CanonicalEncodingRequired bool `json:"-"`
 
 	// ToolExecutionSecrets contains request-local executor credentials. It must
 	// never enter canonical serialization, conversion traces, or persistence.

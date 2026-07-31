@@ -12,6 +12,7 @@ import (
 
 func (controller *Controller) lowerHistory(ctx context.Context, request *llm.Request, registry *mcp.Registry) (*llm.Request, []llm.Item, error) {
 	prepared := request.Clone()
+	prepared.CanonicalEncodingRequired = true
 	clonedDefinitions := prepared.ToolDefinitions
 	prepared.ToolDefinitions = nil
 	for index := range clonedDefinitions {

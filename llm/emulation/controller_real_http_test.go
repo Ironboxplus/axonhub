@@ -1380,6 +1380,125 @@ func TestControllerRunsResponsesMCPThroughAnthropicTargetOverRealHTTP(t *testing
 	require.EqualValues(t, 17, responseBody.Usage.TotalTokens)
 }
 
+func TestControllerRunsAnthropicMCPServersThroughAnthropicGatewayOverRealHTTP(t *testing.T) {
+	t.Parallel()
+	const authorization = "Bearer anthropic-native-shape-private-token"
+	var mcpCalls atomic.Int64
+	mcpServer := newControllerMCPServer(t, authorization, &mcpCalls)
+	allowedMCP, err := url.Parse(mcpServer.URL)
+	require.NoError(t, err)
+
+	var providerRounds atomic.Int64
+	var syntheticName string
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		round := providerRounds.Add(1)
+		body, readErr := io.ReadAll(r.Body)
+		if readErr != nil {
+			http.Error(w, "read", http.StatusBadRequest)
+			return
+		}
+		var payload struct {
+			MCPServers []json.RawMessage `json:"mcp_servers"`
+			Tools      []struct {
+				Name string `json:"name"`
+			} `json:"tools"`
+			ToolChoice *struct {
+				Type string `json:"type"`
+				Name string `json:"name"`
+			} `json:"tool_choice"`
+			Messages []struct {
+				Role    string          `json:"role"`
+				Content json.RawMessage `json:"content"`
+			} `json:"messages"`
+		}
+		if json.Unmarshal(body, &payload) != nil {
+			http.Error(w, "decode Anthropic gateway request", http.StatusBadRequest)
+			return
+		}
+		if len(payload.Tools) != 1 {
+			http.Error(w, fmt.Sprintf("Anthropic gateway tool count = %d", len(payload.Tools)), http.StatusBadRequest)
+			return
+		}
+		if len(payload.MCPServers) != 0 {
+			http.Error(w, fmt.Sprintf("Anthropic gateway retained %d native MCP servers", len(payload.MCPServers)), http.StatusBadRequest)
+			return
+		}
+		if strings.Contains(string(body), authorization) {
+			http.Error(w, "Anthropic gateway leaked MCP authorization", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if round == 1 {
+			syntheticName = payload.Tools[0].Name
+			if !strings.HasPrefix(syntheticName, "axon_mcp_") || payload.ToolChoice == nil ||
+				payload.ToolChoice.Type != "tool" || payload.ToolChoice.Name != syntheticName {
+				http.Error(w, "Anthropic gateway did not require the discovered MCP function", http.StatusBadRequest)
+				return
+			}
+			_, _ = fmt.Fprintf(w, `{"id":"msg_native_mcp_round_1","type":"message","role":"assistant","model":"fixture-model","content":[{"type":"tool_use","id":"anthropic_native_mcp_call","name":%q,"input":{"sku":"A-1"}}],"stop_reason":"tool_use","usage":{"input_tokens":5,"output_tokens":2}}`, syntheticName)
+			return
+		}
+		if payload.ToolChoice != nil {
+			http.Error(w, "Anthropic MCP continuation kept forcing a tool", http.StatusBadRequest)
+			return
+		}
+		foundResult := false
+		for _, message := range payload.Messages {
+			if message.Role == "user" && strings.Contains(string(message.Content), "available") {
+				foundResult = true
+			}
+		}
+		if round != 2 || !foundResult {
+			http.Error(w, "Anthropic MCP result missing", http.StatusBadRequest)
+			return
+		}
+		_, _ = io.WriteString(w, `{"id":"msg_native_mcp_round_2","type":"message","role":"assistant","model":"fixture-model","content":[{"type":"text","text":"Anthropic received 7 units"}],"stop_reason":"end_turn","usage":{"input_tokens":7,"output_tokens":3}}`)
+	}))
+	t.Cleanup(provider.Close)
+
+	controller, err := emulation.NewController(emulation.ControllerConfig{
+		MCP: mcp.RegistryConfig{
+			SyntheticNameKey: []byte(strings.Repeat("anthropic-native-controller-key-", 2)),
+			EndpointPolicy: func(candidate *url.URL) error {
+				if candidate.Scheme != allowedMCP.Scheme || candidate.Host != allowedMCP.Host {
+					return fmt.Errorf("MCP endpoint is not allowlisted")
+				}
+				return nil
+			},
+		},
+		MaxRounds: 4, MaxToolCalls: 8, MaxParallelCalls: 2,
+	})
+	require.NoError(t, err)
+	outbound, err := anthropic.NewOutboundTransformer(provider.URL, "provider-key")
+	require.NoError(t, err)
+	executor := httpclient.NewHttpClientWithProxy(&httpclient.ProxyConfig{Type: httpclient.ProxyTypeDisabled})
+	t.Cleanup(executor.CloseIdleConnections)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result, err := pipeline.NewFactory(executor).Pipeline(
+		anthropic.NewInboundTransformer(), conversion.NewOutbound(outbound),
+		pipeline.WithToolLoopController(controller),
+	).Process(ctx, &httpclient.Request{
+		Method: http.MethodPost, URL: "/v1/messages",
+		Headers: http.Header{"Content-Type": []string{"application/json"}},
+		Body: []byte(fmt.Sprintf(`{
+			"model":"fixture-model","max_tokens":128,"messages":[{"role":"user","content":"check inventory"}],
+			"mcp_servers":[{"name":"inventory","url":%q,"authorization_token":%q}],
+			"tool_choice":{"type":"any"}
+		}`, mcpServer.URL, authorization)),
+	})
+	require.NoError(t, err)
+	require.NotNil(t, result.Response)
+	require.EqualValues(t, 2, providerRounds.Load())
+	require.EqualValues(t, 1, mcpCalls.Load())
+	wire := string(result.Response.Body)
+	require.Contains(t, wire, `"type":"mcp_tool_use"`)
+	require.Contains(t, wire, `"type":"mcp_tool_result"`)
+	require.Contains(t, wire, "Anthropic received 7 units")
+	require.NotContains(t, wire, syntheticName)
+	require.NotContains(t, wire, authorization)
+}
+
 func TestControllerEmulatesAnthropicServerToolSearchThenExposesDiscoveredCallOverRealHTTP(t *testing.T) {
 	t.Parallel()
 	var providerRounds atomic.Int64
