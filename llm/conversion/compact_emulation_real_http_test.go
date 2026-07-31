@@ -307,17 +307,18 @@ func serveCompactResponsesEmulated(t *testing.T, writer http.ResponseWriter, req
 	// Emulation rewrites compact → RequestTypeChat on /v1/responses. The wire
 	// is a normal response create carrying the compact system instruction and
 	// lowered history — not object=response.compaction upstream.
-	if !strings.Contains(string(body), "Preserve pending file edits.") ||
-		!strings.Contains(string(body), `"type":"function_call"`) && !strings.Contains(string(body), `"call_id":"call_index"`) &&
-			!strings.Contains(string(body), "call_index") {
-		// Accept either function_call items or chat-style tool history after lower.
-		if !strings.Contains(string(body), "Preserve pending file edits.") {
-			http.Error(writer, "emulated Responses compact degraded", http.StatusBadRequest)
-			return
-		}
-	}
-	if !strings.Contains(string(body), "Preserve pending file edits.") {
+	// Require BOTH the compact instruction and function-call history identity;
+	// instruction alone must not pass (avoids false positive when history is dropped).
+	payload := string(body)
+	if !strings.Contains(payload, "Preserve pending file edits.") {
 		http.Error(writer, "emulated Responses compact missing instruction", http.StatusBadRequest)
+		return
+	}
+	hasFunctionHistory := strings.Contains(payload, `"type":"function_call"`) ||
+		strings.Contains(payload, `"call_id":"call_index"`) ||
+		strings.Contains(payload, "call_index")
+	if !hasFunctionHistory {
+		http.Error(writer, "emulated Responses compact lost function history", http.StatusBadRequest)
 		return
 	}
 	writer.Header().Set("Content-Type", "application/json")
