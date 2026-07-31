@@ -38,6 +38,14 @@ func validateCanonicalAnthropicRequest(request *llm.Request) error {
 					!strings.HasPrefix(definition.Hosted.Type, "tool_search_tool_bm25_") {
 				return fmt.Errorf("canonical tool %d tool search payload is missing or unsupported", index)
 			}
+		case llm.ToolKindMCP:
+			if definition.MCP == nil || definition.MCP.ServerLabel == "" || definition.MCP.ServerURL == "" {
+				return fmt.Errorf("canonical tool %d MCP server label or URL is missing", index)
+			}
+			if definition.MCP.AllowedTools != nil || definition.MCP.RequireApproval != nil || definition.MCP.DeferLoading != nil ||
+				len(definition.MCP.AllowedCallers) > 0 || definition.MCP.ConnectorID != "" || definition.MCP.TunnelID != "" {
+				return fmt.Errorf("canonical tool %d MCP constraints require gateway emulation for an Anthropic target", index)
+			}
 		default:
 			return fmt.Errorf("canonical tool %d kind %q has no Anthropic encoding", index, definition.Kind)
 		}
@@ -525,6 +533,29 @@ func canonicalAnthropicArguments(call *llm.ToolInvocation) json.RawMessage {
 		return json.RawMessage(call.ArgumentsText)
 	}
 	return json.RawMessage(`{}`)
+}
+
+// canonicalAnthropicMCPServers restores the native Anthropic top-level MCP
+// declaration only when the selected route has not already lowered it through
+// the gateway. Credentials stay in the request-local sidecar until this final
+// wire encoding step.
+func canonicalAnthropicMCPServers(request *llm.Request) []MCPServer {
+	if request == nil {
+		return nil
+	}
+	servers := make([]MCPServer, 0)
+	for index := range request.ToolDefinitions {
+		definition := &request.ToolDefinitions[index]
+		if definition.Kind != llm.ToolKindMCP || definition.MCP == nil || definition.MCP.ServerLabel == "" || definition.MCP.ServerURL == "" {
+			continue
+		}
+		server := MCPServer{Name: definition.MCP.ServerLabel, URL: definition.MCP.ServerURL}
+		if request.ToolExecutionSecrets != nil {
+			server.AuthorizationToken = request.ToolExecutionSecrets.MCP[definition.MCP.ServerLabel].Authorization
+		}
+		servers = append(servers, server)
+	}
+	return servers
 }
 
 func stringPointerNonNil(value string) *string { return &value }

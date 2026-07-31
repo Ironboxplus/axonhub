@@ -63,6 +63,22 @@ func TestInboundPreservesAnthropicMCPServersWithoutLeakingCredentials(t *testing
 	if strings.Contains(string(serialized), authorization) {
 		t.Fatalf("Anthropic MCP credential leaked into serialized request: %s", serialized)
 	}
+	outbound, err := NewOutboundTransformer("https://provider.example.invalid", "provider-key")
+	if err != nil {
+		t.Fatalf("create Anthropic outbound: %v", err)
+	}
+	wire, err := outbound.TransformRequest(context.Background(), request)
+	if err != nil {
+		t.Fatalf("re-encode Anthropic MCP server: %v", err)
+	}
+	var restored MessageRequest
+	if err := json.Unmarshal(wire.Body, &restored); err != nil {
+		t.Fatalf("decode re-encoded Anthropic wire request: %v", err)
+	}
+	if len(restored.MCPServers) != 1 || restored.MCPServers[0].Name != "inventory" ||
+		restored.MCPServers[0].URL != "https://mcp.example.invalid/v1" || restored.MCPServers[0].AuthorizationToken != authorization {
+		t.Fatalf("Anthropic MCP wire restoration degraded: %#v", restored.MCPServers)
+	}
 }
 
 func TestInboundRejectsDuplicateAnthropicMCPServerNames(t *testing.T) {
@@ -75,6 +91,29 @@ func TestInboundRejectsDuplicateAnthropicMCPServerNames(t *testing.T) {
 		t.Fatalf("duplicate Anthropic MCP names must be rejected, got %v", err)
 	}
 }
+
+func TestAnthropicOutboundRejectsMCPConstraintsWithoutGateway(t *testing.T) {
+	t.Parallel()
+	outbound, err := NewOutboundTransformer("https://provider.example.invalid", "provider-key")
+	if err != nil {
+		t.Fatalf("create Anthropic outbound: %v", err)
+	}
+	_, err = outbound.TransformRequest(context.Background(), &llm.Request{
+		APIFormat: llm.APIFormatOpenAIResponse, Model: "fixture-model", MaxTokens: int64PointerAnthropicMCP(64),
+		Messages: []llm.Message{{Role: "user", Content: llm.MessageContent{Content: stringPointerAnthropicMCP("check")}}},
+		ToolDefinitions: []llm.ToolDefinition{{
+			Kind: llm.ToolKindMCP, LogicalName: "inventory", Execution: llm.ExecutionOwnerProvider,
+			MCP: &llm.MCPDefinition{ServerLabel: "inventory", ServerURL: "https://mcp.example.invalid/v1", AllowedTools: &llm.MCPToolFilter{ToolNames: []string{"lookup"}}},
+		}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "constraints require gateway emulation") {
+		t.Fatalf("Anthropic native MCP must reject unencodable constraints, got %v", err)
+	}
+}
+
+func int64PointerAnthropicMCP(value int64) *int64 { return &value }
+
+func stringPointerAnthropicMCP(value string) *string { return &value }
 
 func TestInboundPreservesAnthropicContentBlockOrderInCanonical(t *testing.T) {
 	t.Parallel()

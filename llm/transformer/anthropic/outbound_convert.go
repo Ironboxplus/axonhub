@@ -26,6 +26,7 @@ func convertToAnthropicRequestWithConfig(chatReq *llm.Request, config *Config) *
 		req.Messages = messages
 		req.Tools = tools
 	}
+	req.MCPServers = canonicalAnthropicMCPServers(chatReq)
 
 	// DeepSeek requires assistant messages in history to include a thinking block
 	// when thinking is enabled (matching their OpenAI API behavior).
