@@ -91,7 +91,21 @@ func (decoder *anthropicCanonicalDecoder) decode(wire *StreamEvent, platformType
 		index := int(*wire.Index)
 		block := decoder.blocks[index]
 		if block == nil {
-			return nil, fmt.Errorf("Anthropic content_block_delta references unknown block %d", index)
+			// An input delta without a declared block would otherwise fail as an
+			// ordinary parser error. Classify it as a typed stream invariant so
+			// the conversion ledger, metrics, and UI retain bounded evidence of
+			// the failed lifecycle without retaining the delta payload.
+			eventKind := llm.EventKindTextDelta
+			if *wire.Delta.Type == "input_json_delta" {
+				eventKind = llm.EventKindToolInputDelta
+			}
+			return nil, &llm.StreamInvariantError{
+				Code:      llm.StreamInvariantItemState,
+				EventKind: eventKind,
+				Sequence:  decoder.nextSequence,
+				ItemRef:   llm.ItemRef{OutputIndex: lo.ToPtr(index)},
+				Cause:     fmt.Errorf("Anthropic content_block_delta references unknown block %d", index),
+			}
 		}
 		switch *wire.Delta.Type {
 		case "text_delta":

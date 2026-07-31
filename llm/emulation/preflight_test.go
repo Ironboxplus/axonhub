@@ -58,6 +58,18 @@ func TestControllerPreflightMergesOnlyConfiguredEmulators(t *testing.T) {
 	if err != nil || !mcpPlan.Complete() || mcpPlan.Summary.Emulated != 1 || mcpPlan.Actions[0].Strategy != conversion.StrategyMCPGateway {
 		t.Fatalf("MCP preflight = %#v, err=%v", mcpPlan, err)
 	}
+
+	responsesGatewayController, err := NewController(ControllerConfig{
+		MCP: mcpOnlyController.config.MCP, ForceMCPGateway: true,
+	})
+	if err != nil {
+		t.Fatalf("new forced Responses MCP controller: %v", err)
+	}
+	responsesPlan, err := responsesGatewayController.Preflight(mcpRequest, llm.APIFormatOpenAIResponse)
+	if err != nil || !responsesPlan.Complete() || responsesPlan.Summary.Emulated != 1 ||
+		responsesPlan.Actions[0].Strategy != conversion.StrategyMCPGateway {
+		t.Fatalf("forced Responses MCP preflight = %#v, err=%v", responsesPlan, err)
+	}
 }
 
 func TestControllerRejectsMismatchedHostedExecutorRegistration(t *testing.T) {

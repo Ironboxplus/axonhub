@@ -219,11 +219,31 @@ type MCPDefinition struct {
 }
 
 // MCPToolFilter is the protocol-neutral form shared by MCP discovery and
-// Responses' array/object allowed-tools variants. A nil ReadOnly means the
-// source did not constrain the MCP annotation.
+// protocol encoders. Current Responses uses an allow-list array; ReadOnly is
+// a discovery-time constraint over MCP readOnlyHint annotations and must not
+// be emitted as a provider-private object on a target that lacks that field.
+// A nil ReadOnly means the source did not constrain the MCP annotation.
 type MCPToolFilter struct {
 	ToolNames []string `json:"tool_names,omitempty"`
 	ReadOnly  *bool    `json:"read_only,omitempty"`
+}
+
+// HasMCPReadOnlyFilter reports whether a request needs MCP discovery before
+// it can be projected to a wire that only accepts explicit tool-name lists.
+// It is intentionally request-scoped: a route must not choose the gateway for
+// ordinary portable MCP definitions merely because another request did.
+func (request *Request) HasMCPReadOnlyFilter() bool {
+	if request == nil {
+		return false
+	}
+	for index := range request.ToolDefinitions {
+		definition := request.ToolDefinitions[index]
+		if definition.Kind == ToolKindMCP && definition.MCP != nil &&
+			definition.MCP.AllowedTools != nil && definition.MCP.AllowedTools.ReadOnly != nil {
+			return true
+		}
+	}
+	return false
 }
 
 type MCPApprovalMode string

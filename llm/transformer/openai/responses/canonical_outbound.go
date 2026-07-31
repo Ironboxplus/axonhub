@@ -209,13 +209,15 @@ func responsesMCPToolFilter(filter *llm.MCPToolFilter) (json.RawMessage, error) 
 	if filter == nil {
 		return nil, nil
 	}
-	if filter.ReadOnly == nil {
-		return json.Marshal(filter.ToolNames)
+	if filter.ReadOnly != nil {
+		// read_only filters are semantic constraints over tools/list metadata.
+		// Current Responses accepts only a tool-name sequence at this position;
+		// serializing the historical object form makes compatible providers
+		// reject the entire request with a 4xx. The relay must select the MCP
+		// gateway, discover the annotated tools, and lower the definition first.
+		return nil, fmt.Errorf("Responses MCP read_only requires MCP gateway projection")
 	}
-	return json.Marshal(struct {
-		ToolNames []string `json:"tool_names,omitempty"`
-		ReadOnly  *bool    `json:"read_only,omitempty"`
-	}{ToolNames: filter.ToolNames, ReadOnly: filter.ReadOnly})
+	return json.Marshal(filter.ToolNames)
 }
 
 func responsesMCPApprovalPolicy(policy *llm.MCPApprovalPolicy) (json.RawMessage, error) {

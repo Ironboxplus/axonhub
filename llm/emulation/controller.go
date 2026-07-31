@@ -30,8 +30,14 @@ var (
 )
 
 type ControllerConfig struct {
-	MCP                        mcp.RegistryConfig
-	Hosted                     hosted.Config
+	MCP    mcp.RegistryConfig
+	Hosted hosted.Config
+	// ForceMCPGateway prevents a Responses-compatible upstream from receiving a
+	// native remote-MCP definition when that particular upstream has not been
+	// verified to execute it. The wire format alone is not proof of provider
+	// capability; callers set this attempt-local policy from their channel
+	// capability profile.
+	ForceMCPGateway            bool
 	ContinuePauseTurns         bool
 	DefaultRequireApproval     bool
 	MaxRounds                  int
@@ -78,7 +84,7 @@ func (controller *Controller) Complete(ctx context.Context, request *llm.Request
 	if controller == nil || request == nil || rounds == nil {
 		return nil, errors.New("gateway tool loop requires controller, request, and round tripper")
 	}
-	if !needsMCPEmulation(request, rounds.TargetFormat()) && !hasHostedDefinitionsForTarget(request, rounds.TargetFormat()) &&
+	if !controller.needsMCPEmulation(request, rounds.TargetFormat()) && !hasHostedDefinitionsForTarget(request, rounds.TargetFormat()) &&
 		!controller.needsPauseTurnContinuation(request, rounds.TargetFormat()) &&
 		!(controller.config.EnableCustomConstraints && NeedsCustomConstraintEmulation(request, rounds.TargetFormat())) {
 		return rounds.Complete(ctx, request)
@@ -90,7 +96,7 @@ func (controller *Controller) Stream(ctx context.Context, request *llm.Request, 
 	if controller == nil || request == nil || rounds == nil {
 		return nil, errors.New("gateway tool loop requires controller, request, and round tripper")
 	}
-	if !needsMCPEmulation(request, rounds.TargetFormat()) && !hasHostedDefinitionsForTarget(request, rounds.TargetFormat()) &&
+	if !controller.needsMCPEmulation(request, rounds.TargetFormat()) && !hasHostedDefinitionsForTarget(request, rounds.TargetFormat()) &&
 		!controller.needsPauseTurnContinuation(request, rounds.TargetFormat()) &&
 		!(controller.config.EnableCustomConstraints && NeedsCustomConstraintEmulation(request, rounds.TargetFormat())) {
 		return rounds.Stream(ctx, request)
@@ -118,7 +124,7 @@ func (controller *Controller) completeMCP(ctx context.Context, request *llm.Requ
 	defer func() { _ = constraints.Close(context.WithoutCancel(loopCtx)) }()
 
 	registry := mcp.NewEmptyRegistry(controller.config.MCP.SyntheticNameKey)
-	if needsMCPEmulation(gatewayRequest, rounds.TargetFormat()) {
+	if controller.needsMCPEmulation(gatewayRequest, rounds.TargetFormat()) {
 		registry, err = mcp.DiscoverRegistry(loopCtx, gatewayRequest, controller.config.MCP)
 		if err != nil {
 			pipeline.RecordEmulationFailure(loopCtx)
@@ -135,7 +141,7 @@ func (controller *Controller) completeMCP(ctx context.Context, request *llm.Requ
 	}
 	prepared := gatewayRequest.Clone()
 	resumed := []llm.Item(nil)
-	if needsMCPEmulation(gatewayRequest, rounds.TargetFormat()) {
+	if controller.needsMCPEmulation(gatewayRequest, rounds.TargetFormat()) {
 		prepared, resumed, err = controller.lowerHistory(loopCtx, gatewayRequest, registry)
 		if err != nil {
 			pipeline.RecordEmulationFailure(loopCtx)
@@ -835,8 +841,9 @@ func hasMCPDefinitions(request *llm.Request) bool {
 	return false
 }
 
-func needsMCPEmulation(request *llm.Request, target llm.APIFormat) bool {
-	return target != llm.APIFormatOpenAIResponse && hasMCPDefinitions(request)
+func (controller *Controller) needsMCPEmulation(request *llm.Request, target llm.APIFormat) bool {
+	return hasMCPDefinitions(request) &&
+		(target != llm.APIFormatOpenAIResponse || controller != nil && controller.config.ForceMCPGateway || request.HasMCPReadOnlyFilter())
 }
 
 func hasHostedDefinitionsForTarget(request *llm.Request, target llm.APIFormat) bool {

@@ -67,6 +67,20 @@ func TestNewOutboundTransformer(t *testing.T) {
 	}
 }
 
+func TestOutboundTransformerRejectsUnsupportedLegacyToolInsteadOfDroppingIt(t *testing.T) {
+	t.Parallel()
+	transformer, err := NewOutboundTransformer("https://example.invalid", "test-api-key")
+	require.NoError(t, err)
+	_, err = transformer.TransformRequest(context.Background(), &llm.Request{
+		Model: "fixture-model",
+		Messages: []llm.Message{{
+			Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("run")},
+		}},
+		Tools: []llm.Tool{{Type: "future_behavior"}},
+	})
+	require.ErrorContains(t, err, "unsupported legacy Responses tool type")
+}
+
 func TestOutboundTransformer_TransformResponse_CanceledFinishReason(t *testing.T) {
 	transformer, err := NewOutboundTransformer("https://api.openai.com", "test-api-key")
 	require.NoError(t, err)
@@ -671,7 +685,7 @@ func TestOutboundTransformer_TransformRequest(t *testing.T) {
 			},
 		},
 		{
-			name: "request with unsupported tool type is skipped",
+			name: "request with unsupported tool type is rejected",
 			chatReq: &llm.Request{
 				Model: "gpt-4o",
 				Messages: []llm.Message{
@@ -688,15 +702,7 @@ func TestOutboundTransformer_TransformRequest(t *testing.T) {
 					},
 				},
 			},
-			expectError: false,
-			validate: func(t *testing.T, result *httpclient.Request, chatReq *llm.Request) {
-				var req Request
-
-				err := json.Unmarshal(result.Body, &req)
-				require.NoError(t, err)
-				// Unsupported tools should be skipped
-				require.Len(t, req.Tools, 0)
-			},
+			expectError: true,
 		},
 		{
 			name: "request with function tool",

@@ -2,6 +2,7 @@ package anthropic
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -13,6 +14,32 @@ import (
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/streams"
 )
+
+func TestOutboundTransformerRejectsUnregisteredToolInputDelta(t *testing.T) {
+	t.Parallel()
+	stream := newOutboundStream(streams.SliceStream([]*httpclient.StreamEvent{}), PlatformDirect)
+	startWire := sseEvent(t, "content_block_start", map[string]any{
+		"type": "content_block_start", "index": 3,
+		"content_block": map[string]any{
+			"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": map[string]any{},
+		},
+	})
+	var start StreamEvent
+	require.NoError(t, json.Unmarshal(startWire.Data, &start))
+	_, err := stream.canonical.decode(&start, PlatformDirect)
+	require.NoError(t, err)
+
+	deltaWire := sseEvent(t, "content_block_delta", map[string]any{
+		"type": "content_block_delta", "index": 3,
+		"delta": map[string]any{"type": "input_json_delta", "partial_json": `{"query":"Singapore"}`},
+	})
+	_, err = stream.transformStreamChunk(deltaWire)
+	require.Error(t, err)
+	var violation *llm.StreamInvariantError
+	require.True(t, errors.As(err, &violation), "error = %v", err)
+	require.Equal(t, llm.StreamInvariantToolState, violation.Code)
+	require.Equal(t, llm.EventKindToolInputDelta, violation.EventKind)
+}
 
 // TestOutboundTransformer_ServerToolUse_NoPanic replays the SSE trace from the
 // production panic report: a server_tool_use content block followed by
@@ -30,10 +57,10 @@ func TestOutboundTransformer_ServerToolUse_NoPanic(t *testing.T) {
 		sseEvent(t, "message_start", map[string]any{
 			"type": "message_start",
 			"message": map[string]any{
-				"id":    "msg_01AEsGpin3gJumakZWMTyQp3",
-				"type":  "message",
-				"role":  "assistant",
-				"model": "claude-opus-4-7",
+				"id":      "msg_01AEsGpin3gJumakZWMTyQp3",
+				"type":    "message",
+				"role":    "assistant",
+				"model":   "claude-opus-4-7",
 				"content": []any{},
 				"usage": map[string]any{
 					"input_tokens":  6,

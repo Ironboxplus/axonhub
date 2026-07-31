@@ -810,6 +810,76 @@ func TestResponsesSourceSequenceViolationIsObservableOverRealHTTP(t *testing.T) 
 	t.Fatal("missing conversion restore observation for sequence violation")
 }
 
+// TestAnthropicProviderToolStateViolationIsObservableOverRealHTTP proves that
+// a malformed Anthropic server-tool delta cannot disappear as a superficially
+// successful client stream. The provider is a real local TCP/SSE server rather
+// than a mocked transformer; the conversion observer must retain only the
+// bounded invariant evidence and never the tool arguments.
+func TestAnthropicProviderToolStateViolationIsObservableOverRealHTTP(t *testing.T) {
+	t.Parallel()
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		writeNamedSSEJSON(t, writer, "message_start", map[string]any{
+			"type": "message_start",
+			"message": map[string]any{
+				"id": "msg_bad_tool_state", "type": "message", "role": "assistant", "model": "matrix-model",
+				"content": []any{}, "usage": map[string]any{"input_tokens": 4, "output_tokens": 0},
+			},
+		})
+		writeNamedSSEJSON(t, writer, "content_block_delta", map[string]any{
+			"type": "content_block_delta", "index": 0,
+			"delta": map[string]any{"type": "input_json_delta", "partial_json": `{"query":"must-not-enter-trace"}`},
+		})
+	}))
+	t.Cleanup(provider.Close)
+
+	target, err := anthropic.NewOutboundTransformer(provider.URL, "fixture-key")
+	if err != nil {
+		t.Fatalf("create Anthropic outbound: %v", err)
+	}
+	executor := httpclient.NewHttpClientWithClient(provider.Client())
+	t.Cleanup(executor.CloseIdleConnections)
+	observer := &observationRecorder{}
+	result, err := pipeline.NewFactory(executor).
+		Pipeline(openai.NewInboundTransformer(), conversion.NewOutbound(target), pipeline.WithObserver(observer)).
+		Process(llm.WithConversionTrace(context.Background()), &httpclient.Request{
+			Method: http.MethodPost, URL: "/v1/chat/completions",
+			Headers: http.Header{"Content-Type": []string{"application/json"}},
+			Body:    []byte(`{"model":"matrix-model","stream":true,"messages":[{"role":"user","content":"fail deterministically"}]}`),
+		})
+	if err != nil {
+		t.Fatalf("start observable Anthropic tool-state test: %v", err)
+	}
+	defer result.EventStream.Close()
+	for result.EventStream.Next() {
+	}
+	if err := result.EventStream.Err(); err == nil {
+		t.Fatalf("stream error = %v", err)
+	}
+
+	for _, observation := range observer.snapshot() {
+		if observation.Stage != pipeline.StageConversionRestore || observation.Conversion == nil {
+			continue
+		}
+		if observation.Conversion.StreamViolations != 1 ||
+			observation.Conversion.LastStreamViolation != string(llm.StreamInvariantItemState) ||
+			observation.Conversion.LastStreamEvent != llm.EventKindToolInputDelta {
+			t.Fatalf("conversion tool-state summary = %#v", observation.Conversion)
+		}
+		if debug := observation.ConversionDebug; debug != nil {
+			serialized, err := json.Marshal(debug)
+			if err != nil {
+				t.Fatalf("marshal conversion debug trace: %v", err)
+			}
+			if bytes.Contains(serialized, []byte("must-not-enter-trace")) {
+				t.Fatalf("tool arguments leaked into conversion debug trace: %#v", debug)
+			}
+		}
+		return
+	}
+	t.Fatal("missing conversion restore observation for Anthropic tool-state violation")
+}
+
 func TestResponsesProviderToAnthropicClientCanonicalParallelToolsOverRealHTTP(t *testing.T) {
 	t.Parallel()
 

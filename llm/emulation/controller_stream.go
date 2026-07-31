@@ -96,7 +96,7 @@ func (controller *Controller) streamMCP(ctx context.Context, request *llm.Reques
 	}
 
 	registry := mcp.NewEmptyRegistry(controller.config.MCP.SyntheticNameKey)
-	if needsMCPEmulation(gatewayRequest, rounds.TargetFormat()) {
+	if controller.needsMCPEmulation(gatewayRequest, rounds.TargetFormat()) {
 		registry, err = mcp.DiscoverRegistry(loopCtx, gatewayRequest, controller.config.MCP)
 		if err != nil {
 			_ = constraints.Close(context.WithoutCancel(loopCtx))
@@ -112,7 +112,7 @@ func (controller *Controller) streamMCP(ctx context.Context, request *llm.Reques
 	}
 	prepared := gatewayRequest.Clone()
 	resumed := []llm.Item(nil)
-	if needsMCPEmulation(gatewayRequest, rounds.TargetFormat()) {
+	if controller.needsMCPEmulation(gatewayRequest, rounds.TargetFormat()) {
 		prepared, resumed, err = controller.lowerHistory(loopCtx, gatewayRequest, registry)
 		if err != nil {
 			closeOnError()

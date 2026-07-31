@@ -189,6 +189,132 @@ func TestControllerRunsResponsesMCPThroughChatTargetOverRealHTTP(t *testing.T) {
 	require.EqualValues(t, 1, emulationObservation.ToolCalls)
 }
 
+func TestControllerRunsPortableResponsesMCPThroughForcedGatewayOverRealHTTP(t *testing.T) {
+	t.Parallel()
+	const authorization = "Bearer responses-portable-private-token"
+	var mcpCalls atomic.Int64
+	mcpServer := newControllerMCPServer(t, authorization, &mcpCalls)
+	allowedMCP, err := url.Parse(mcpServer.URL)
+	require.NoError(t, err)
+
+	var providerRounds atomic.Int64
+	var syntheticName string
+	var providerIssues []string
+	var providerIssuesMu sync.Mutex
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		round := providerRounds.Add(1)
+		body, readErr := io.ReadAll(request.Body)
+		if readErr != nil {
+			http.Error(writer, "read", http.StatusBadRequest)
+			return
+		}
+		var payload struct {
+			Tools []struct {
+				Type string `json:"type"`
+				Name string `json:"name"`
+			} `json:"tools"`
+			Input json.RawMessage `json:"input"`
+		}
+		if json.Unmarshal(body, &payload) != nil || len(payload.Tools) != 1 || payload.Tools[0].Type != "function" ||
+			strings.Contains(string(body), `"type":"mcp"`) || strings.Contains(string(body), `"read_only"`) {
+			providerIssuesMu.Lock()
+			providerIssues = append(providerIssues, fmt.Sprintf("round %d provider body was not a lowered Responses request: %s", round, body))
+			providerIssuesMu.Unlock()
+			http.Error(writer, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		if round == 1 {
+			syntheticName = payload.Tools[0].Name
+			if !strings.HasPrefix(syntheticName, "axon_mcp_") {
+				providerIssuesMu.Lock()
+				providerIssues = append(providerIssues, "first round did not use an opaque MCP function")
+				providerIssuesMu.Unlock()
+			}
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(writer, `{"id":"resp_readonly_1","object":"response","created_at":1785382000,"model":"fixture-model","status":"completed","output":[{"id":"item_call_1","type":"function_call","call_id":"provider_call_1","name":%q,"arguments":"{\"sku\":\"A-1\"}","status":"completed"}],"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}`, syntheticName)
+			return
+		}
+		var inputItems []struct {
+			Type   string `json:"type"`
+			CallID string `json:"call_id"`
+			Output string `json:"output"`
+		}
+		foundResult := json.Unmarshal(payload.Input, &inputItems) == nil
+		if foundResult {
+			foundResult = false
+			for _, item := range inputItems {
+				if item.Type == "function_call_output" && item.CallID == "provider_call_1" && strings.Contains(item.Output, `"available":7`) {
+					foundResult = true
+					break
+				}
+			}
+		}
+		if round != 2 || !foundResult {
+			providerIssuesMu.Lock()
+			providerIssues = append(providerIssues, fmt.Sprintf("round %d missing lowered MCP result: %s", round, body))
+			providerIssuesMu.Unlock()
+			http.Error(writer, "missing function result", http.StatusBadRequest)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(writer, `{"id":"resp_readonly_2","object":"response","created_at":1785382001,"model":"fixture-model","status":"completed","output":[{"id":"msg_1","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"7 units available","annotations":[]}]}],"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}`)
+	}))
+	t.Cleanup(provider.Close)
+
+	controller, err := emulation.NewController(emulation.ControllerConfig{
+		MCP: mcp.RegistryConfig{
+			SyntheticNameKey: []byte(strings.Repeat("responses-portable-controller-key-", 2)),
+			EndpointPolicy: func(candidate *url.URL) error {
+				if candidate.Scheme != allowedMCP.Scheme || candidate.Host != allowedMCP.Host {
+					return fmt.Errorf("MCP endpoint is not allowlisted")
+				}
+				return nil
+			},
+		},
+		ForceMCPGateway: true,
+		MaxRounds:       4, MaxToolCalls: 8, MaxParallelCalls: 2,
+	})
+	require.NoError(t, err)
+	outbound, err := responses.NewOutboundTransformer(provider.URL, "provider-key")
+	require.NoError(t, err)
+	executor := httpclient.NewHttpClientWithProxy(&httpclient.ProxyConfig{Type: httpclient.ProxyTypeDisabled})
+	t.Cleanup(executor.CloseIdleConnections)
+	observer := &controllerObservationRecorder{}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	result, err := pipeline.NewFactory(executor).Pipeline(
+		responses.NewInboundTransformer(), conversion.NewOutbound(outbound),
+		pipeline.WithToolLoopController(controller), pipeline.WithObserver(observer),
+	).Process(ctx, &httpclient.Request{
+		Method: http.MethodPost, URL: "/v1/responses",
+		Headers: http.Header{"Content-Type": []string{"application/json"}},
+		Body: []byte(fmt.Sprintf(`{
+			"model":"fixture-model","input":"check inventory",
+			"tools":[{"type":"mcp","server_label":"inventory","server_url":%q,"authorization":%q,
+			"allowed_tools":["lookup"],"require_approval":"never"}]
+		}`, mcpServer.URL, authorization)),
+	})
+	require.NoError(t, err)
+	require.NotNil(t, result.Response)
+	require.EqualValues(t, 2, providerRounds.Load())
+	require.EqualValues(t, 1, mcpCalls.Load())
+	providerIssuesMu.Lock()
+	require.Empty(t, providerIssues)
+	providerIssuesMu.Unlock()
+
+	wire := string(result.Response.Body)
+	require.Contains(t, wire, `"type":"mcp_list_tools"`)
+	require.Contains(t, wire, `"type":"mcp_call"`)
+	require.Contains(t, wire, `"server_label":"inventory"`)
+	require.Contains(t, wire, "7 units available")
+	require.NotContains(t, wire, authorization)
+	emulationObservation := observer.emulation()
+	require.NotNil(t, emulationObservation)
+	require.EqualValues(t, 2, emulationObservation.InternalRounds)
+	require.EqualValues(t, 1, emulationObservation.ToolCalls)
+}
+
 func TestControllerPausesAndResumesMCPApprovalOverRealHTTP(t *testing.T) {
 	t.Parallel()
 	const authorization = "Bearer approval-private-token"

@@ -251,8 +251,7 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 			tool := convertFunctionToTool(item)
 			tools = append(tools, tool)
 		default:
-			// Skip unsupported tool types
-			continue
+			return nil, fmt.Errorf("unsupported legacy Responses tool type %q; provide a canonical tool definition with an explicit conversion plan", item.Type)
 		}
 	}
 	if canonicalTools, ok, err := canonicalRequestTools(llmReq); err != nil {

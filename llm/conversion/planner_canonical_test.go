@@ -498,6 +498,45 @@ func TestPlannerRoutesMCPDefinitionThroughGatewayEmulation(t *testing.T) {
 	}
 }
 
+func TestPlannerUsesNativeResponsesMCPWhenFilterIsPortable(t *testing.T) {
+	t.Parallel()
+	request := &llm.Request{
+		APIFormat: llm.APIFormatAnthropicMessage,
+		ToolDefinitions: []llm.ToolDefinition{{
+			Kind: llm.ToolKindMCP, LogicalName: "inventory", Execution: llm.ExecutionOwnerProvider,
+			MCP: &llm.MCPDefinition{
+				ServerLabel: "inventory", ServerURL: "https://mcp.example.test/rpc",
+				AllowedTools: &llm.MCPToolFilter{ToolNames: []string{"lookup", "reserve"}},
+			},
+		}},
+	}
+	plan, err := NewPlanner().Plan(request, llm.APIFormatOpenAIResponse)
+	if err != nil || plan == nil || !plan.Complete() || plan.Summary.Native != 1 || plan.Actions[0].Strategy != StrategyNative {
+		t.Fatalf("portable MCP to Responses plan = %#v, err=%v", plan, err)
+	}
+}
+
+func TestPlannerRoutesPortableResponsesMCPThroughGatewayWhenTargetProfileDoesNotSupportNativeMCP(t *testing.T) {
+	t.Parallel()
+	request := &llm.Request{
+		APIFormat: llm.APIFormatOpenAIResponse,
+		ToolDefinitions: []llm.ToolDefinition{{
+			Kind: llm.ToolKindMCP, LogicalName: "inventory", Execution: llm.ExecutionOwnerProvider,
+			MCP: &llm.MCPDefinition{
+				ServerLabel: "inventory", ServerURL: "https://mcp.example.test/rpc",
+				AllowedTools: &llm.MCPToolFilter{ToolNames: []string{"lookup"}},
+			},
+		}},
+	}
+	profile, _ := ProfileFor(llm.APIFormatOpenAIResponse)
+	profile.NativeTools &^= CapabilityMCPTool
+	profile.EmulatedTools |= CapabilityMCPTool
+	plan, err := NewPlannerWithProfile(profile).Plan(request, llm.APIFormatOpenAIResponse)
+	if err != nil || plan == nil || !plan.Complete() || plan.Summary.Emulated != 1 || plan.Actions[0].Strategy != StrategyMCPGateway {
+		t.Fatalf("portable MCP to a Responses-compatible non-native provider = %#v, err=%v", plan, err)
+	}
+}
+
 func TestPlannerLowersCrossProtocolReasoningAndRejectsOnlyUnknownContent(t *testing.T) {
 	t.Parallel()
 	request := &llm.Request{

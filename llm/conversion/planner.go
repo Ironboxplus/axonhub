@@ -194,7 +194,7 @@ func (p *Planner) plan(request *llm.Request, targetFormat llm.APIFormat, trace b
 				}
 			case llm.ItemKindMCPListTools, llm.ItemKindMCPApprovalRequest,
 				llm.ItemKindMCPApprovalResponse, llm.ItemKindMCPCall:
-				if profile.APIFormat == llm.APIFormatOpenAIResponse {
+				if profile.NativeTools.Supports(CapabilityMCPTool) {
 					plan.Actions = append(plan.Actions, nativeItemAction(itemIndex))
 				} else if profile.EmulatedTools.Supports(CapabilityMCPTool) && profile.NativeTools.Supports(CapabilityFunctionTool) {
 					plan.Actions = append(plan.Actions, Action{
@@ -502,6 +502,20 @@ func actionForToolDefinition(definition *llm.ToolDefinition, source llm.APIForma
 	if definition == nil {
 		return Action{Ref: ref, Kind: ActionUnknown, Strategy: StrategyUnavailable, Reason: ReasonNoStrategy}
 	}
+	capability := capabilityForToolKind(string(definition.Kind))
+	if definition.Execution == llm.ExecutionOwnerProvider && definition.Kind == llm.ToolKindMCP {
+		// A standard remote-MCP definition is native on Responses. A read_only
+		// filter is not a wire property there: its semantics are preserved only
+		// by discovering readOnlyHint annotations through the MCP gateway.
+		portable := definition.MCP != nil && (definition.MCP.AllowedTools == nil || definition.MCP.AllowedTools.ReadOnly == nil)
+		if portable && target.NativeTools.Supports(CapabilityMCPTool) {
+			return Action{Ref: ref, Kind: ActionNative, Strategy: StrategyNative, Reason: ReasonTargetNative, Reversible: true}
+		}
+		if target.EmulatedTools.Supports(capability) && target.NativeTools.Supports(CapabilityFunctionTool) {
+			return Action{Ref: ref, Kind: ActionEmulate, Strategy: StrategyMCPGateway, Reason: ReasonGatewayExecution, Reversible: true}
+		}
+		return Action{Ref: ref, Kind: ActionUnknown, Strategy: StrategyUnavailable, Reason: ReasonNoStrategy}
+	}
 	if source == target.APIFormat {
 		return Action{Ref: ref, Kind: ActionNative, Strategy: StrategyNative, Reason: ReasonTargetNative, Reversible: true}
 	}
@@ -513,19 +527,12 @@ func actionForToolDefinition(definition *llm.ToolDefinition, source llm.APIForma
 		(definition.Hosted == nil || definition.Hosted.WebSearch == nil) {
 		return Action{Ref: ref, Kind: ActionUnknown, Strategy: StrategyUnavailable, Reason: ReasonNoStrategy}
 	}
-	capability := capabilityForToolKind(string(definition.Kind))
 	if definition.Execution == llm.ExecutionOwnerProvider && definition.Hosted != nil {
 		if HostedToolNativeEquivalent(*definition, target.APIFormat) {
 			return Action{Ref: ref, Kind: ActionNative, Strategy: StrategyNative, Reason: ReasonTargetNative, Reversible: true}
 		}
 		if target.EmulatedTools.Supports(capability) && target.NativeTools.Supports(CapabilityFunctionTool) {
 			return Action{Ref: ref, Kind: ActionEmulate, Strategy: StrategyHostedGateway, Reason: ReasonGatewayExecution, Reversible: true}
-		}
-		return Action{Ref: ref, Kind: ActionUnknown, Strategy: StrategyUnavailable, Reason: ReasonNoStrategy}
-	}
-	if definition.Execution == llm.ExecutionOwnerProvider && definition.Kind == llm.ToolKindMCP {
-		if target.EmulatedTools.Supports(capability) && target.NativeTools.Supports(CapabilityFunctionTool) {
-			return Action{Ref: ref, Kind: ActionEmulate, Strategy: StrategyMCPGateway, Reason: ReasonGatewayExecution, Reversible: true}
 		}
 		return Action{Ref: ref, Kind: ActionUnknown, Strategy: StrategyUnavailable, Reason: ReasonNoStrategy}
 	}

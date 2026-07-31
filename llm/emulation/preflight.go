@@ -22,6 +22,13 @@ func (controller *Controller) CapabilityProfile(target llm.APIFormat) (conversio
 	if controllerMCPConfigured(controller.config) {
 		profile.EmulatedTools |= conversion.CapabilityMCPTool
 	}
+	if target == llm.APIFormatOpenAIResponse && controller.config.ForceMCPGateway {
+		// The upstream advertised the Responses wire but has not been admitted
+		// as a native remote-MCP executor. Preserve the public MCP lifecycle by
+		// planning the configured gateway instead of silently sending a tool the
+		// provider may ignore.
+		profile.NativeTools &^= conversion.CapabilityMCPTool
+	}
 	if len(controller.config.Hosted.SyntheticNameKey) >= 32 {
 		profile.EmulatedTools |= conversion.CapabilityToolSearch
 		for kind, executor := range controller.config.Hosted.Executors {
@@ -44,6 +51,11 @@ func (controller *Controller) Preflight(request *llm.Request, target llm.APIForm
 	profile, ok := controller.CapabilityProfile(target)
 	if !ok {
 		return conversion.NewPlanner().Plan(request, target)
+	}
+	if target == llm.APIFormatOpenAIResponse && (controller.config.ForceMCPGateway || request.HasMCPReadOnlyFilter()) {
+		// Prevent the planner from selecting the native Responses encoder for a
+		// constraint that only the configured MCP registry can preserve.
+		profile.NativeTools &^= conversion.CapabilityMCPTool
 	}
 	return conversion.NewPlannerWithProfile(profile).Plan(request, target)
 }

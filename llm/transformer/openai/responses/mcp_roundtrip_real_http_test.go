@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
@@ -36,8 +35,8 @@ func TestResponsesMCPDefinitionAndSecretsRoundTripOverRealHTTP(t *testing.T) {
 				"headers":{"X-MCP-Secret":"private-header-value"},
 				"defer_loading":true,
 				"allowed_callers":["direct"],
-				"allowed_tools":{"tool_names":["lookup","reserve"],"read_only":false},
-				"require_approval":{"always":{"tool_names":["reserve"]},"never":{"tool_names":["lookup"],"read_only":true}}
+				"allowed_tools":["lookup","reserve"],
+				"require_approval":"never"
 			},
 			{"type":"custom","name":"after"}
 		]
@@ -111,17 +110,17 @@ func TestResponsesMCPDefinitionAndSecretsRoundTripOverRealHTTP(t *testing.T) {
 
 	var providerRequest struct {
 		Tools []struct {
-			Type              string                     `json:"type"`
-			Name              string                     `json:"name"`
-			ServerLabel       string                     `json:"server_label"`
-			Authorization     string                     `json:"authorization"`
-			Headers           map[string]string          `json:"headers"`
-			AllowedTools      map[string]json.RawMessage `json:"allowed_tools"`
-			RequireApproval   map[string]json.RawMessage `json:"require_approval"`
-			ServerURL         string                     `json:"server_url"`
-			ServerDescription string                     `json:"server_description"`
-			AllowedCallers    []string                   `json:"allowed_callers"`
-			DeferLoading      *bool                      `json:"defer_loading"`
+			Type              string            `json:"type"`
+			Name              string            `json:"name"`
+			ServerLabel       string            `json:"server_label"`
+			Authorization     string            `json:"authorization"`
+			Headers           map[string]string `json:"headers"`
+			AllowedTools      json.RawMessage   `json:"allowed_tools"`
+			RequireApproval   json.RawMessage   `json:"require_approval"`
+			ServerURL         string            `json:"server_url"`
+			ServerDescription string            `json:"server_description"`
+			AllowedCallers    []string          `json:"allowed_callers"`
+			DeferLoading      *bool             `json:"defer_loading"`
 		} `json:"tools"`
 	}
 	select {
@@ -142,8 +141,28 @@ func TestResponsesMCPDefinitionAndSecretsRoundTripOverRealHTTP(t *testing.T) {
 	require.NotNil(t, mcp.DeferLoading)
 	require.True(t, *mcp.DeferLoading)
 	require.Equal(t, []string{"direct"}, mcp.AllowedCallers)
-	require.JSONEq(t, `["lookup","reserve"]`, string(mcp.AllowedTools["tool_names"]))
-	require.Equal(t, "false", strings.TrimSpace(string(mcp.AllowedTools["read_only"])))
-	require.JSONEq(t, `{"tool_names":["reserve"]}`, string(mcp.RequireApproval["always"]))
-	require.JSONEq(t, `{"tool_names":["lookup"],"read_only":true}`, string(mcp.RequireApproval["never"]))
+	require.JSONEq(t, `["lookup","reserve"]`, string(mcp.AllowedTools))
+	require.JSONEq(t, `"never"`, string(mcp.RequireApproval))
+}
+
+func TestResponsesMCPReadOnlyFilterRequiresGatewayBeforeProviderHTTP(t *testing.T) {
+	t.Parallel()
+	inbound := responses.NewInboundTransformer()
+	decoded, err := inbound.TransformRequest(context.Background(), &httpclient.Request{
+		Method: http.MethodPost, URL: "/v1/responses",
+		Headers: http.Header{"Content-Type": []string{"application/json"}},
+		Body: []byte(`{
+			"model":"fixture-model","input":"inspect inventory",
+			"tools":[{
+				"type":"mcp","server_label":"inventory","server_url":"https://mcp.example.invalid/rpc",
+				"allowed_tools":{"tool_names":["lookup"],"read_only":true},"require_approval":"never"
+			}]
+		}`),
+	})
+	require.NoError(t, err)
+
+	outbound, err := responses.NewOutboundTransformer("https://example.invalid", "fixture-key")
+	require.NoError(t, err)
+	_, err = outbound.TransformRequest(context.Background(), decoded)
+	require.ErrorContains(t, err, "read_only requires MCP gateway projection")
 }

@@ -267,12 +267,16 @@ func (s *outboundStream) transformStreamChunk(event *httpclient.StreamEvent) (*l
 				if streamEvent.Delta.PartialJSON != nil {
 					tc, ok := state.toolCalls[state.toolIndex]
 					if !ok || tc == nil {
-						// A tool_use-style delta arrived without a preceding
-						// content_block_start we registered (e.g. a block type
-						// we do not handle). Drop the delta rather than
-						// dereference nil.
-						//nolint:nilnil // Intentional no-op.
-						return nil, nil
+						// A tool-use delta without its registered legacy block is
+						// a semantic stream violation. It is unsafe to hide it:
+						// doing so produces a successful response with missing tool
+						// arguments. Conversion observers retain this typed error in
+						// the bounded trace without recording tool arguments.
+						return nil, &llm.StreamInvariantError{
+							Code:      llm.StreamInvariantToolState,
+							EventKind: llm.EventKindToolInputDelta,
+							Cause:     fmt.Errorf("Anthropic input_json_delta references an unregistered tool block"),
+						}
 					}
 
 					deltaTC := llm.ToolCall{
