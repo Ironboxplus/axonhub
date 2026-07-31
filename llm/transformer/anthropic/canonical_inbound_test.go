@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/looplj/axonhub/llm"
@@ -30,6 +31,48 @@ func TestAnthropicDeferredToolDefinitionSurvivesCanonicalCrossEncoding(t *testin
 	tools := canonicalAnthropicTools(request.ToolDefinitions)
 	if len(tools) != 1 || tools[0].DeferLoading == nil || !*tools[0].DeferLoading {
 		t.Fatalf("canonical Anthropic deferred encoding degraded: %#v", tools)
+	}
+}
+
+func TestInboundPreservesAnthropicMCPServersWithoutLeakingCredentials(t *testing.T) {
+	t.Parallel()
+	const authorization = "Bearer anthropic-mcp-private-token"
+	body := []byte(`{
+		"model":"fixture-model","max_tokens":128,
+		"messages":[{"role":"user","content":"look up the inventory"}],
+		"mcp_servers":[{"name":" inventory ","url":" https://mcp.example.invalid/v1 ","authorization_token":"` + authorization + `"}]
+	}`)
+	request, err := NewInboundTransformer().TransformRequest(context.Background(), &httpclient.Request{
+		Method: http.MethodPost, URL: "/v1/messages", Headers: http.Header{"Content-Type": []string{"application/json"}}, Body: body,
+	})
+	if err != nil {
+		t.Fatalf("decode Anthropic MCP server: %v", err)
+	}
+	if len(request.ToolDefinitions) != 1 || request.ToolDefinitions[0].Kind != llm.ToolKindMCP || request.ToolDefinitions[0].MCP == nil ||
+		request.ToolDefinitions[0].MCP.ServerLabel != "inventory" || request.ToolDefinitions[0].MCP.ServerURL != "https://mcp.example.invalid/v1" ||
+		request.ToolDefinitions[0].Execution != llm.ExecutionOwnerProvider {
+		t.Fatalf("Anthropic MCP definition degraded: %#v", request.ToolDefinitions)
+	}
+	if request.ToolExecutionSecrets == nil || request.ToolExecutionSecrets.MCP["inventory"].Authorization != authorization {
+		t.Fatalf("Anthropic MCP execution secret degraded: %#v", request.ToolExecutionSecrets)
+	}
+	serialized, err := json.Marshal(request)
+	if err != nil {
+		t.Fatalf("marshal canonical request: %v", err)
+	}
+	if strings.Contains(string(serialized), authorization) {
+		t.Fatalf("Anthropic MCP credential leaked into serialized request: %s", serialized)
+	}
+}
+
+func TestInboundRejectsDuplicateAnthropicMCPServerNames(t *testing.T) {
+	t.Parallel()
+	_, err := NewInboundTransformer().TransformRequest(context.Background(), &httpclient.Request{
+		Method: http.MethodPost, URL: "/v1/messages", Headers: http.Header{"Content-Type": []string{"application/json"}},
+		Body: []byte(`{"model":"fixture-model","max_tokens":128,"messages":[{"role":"user","content":"check"}],"mcp_servers":[{"name":"inventory","url":"https://one.example.invalid"},{"name":"inventory","url":"https://two.example.invalid"}]}`),
+	})
+	if err == nil || !strings.Contains(err.Error(), `duplicates name "inventory"`) {
+		t.Fatalf("duplicate Anthropic MCP names must be rejected, got %v", err)
 	}
 }
 

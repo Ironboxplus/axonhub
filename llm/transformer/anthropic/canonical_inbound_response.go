@@ -48,6 +48,21 @@ func canonicalResponseToAnthropic(response *llm.Response) (*Message, bool, error
 				return nil, true, fmt.Errorf("canonical output item %d hosted call has no Anthropic encoding", index)
 			}
 			message.Content = append(message.Content, blocks...)
+		case llm.ItemKindMCPListTools:
+			if item.MCPListTools == nil || item.MCPListTools.ServerLabel == "" {
+				return nil, true, fmt.Errorf("canonical output item %d MCP discovery payload is missing", index)
+			}
+			// Anthropic's MCP response vocabulary exposes actual mcp_tool_use and
+			// mcp_tool_result blocks, but has no response block for an internal
+			// tools/list discovery operation. Discovery remains in the bounded
+			// conversion observation; emitting a fabricated model tool call here
+			// would misrepresent what the model invoked.
+		case llm.ItemKindMCPCall:
+			blocks, err := canonicalAnthropicMCPCall(item)
+			if err != nil {
+				return nil, true, fmt.Errorf("canonical output item %d MCP call has no Anthropic encoding: %w", index, err)
+			}
+			message.Content = append(message.Content, blocks...)
 		case llm.ItemKindUnknown:
 			if item.Unknown == nil || !json.Valid(item.Unknown.Raw) {
 				return nil, true, fmt.Errorf("canonical output item %d unknown payload is invalid", index)
@@ -93,9 +108,51 @@ func canonicalAnthropicStopReason(response *llm.Response, content []MessageConte
 		}
 	}
 	for index := range content {
-		if content[index].Type == "tool_use" {
+		if content[index].Type == "tool_use" || content[index].Type == "mcp_tool_use" {
 			return lo.ToPtr("tool_use")
 		}
 	}
 	return lo.ToPtr("end_turn")
+}
+
+// canonicalAnthropicMCPCall projects the typed, completed MCP gateway item to
+// Anthropic's paired server-side blocks. The opaque list/discovery step has no
+// Anthropic wire equivalent and is deliberately kept in observability rather
+// than rendered as a false model invocation.
+func canonicalAnthropicMCPCall(item *llm.Item) ([]MessageContentBlock, error) {
+	if item == nil || item.ID == "" || item.MCPCall == nil {
+		return nil, fmt.Errorf("MCP call item id or payload is missing")
+	}
+	call := item.MCPCall
+	if call.ServerLabel == "" || call.LogicalName == "" {
+		return nil, fmt.Errorf("MCP server label or logical name is missing")
+	}
+	arguments := append(json.RawMessage(nil), call.ArgumentsJSON...)
+	if len(arguments) == 0 && call.ArgumentsText != "" && json.Valid([]byte(call.ArgumentsText)) {
+		arguments = json.RawMessage(call.ArgumentsText)
+	}
+	if len(arguments) == 0 || !json.Valid(arguments) {
+		arguments = json.RawMessage(`{}`)
+	}
+	use := MessageContentBlock{
+		Type: "mcp_tool_use", ID: item.ID, Name: stringPointerNonNil(call.LogicalName),
+		ServerName: call.ServerLabel, Input: arguments,
+	}
+
+	resultContent := MessageContent{}
+	isError := item.Status == llm.ItemStatusFailed || call.Status == llm.MCPCallStatusFailed || call.Error != ""
+	switch {
+	case call.Error != "":
+		resultContent.Content = stringPointerNonNil(call.Error)
+	case json.Valid([]byte(call.Output)) && len(call.Output) > 0 && (call.Output[0] == '{' || call.Output[0] == '['):
+		resultContent.SetRaw(append(json.RawMessage(nil), call.Output...))
+	case call.Output != "":
+		resultContent.Content = stringPointerNonNil(call.Output)
+	default:
+		resultContent.Content = stringPointerNonNil("")
+	}
+	return []MessageContentBlock{
+		use,
+		{Type: "mcp_tool_result", ToolUseID: stringPointerNonNil(item.ID), Content: &resultContent, IsError: &isError},
+	}, nil
 }

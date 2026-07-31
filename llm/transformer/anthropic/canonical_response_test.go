@@ -58,3 +58,38 @@ func TestTransformResponseBuildsCanonicalWebFetchObjectLifecycle(t *testing.T) {
 	require.Equal(t, string(hosted.Result.StructuredContent), hosted.Result.Content[0].Text)
 	require.Equal(t, "fetched", response.Output[1].Content[0].Text)
 }
+
+func TestCanonicalResponseProjectsMCPGatewayLifecycleToAnthropicBlocks(t *testing.T) {
+	t.Parallel()
+	message, encoded, err := canonicalResponseToAnthropic(&llm.Response{
+		ID: "msg_mcp", Model: "fixture-model",
+		Output: []llm.Item{
+			{
+				Kind: llm.ItemKindMCPListTools, ID: "list_inventory", Status: llm.ItemStatusCompleted,
+				MCPListTools: &llm.MCPListTools{ServerLabel: "inventory", Tools: []llm.MCPDiscoveredTool{{Name: "lookup"}}},
+			},
+			{
+				Kind: llm.ItemKindMCPCall, ID: "mcp_call_inventory_1", Status: llm.ItemStatusCompleted,
+				MCPCall: &llm.MCPCall{
+					ServerLabel: "inventory", LogicalName: "lookup", ArgumentsJSON: []byte(`{"sku":"A-1"}`),
+					Output: `{"content":[{"type":"text","text":"7 units available"}],"structuredContent":{"available":7}}`, Status: llm.MCPCallStatusCompleted,
+				},
+			},
+			{Kind: llm.ItemKindMessage, Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Kind: llm.ContentKindText, Text: "done"}}},
+		},
+	})
+	require.NoError(t, err)
+	require.True(t, encoded)
+	require.Len(t, message.Content, 3, "MCP discovery is observable but has no fabricated Anthropic response block")
+	require.Equal(t, "mcp_tool_use", message.Content[0].Type)
+	require.Equal(t, "inventory", message.Content[0].ServerName)
+	require.Equal(t, "lookup", *message.Content[0].Name)
+	require.JSONEq(t, `{"sku":"A-1"}`, string(message.Content[0].Input))
+	require.Equal(t, "mcp_tool_result", message.Content[1].Type)
+	require.Equal(t, "mcp_call_inventory_1", *message.Content[1].ToolUseID)
+	require.NotNil(t, message.Content[1].Content)
+	require.Contains(t, string(message.Content[1].Content.Raw), "7 units available")
+	require.NotNil(t, message.StopReason)
+	require.Equal(t, "tool_use", *message.StopReason)
+	require.Equal(t, "done", *message.Content[2].Text)
+}

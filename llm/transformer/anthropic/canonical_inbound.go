@@ -19,6 +19,11 @@ func anthropicRequestToCanonical(request *MessageRequest) ([]llm.Item, []llm.Too
 	if err != nil {
 		return nil, nil, err
 	}
+	mcpDefinitions, err := anthropicMCPServerDefinitionsToCanonical(request.MCPServers)
+	if err != nil {
+		return nil, nil, err
+	}
+	definitions = append(definitions, mcpDefinitions...)
 	toolKinds := make(map[string]llm.ToolKind, len(definitions))
 	for index := range definitions {
 		toolKinds[definitions[index].LogicalName] = definitions[index].Kind
@@ -80,6 +85,48 @@ func anthropicToolDefinitionsToCanonical(tools []Tool) ([]llm.ToolDefinition, er
 		})
 	}
 	return definitions, nil
+}
+
+// anthropicMCPServerDefinitionsToCanonical keeps the remote-server declaration
+// protocol-neutral. Executor credentials are intentionally handled by
+// anthropicMCPExecutionSecrets and never copied into the definition.
+func anthropicMCPServerDefinitionsToCanonical(servers []MCPServer) ([]llm.ToolDefinition, error) {
+	definitions := make([]llm.ToolDefinition, 0, len(servers))
+	seenLabels := make(map[string]struct{}, len(servers))
+	for index := range servers {
+		server := &servers[index]
+		name := strings.TrimSpace(server.Name)
+		serverURL := strings.TrimSpace(server.URL)
+		if name == "" || serverURL == "" {
+			return nil, fmt.Errorf("mcp_servers[%d] requires non-empty name and url", index)
+		}
+		if _, exists := seenLabels[name]; exists {
+			return nil, fmt.Errorf("mcp_servers[%d] duplicates name %q", index, name)
+		}
+		seenLabels[name] = struct{}{}
+		definitions = append(definitions, llm.ToolDefinition{
+			Kind: llm.ToolKindMCP, LogicalName: name, Execution: llm.ExecutionOwnerProvider,
+			MCP:           &llm.MCPDefinition{ServerLabel: name, ServerURL: serverURL},
+			ProtocolHints: anthropicHints("mcp_servers", -1, index),
+		})
+	}
+	return definitions, nil
+}
+
+func anthropicMCPExecutionSecrets(servers []MCPServer) *llm.ToolExecutionSecrets {
+	var secrets *llm.ToolExecutionSecrets
+	for index := range servers {
+		name := strings.TrimSpace(servers[index].Name)
+		authorization := strings.TrimSpace(servers[index].AuthorizationToken)
+		if name == "" || authorization == "" {
+			continue
+		}
+		if secrets == nil {
+			secrets = &llm.ToolExecutionSecrets{MCP: make(map[string]llm.MCPConnectionSecrets)}
+		}
+		secrets.MCP[name] = llm.MCPConnectionSecrets{Authorization: authorization}
+	}
+	return secrets
 }
 
 func cloneAnthropicBool(value *bool) *bool {

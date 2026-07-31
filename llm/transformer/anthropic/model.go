@@ -88,6 +88,10 @@ type MessageRequest struct {
 
 	// Tools is an optional array of tools.
 	Tools []Tool `json:"tools,omitempty"`
+	// MCPServers is the Anthropic remote-MCP declaration. Its authorization
+	// token is extracted into llm.ToolExecutionSecrets after inbound decoding so
+	// that it never enters canonical serialization, observations, or storage.
+	MCPServers []MCPServer `json:"mcp_servers,omitempty"`
 	// ToolChoice is an optional tool choice configuration.
 	ToolChoice *ToolChoice `json:"tool_choice,omitempty"`
 
@@ -207,6 +211,16 @@ type ToolChoice struct {
 
 	// Name is an optional name of the tool to use, it is required when Type is tool.
 	Name *string `json:"name,omitempty" validate:"required_if=Type tool"`
+}
+
+// MCPServer describes an Anthropic remote MCP server declaration. The wire
+// field is deliberately named AuthorizationToken rather than Authorization to
+// match the Anthropic API while keeping it distinct from the Responses wire
+// format. It is request-lifetime secret material, not canonical metadata.
+type MCPServer struct {
+	Name               string `json:"name"`
+	URL                string `json:"url"`
+	AuthorizationToken string `json:"authorization_token,omitempty"`
 }
 
 // Tool represents a tool definition for Anthropic API.

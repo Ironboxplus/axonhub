@@ -389,6 +389,7 @@ func convertToLLMRequest(anthropicReq *MessageRequest) (*llm.Request, error) {
 	}
 	chatReq.Input = canonicalInput
 	chatReq.ToolDefinitions = canonicalTools
+	chatReq.ToolExecutionSecrets = anthropicMCPExecutionSecrets(anthropicReq.MCPServers)
 
 	if err := llm.PopulateCanonicalFromLegacy(chatReq); err != nil {
 		return nil, err

@@ -315,6 +315,130 @@ func TestControllerRunsPortableResponsesMCPThroughForcedGatewayOverRealHTTP(t *t
 	require.EqualValues(t, 1, emulationObservation.ToolCalls)
 }
 
+// TestControllerRunsAnthropicMCPServersThroughResponsesGatewayOverRealHTTP
+// exercises the exact client shape used by Anthropic mcp_servers callers. The
+// two HTTP servers are real protocol peers: one is a Streamable HTTP MCP
+// server, and the other is a Responses-form upstream. No tool executor is
+// stubbed inside the controller.
+func TestControllerRunsAnthropicMCPServersThroughResponsesGatewayOverRealHTTP(t *testing.T) {
+	t.Parallel()
+	const authorization = "Bearer anthropic-mcp-private-token"
+	var mcpCalls atomic.Int64
+	mcpServer := newControllerMCPServer(t, authorization, &mcpCalls)
+	allowedMCP, err := url.Parse(mcpServer.URL)
+	require.NoError(t, err)
+
+	var providerRounds atomic.Int64
+	var syntheticName string
+	var providerIssues []string
+	var providerIssuesMu sync.Mutex
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		round := providerRounds.Add(1)
+		body, readErr := io.ReadAll(request.Body)
+		if readErr != nil {
+			http.Error(writer, "read", http.StatusBadRequest)
+			return
+		}
+		var payload struct {
+			Tools []struct {
+				Type string `json:"type"`
+				Name string `json:"name"`
+			} `json:"tools"`
+			Input json.RawMessage `json:"input"`
+		}
+		if json.Unmarshal(body, &payload) != nil || len(payload.Tools) != 1 || payload.Tools[0].Type != "function" ||
+			strings.Contains(string(body), `"type":"mcp"`) || strings.Contains(string(body), authorization) {
+			providerIssuesMu.Lock()
+			providerIssues = append(providerIssues, fmt.Sprintf("round %d provider body was not an isolated Anthropic MCP gateway request: %s", round, body))
+			providerIssuesMu.Unlock()
+			http.Error(writer, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		if round == 1 {
+			syntheticName = payload.Tools[0].Name
+			writer.Header().Set("Content-Type", "application/json")
+			argumentsJSON := `{"sku":"A-1"}`
+			_, _ = fmt.Fprintf(writer, `{"id":"resp_anthropic_mcp_1","object":"response","created_at":1785382000,"model":"fixture-model","status":"completed","output":[{"id":"item_call_1","type":"function_call","call_id":"provider_call_1","name":%q,"arguments":%q,"status":"completed"}],"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}`, syntheticName, argumentsJSON)
+			return
+		}
+		var inputItems []struct {
+			Type   string `json:"type"`
+			CallID string `json:"call_id"`
+			Output string `json:"output"`
+		}
+		foundResult := json.Unmarshal(payload.Input, &inputItems) == nil
+		if foundResult {
+			foundResult = false
+			for _, item := range inputItems {
+				if item.Type == "function_call_output" && item.CallID == "provider_call_1" && strings.Contains(item.Output, `"available":7`) {
+					foundResult = true
+					break
+				}
+			}
+		}
+		if round != 2 || !foundResult {
+			providerIssuesMu.Lock()
+			providerIssues = append(providerIssues, fmt.Sprintf("round %d missing Anthropic MCP result: %s", round, body))
+			providerIssuesMu.Unlock()
+			http.Error(writer, "missing function result", http.StatusBadRequest)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(writer, `{"id":"resp_anthropic_mcp_2","object":"response","created_at":1785382001,"model":"fixture-model","status":"completed","output":[{"id":"msg_1","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"7 units available","annotations":[]}]}],"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}`)
+	}))
+	t.Cleanup(provider.Close)
+
+	controller, err := emulation.NewController(emulation.ControllerConfig{
+		MCP: mcp.RegistryConfig{
+			SyntheticNameKey: []byte(strings.Repeat("anthropic-mcp-server-key-", 3)),
+			EndpointPolicy: func(candidate *url.URL) error {
+				if candidate.Scheme != allowedMCP.Scheme || candidate.Host != allowedMCP.Host {
+					return fmt.Errorf("MCP endpoint is not allowlisted")
+				}
+				return nil
+			},
+		},
+		ForceMCPGateway: true,
+		MaxRounds:       4, MaxToolCalls: 8, MaxParallelCalls: 2,
+	})
+	require.NoError(t, err)
+	outbound, err := responses.NewOutboundTransformer(provider.URL, "provider-key")
+	require.NoError(t, err)
+	executor := httpclient.NewHttpClientWithProxy(&httpclient.ProxyConfig{Type: httpclient.ProxyTypeDisabled})
+	t.Cleanup(executor.CloseIdleConnections)
+	observer := &controllerObservationRecorder{}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	result, err := pipeline.NewFactory(executor).Pipeline(
+		anthropic.NewInboundTransformer(), conversion.NewOutbound(outbound),
+		pipeline.WithToolLoopController(controller), pipeline.WithObserver(observer),
+	).Process(ctx, &httpclient.Request{
+		Method: http.MethodPost, URL: "/v1/messages",
+		Headers: http.Header{"Content-Type": []string{"application/json"}},
+		Body: []byte(fmt.Sprintf(`{
+			"model":"fixture-model","max_tokens":128,"messages":[{"role":"user","content":"check inventory"}],
+			"mcp_servers":[{"name":"inventory","url":%q,"authorization_token":%q}]
+		}`, mcpServer.URL, authorization)),
+	})
+	require.NoError(t, err)
+	require.NotNil(t, result.Response)
+	require.EqualValues(t, 2, providerRounds.Load())
+	require.EqualValues(t, 1, mcpCalls.Load())
+	providerIssuesMu.Lock()
+	require.Empty(t, providerIssues)
+	providerIssuesMu.Unlock()
+
+	wire := string(result.Response.Body)
+	require.Contains(t, wire, "7 units available")
+	require.NotContains(t, wire, syntheticName)
+	require.NotContains(t, wire, authorization)
+	emulationObservation := observer.emulation()
+	require.NotNil(t, emulationObservation)
+	require.EqualValues(t, 2, emulationObservation.InternalRounds)
+	require.EqualValues(t, 1, emulationObservation.ToolCalls)
+}
+
 func TestControllerPausesAndResumesMCPApprovalOverRealHTTP(t *testing.T) {
 	t.Parallel()
 	const authorization = "Bearer approval-private-token"
