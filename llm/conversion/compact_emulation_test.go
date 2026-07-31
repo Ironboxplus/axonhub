@@ -25,7 +25,9 @@ func TestPlannerModelsCompactAsRequestLevelCapability(t *testing.T) {
 		strategy   StrategyID
 		reversible bool
 	}{
-		{name: "responses_native", target: llm.APIFormatOpenAIResponse, kind: ActionNative, strategy: StrategyNative, reversible: true},
+		// Responses targets also emulate: live OpenAI-compatible gateways often
+		// lack /v1/responses/compact, so native passthrough is not reliable.
+		{name: "responses_emulated", target: llm.APIFormatOpenAIResponse, kind: ActionEmulate, strategy: StrategyCompactAsChat},
 		{name: "chat_emulated", target: llm.APIFormatOpenAIChatCompletion, kind: ActionEmulate, strategy: StrategyCompactAsChat},
 		{name: "anthropic_emulated", target: llm.APIFormatAnthropicMessage, kind: ActionEmulate, strategy: StrategyCompactAsChat},
 	}

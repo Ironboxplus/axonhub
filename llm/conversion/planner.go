@@ -268,10 +268,14 @@ func actionForCompactRequest(request *llm.Request, profile CapabilityProfile) Ac
 	if request == nil || request.Compact == nil {
 		return Action{Ref: ref, Kind: ActionUnknown, Strategy: StrategyUnavailable, Reason: ReasonNoStrategy}
 	}
-	if profile.APIFormat == llm.APIFormatOpenAIResponse {
-		return Action{Ref: ref, Kind: ActionNative, Strategy: StrategyNative, Reason: ReasonTargetNative, Reversible: true}
-	}
-	if profile.APIFormat == llm.APIFormatOpenAIChatCompletion || profile.APIFormat == llm.APIFormatAnthropicMessage {
+	// Always emulate compact as a chat-style completion. Live upstreams used by
+	// Octopus (and many OpenAI-compatible gateways) do not implement
+	// POST /v1/responses/compact; native passthrough 404s. Emulation rewrites to
+	// an ordinary completion on the selected wire and restoreCompactEmulation
+	// rehydrates object=response.compaction for the client.
+	if profile.APIFormat == llm.APIFormatOpenAIResponse ||
+		profile.APIFormat == llm.APIFormatOpenAIChatCompletion ||
+		profile.APIFormat == llm.APIFormatAnthropicMessage {
 		return Action{Ref: ref, Kind: ActionEmulate, Strategy: StrategyCompactAsChat, Reason: ReasonTargetNoCompact}
 	}
 	return Action{Ref: ref, Kind: ActionUnknown, Strategy: StrategyUnavailable, Reason: ReasonNoStrategy}

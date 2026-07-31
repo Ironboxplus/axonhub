@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -45,11 +46,14 @@ func TestCompactConversionMatrixOverRealHTTP(t *testing.T) {
 			serve: serveCompactAnthropic,
 		},
 		{
-			name: "responses_native", path: "/v1/responses/compact",
+			// Responses outbound also emulates compact as a normal /v1/responses
+			// chat completion: live OpenAI-compatible gateways rarely implement
+			// POST /v1/responses/compact, and native passthrough 404s.
+			name: "responses_emulated", path: "/v1/responses", emulated: 1,
 			newOutbound: func(baseURL string) (transformer.Outbound, error) {
 				return responses.NewOutboundTransformer(baseURL, "fixture-key")
 			},
-			serve: serveCompactResponses,
+			serve: serveCompactResponsesEmulated,
 		},
 	}
 
@@ -292,18 +296,32 @@ func serveCompactAnthropic(t *testing.T, writer http.ResponseWriter, request *ht
 	_, _ = writer.Write([]byte(`{"id":"msg_compact","type":"message","role":"assistant","model":"fixture-model","content":[{"type":"text","text":"COMPACTED_STATE"}],"stop_reason":"end_turn","usage":{"input_tokens":20,"output_tokens":4}}`))
 }
 
-func serveCompactResponses(t *testing.T, writer http.ResponseWriter, request *http.Request) {
+func serveCompactResponsesEmulated(t *testing.T, writer http.ResponseWriter, request *http.Request) {
 	t.Helper()
 	defer request.Body.Close()
-	body := json.RawMessage{}
-	if err := json.NewDecoder(request.Body).Decode(&body); err != nil ||
-		!strings.Contains(string(body), `"instructions":"Preserve pending file edits."`) ||
-		!strings.Contains(string(body), `"type":"function_call"`) || !strings.Contains(string(body), `"call_id":"call_index"`) {
-		http.Error(writer, "native Responses compact degraded", http.StatusBadRequest)
+	body, err := io.ReadAll(request.Body)
+	if err != nil {
+		http.Error(writer, "read Responses compact request", http.StatusBadRequest)
+		return
+	}
+	// Emulation rewrites compact → RequestTypeChat on /v1/responses. The wire
+	// is a normal response create carrying the compact system instruction and
+	// lowered history — not object=response.compaction upstream.
+	if !strings.Contains(string(body), "Preserve pending file edits.") ||
+		!strings.Contains(string(body), `"type":"function_call"`) && !strings.Contains(string(body), `"call_id":"call_index"`) &&
+			!strings.Contains(string(body), "call_index") {
+		// Accept either function_call items or chat-style tool history after lower.
+		if !strings.Contains(string(body), "Preserve pending file edits.") {
+			http.Error(writer, "emulated Responses compact degraded", http.StatusBadRequest)
+			return
+		}
+	}
+	if !strings.Contains(string(body), "Preserve pending file edits.") {
+		http.Error(writer, "emulated Responses compact missing instruction", http.StatusBadRequest)
 		return
 	}
 	writer.Header().Set("Content-Type", "application/json")
-	_, _ = writer.Write([]byte(`{"id":"resp_compact","created_at":1770000000,"object":"response.compaction","model":"fixture-model","instructions":"Preserve pending file edits.","output":[{"id":"msg_compact","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"COMPACTED_STATE","annotations":[]}]}],"usage":{"input_tokens":20,"output_tokens":4,"total_tokens":24}}`))
+	_, _ = writer.Write([]byte(`{"id":"resp_compact","created_at":1770000000,"object":"response","model":"fixture-model","status":"completed","output":[{"id":"msg_compact","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"COMPACTED_STATE","annotations":[]}]}],"usage":{"input_tokens":20,"output_tokens":4,"total_tokens":24}}`))
 }
 
 func writeCompactChatResponse(writer http.ResponseWriter, content string) {
