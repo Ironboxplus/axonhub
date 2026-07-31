@@ -1276,6 +1276,10 @@ func TestControllerRunsResponsesMCPThroughAnthropicTargetOverRealHTTP(t *testing
 			Tools []struct {
 				Name string `json:"name"`
 			} `json:"tools"`
+			ToolChoice *struct {
+				Type string `json:"type"`
+				Name string `json:"name"`
+			} `json:"tool_choice"`
 			Messages []struct {
 				Role    string          `json:"role"`
 				Content json.RawMessage `json:"content"`
@@ -1292,7 +1296,15 @@ func TestControllerRunsResponsesMCPThroughAnthropicTargetOverRealHTTP(t *testing
 				http.Error(w, "synthetic tool", http.StatusBadRequest)
 				return
 			}
+			if payload.ToolChoice == nil || payload.ToolChoice.Type != "tool" || payload.ToolChoice.Name != syntheticName {
+				http.Error(w, "required MCP tool was not specialized", http.StatusBadRequest)
+				return
+			}
 			_, _ = fmt.Fprintf(w, `{"id":"msg_mcp_round_1","type":"message","role":"assistant","model":"fixture-model","content":[{"type":"tool_use","id":"anthropic_mcp_call","name":%q,"input":{"sku":"A-1"}}],"stop_reason":"tool_use","usage":{"input_tokens":5,"output_tokens":2}}`, syntheticName)
+			return
+		}
+		if payload.ToolChoice != nil {
+			http.Error(w, "completed MCP call kept forcing another tool", http.StatusBadRequest)
 			return
 		}
 		foundResult := false
@@ -1336,7 +1348,8 @@ func TestControllerRunsResponsesMCPThroughAnthropicTargetOverRealHTTP(t *testing
 		Headers: http.Header{"Content-Type": []string{"application/json"}},
 		Body: []byte(fmt.Sprintf(`{
 			"model":"fixture-model","input":"check through Anthropic",
-			"tools":[{"type":"mcp","server_label":"inventory","server_url":%q,"authorization":%q,"require_approval":"never"}]
+			"tools":[{"type":"mcp","server_label":"inventory","server_url":%q,"authorization":%q,"require_approval":"never"}],
+			"tool_choice":"required"
 		}`, mcpServer.URL, authorization)),
 	})
 	require.NoError(t, err)

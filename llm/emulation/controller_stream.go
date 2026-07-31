@@ -44,12 +44,13 @@ type controllerMCPStream struct {
 	roundOrder  []*controllerRoundItem
 	gatewaySeen bool
 
-	initial           []llm.Item
-	usage             *llm.Usage
-	totalCalls        int
-	resumedCalls      int
-	roundsDone        int
-	constraintRetries int
+	initial             []llm.Item
+	usage               *llm.Usage
+	totalCalls          int
+	resumedCalls        int
+	roundsDone          int
+	constraintRetries   int
+	requiredGatewayTool bool
 
 	machine        *llm.StreamStateMachine
 	sequence       uint64
@@ -134,6 +135,7 @@ func (controller *Controller) streamMCP(ctx context.Context, request *llm.Reques
 		pipeline.RecordEmulationFailure(loopCtx)
 		return nil, err
 	}
+	requiredGatewayTool := specializeSingleRequiredGatewayTool(prepared)
 	if len(resumed) > controller.config.MaxToolCalls {
 		closeOnError()
 		pipeline.RecordEmulationLimit(loopCtx)
@@ -145,7 +147,8 @@ func (controller *Controller) streamMCP(ctx context.Context, request *llm.Reques
 		constraints: constraints, rounds: rounds, prepared: prepared,
 		initial:    append(uniqueCurrentListItems(request.Input, registry.ListItems()), resumed...),
 		totalCalls: len(resumed), resumedCalls: len(resumed),
-		machine: llm.NewStreamStateMachine(),
+		requiredGatewayTool: requiredGatewayTool,
+		machine:             llm.NewStreamStateMachine(),
 	}
 	stream.resetRound()
 	if err := stream.openRound(); err != nil {
@@ -436,6 +439,14 @@ func (stream *controllerMCPStream) finishRound() error {
 		return err
 	}
 	stream.totalCalls += processed.gatewayCalls
+	if stream.requiredGatewayTool && processed.gatewayCalls == 0 {
+		pipeline.RecordEmulationFailure(stream.ctx)
+		return ErrRequiredGatewayToolCall
+	}
+	if stream.requiredGatewayTool && processed.gatewayCalls > 0 {
+		stream.prepared.ToolChoice = nil
+		stream.requiredGatewayTool = false
+	}
 	if processed.constraintRetry {
 		stream.constraintRetries++
 		pipeline.RecordCustomConstraintRetry(stream.ctx)

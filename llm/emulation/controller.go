@@ -25,8 +25,9 @@ const (
 )
 
 var (
-	ErrLoopLimit     = errors.New("gateway tool loop limit exceeded")
-	ErrApprovalState = errors.New("invalid gateway approval state")
+	ErrLoopLimit               = errors.New("gateway tool loop limit exceeded")
+	ErrApprovalState           = errors.New("invalid gateway approval state")
+	ErrRequiredGatewayToolCall = errors.New("provider omitted a required gateway tool call")
 )
 
 type ControllerConfig struct {
@@ -153,6 +154,7 @@ func (controller *Controller) completeMCP(ctx context.Context, request *llm.Requ
 		pipeline.RecordEmulationFailure(loopCtx)
 		return nil, err
 	}
+	requiredGatewayTool := specializeSingleRequiredGatewayTool(prepared)
 	publicItems := uniqueCurrentListItems(request.Input, registry.ListItems())
 	publicItems = append(publicItems, resumed...)
 	var billedUsage *llm.Usage
@@ -180,6 +182,14 @@ func (controller *Controller) completeMCP(ctx context.Context, request *llm.Requ
 			return nil, processErr
 		}
 		totalCalls += processed.gatewayCalls
+		if requiredGatewayTool && processed.gatewayCalls == 0 {
+			pipeline.RecordEmulationFailure(loopCtx)
+			return nil, ErrRequiredGatewayToolCall
+		}
+		if requiredGatewayTool && processed.gatewayCalls > 0 {
+			prepared.ToolChoice = nil
+			requiredGatewayTool = false
+		}
 		if processed.constraintRetry {
 			constraintRetries++
 			pipeline.RecordCustomConstraintRetry(loopCtx)
@@ -212,6 +222,30 @@ func (controller *Controller) completeMCP(ctx context.Context, request *llm.Requ
 	}
 	pipeline.RecordEmulationLimit(loopCtx)
 	return nil, ErrLoopLimit
+}
+
+// specializeSingleRequiredGatewayTool strengthens a provider-neutral
+// "required" choice only when gateway lowering leaves exactly one callable
+// function. The transformation is semantically equivalent, but providers
+// that weakly enforce generic required/any choices are much more consistent
+// with an explicit named choice. Callers must clear the choice after the first
+// gateway call so the continuation round can produce the final assistant text.
+func specializeSingleRequiredGatewayTool(request *llm.Request) bool {
+	if request == nil || request.ToolChoice == nil || request.ToolChoice.ToolChoice == nil ||
+		*request.ToolChoice.ToolChoice != "required" || len(request.ToolDefinitions) != 1 {
+		return false
+	}
+	definition := request.ToolDefinitions[0]
+	if definition.Kind != llm.ToolKindFunction || definition.LogicalName == "" {
+		return false
+	}
+	request.ToolChoice = &llm.ToolChoice{NamedToolChoice: &llm.NamedToolChoice{
+		Type: "function",
+		Function: llm.ToolFunction{
+			Name: definition.LogicalName,
+		},
+	}}
+	return true
 }
 
 func (controller *Controller) needsPauseTurnContinuation(request *llm.Request, target llm.APIFormat) bool {
