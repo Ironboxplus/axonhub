@@ -1,7 +1,9 @@
 package responses
 
 import (
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 
 	"github.com/looplj/axonhub/llm"
 )
@@ -19,7 +21,7 @@ func attachOpenAIResponsesRequestExtensions(chatReq *llm.Request, req *Request, 
 	requestExt := &llm.OpenAIResponsesRequestExtensions{
 		ReasoningContext: reasoningContext,
 		RawTools:         buildRawOnlyToolFragments(req.Tools, raw.Tools),
-		ToolSignatures:   buildRepresentedToolSignatures(req.Tools),
+		ToolSignatures:   buildRepresentedToolSignatures(chatReq),
 		RawToolChoice:    rawUnsupportedToolChoice(req.ToolChoice, raw.ToolChoice),
 		RawInputItems:    buildRawOnlyInputFragments(req.Input, raw.InputItems),
 	}
@@ -67,28 +69,19 @@ func parseRawRequestFragments(rawBody []byte) rawRequestFragments {
 	}
 }
 
-func buildRepresentedToolSignatures(tools []Tool) []string {
-	if len(tools) == 0 {
+func buildRepresentedToolSignatures(request *llm.Request) []string {
+	tools, represented, err := canonicalRequestTools(request)
+	if err != nil || !represented || len(tools) == 0 {
 		return nil
 	}
 
 	signatures := make([]string, 0, len(tools))
 	for _, tool := range tools {
-		if tool.Type == "namespace" {
-			for _, subTool := range tool.Tools {
-				if subTool.Type == "function" {
-					signatures = append(signatures, responseToolSignature(Tool{
-						Type: "function",
-						Name: namespaceFunctionName(tool.Name, subTool.Name),
-					}))
-				}
-			}
-			continue
+		signature, ok := responseToolSignature(tool)
+		if !ok {
+			return nil
 		}
-		if !isStructurallyRepresentedTool(tool) {
-			continue
-		}
-		signatures = append(signatures, responseToolSignature(tool))
+		signatures = append(signatures, signature)
 	}
 
 	return signatures
@@ -122,14 +115,15 @@ func representedNamespaceToolCount(tool Tool) int {
 		return 0
 	}
 
-	count := 0
 	for _, subTool := range tool.Tools {
-		if subTool.Type == "function" || subTool.Type == "custom" {
-			count++
+		if isStructurallyRepresentedNamespaceChild(subTool) {
+			// Canonical Responses outbound groups every typed child back into
+			// one top-level namespace object. A raw namespace fragment therefore
+			// replaces one structured tool, not one tool per child.
+			return 1
 		}
 	}
-
-	return count
+	return 0
 }
 
 func isStructurallyRepresentedToolType(toolType string) bool {
@@ -146,16 +140,31 @@ func isStructurallyRepresentedTool(tool Tool) bool {
 	if tool.Type == "tool_search" {
 		return tool.Execution == string(llm.ExecutionOwnerClient)
 	}
+	if tool.Type == "namespace" {
+		if len(tool.Tools) == 0 {
+			return false
+		}
+		for _, subTool := range tool.Tools {
+			if !isStructurallyRepresentedNamespaceChild(subTool) {
+				return false
+			}
+		}
+		return true
+	}
 	return isStructurallyRepresentedToolType(tool.Type)
 }
 
-func responseToolSignature(tool Tool) string {
-	switch tool.Type {
-	case "function", "custom":
-		return tool.Type + ":" + tool.Name
-	default:
-		return tool.Type
+func isStructurallyRepresentedNamespaceChild(tool Tool) bool {
+	return tool.Type == "" || tool.Type == "function" || tool.Type == "custom"
+}
+
+func responseToolSignature(tool Tool) (string, bool) {
+	encoded, err := json.Marshal(tool)
+	if err != nil {
+		return "", false
 	}
+	digest := sha256.Sum256(encoded)
+	return fmt.Sprintf("%x", digest), true
 }
 
 func rawUnsupportedToolChoice(choice *ToolChoice, rawChoice json.RawMessage) json.RawMessage {
@@ -376,7 +385,8 @@ func structuredToolSignaturesMatch(structuredTools []json.RawMessage, expected [
 		if err := json.Unmarshal(rawTool, &tool); err != nil {
 			return false
 		}
-		if responseToolSignature(tool) != expected[i] {
+		signature, ok := responseToolSignature(tool)
+		if !ok || signature != expected[i] {
 			return false
 		}
 	}

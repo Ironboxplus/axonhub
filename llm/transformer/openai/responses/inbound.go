@@ -304,10 +304,6 @@ func convertToLLMRequest(req *Request, rawBody ...[]byte) (*llm.Request, error) 
 		chatReq.Verbosity = req.Text.Verbosity
 	}
 
-	if len(rawBody) > 0 {
-		attachOpenAIResponsesRequestExtensions(chatReq, req, rawBody[0])
-	}
-
 	var sourceBody []byte
 	if len(rawBody) > 0 {
 		sourceBody = rawBody[0]
@@ -319,6 +315,9 @@ func convertToLLMRequest(req *Request, rawBody ...[]byte) (*llm.Request, error) 
 	chatReq.Input = canonicalInput
 	chatReq.ToolDefinitions = canonicalTools
 	chatReq.ToolExecutionSecrets = responsesMCPExecutionSecrets(req.Tools)
+	if len(rawBody) > 0 {
+		attachOpenAIResponsesRequestExtensions(chatReq, req, rawBody[0])
+	}
 
 	if err := llm.PopulateCanonicalFromLegacy(chatReq); err != nil {
 		return nil, fmt.Errorf("%w: invalid canonical lifecycle: %w", transformer.ErrInvalidRequest, err)
@@ -854,43 +853,37 @@ func convertToolsToLLM(tools []Tool) ([]llm.Tool, error) {
 			})
 
 		case "custom":
-			customTool := &llm.ResponseCustomTool{
-				Name:        tool.Name,
-				Description: tool.Description,
-			}
-			if tool.Format != nil {
-				customTool.Format = &llm.ResponseCustomToolFormat{
-					Type:       tool.Format.Type,
-					Syntax:     tool.Format.Syntax,
-					Definition: tool.Format.Definition,
-				}
-			}
-
-			result = append(result, llm.Tool{
-				Type:               llm.ToolTypeResponsesCustomTool,
-				ResponseCustomTool: customTool,
-			})
+			result = append(result, convertCustomToolToLLM(tool))
 
 		case "namespace":
 			for _, subTool := range tool.Tools {
-				if subTool.Type != "function" {
+				switch subTool.Type {
+				case "", "function":
+					params, err := json.Marshal(subTool.Parameters)
+					if err != nil {
+						return nil, fmt.Errorf("failed to marshal namespace tool parameters: %w", err)
+					}
+
+					result = append(result, llm.Tool{
+						Type: "function",
+						Function: llm.Function{
+							Name:        namespaceFunctionName(tool.Name, subTool.Name),
+							Description: subTool.Description,
+							Parameters:  params,
+							Strict:      subTool.Strict,
+						},
+					})
+				case "custom":
+					custom := subTool
+					custom.Name = namespaceFunctionName(tool.Name, subTool.Name)
+					result = append(result, convertCustomToolToLLM(custom))
+				default:
+					// The complete namespace remains in the Responses raw
+					// sidecar. Identity routes replay it verbatim; cross-format
+					// planners reject that opaque behavioral fragment before
+					// provider dispatch.
 					continue
 				}
-
-				params, err := json.Marshal(subTool.Parameters)
-				if err != nil {
-					return nil, fmt.Errorf("failed to marshal namespace tool parameters: %w", err)
-				}
-
-				result = append(result, llm.Tool{
-					Type: "function",
-					Function: llm.Function{
-						Name:        namespaceFunctionName(tool.Name, subTool.Name),
-						Description: subTool.Description,
-						Parameters:  params,
-						Strict:      subTool.Strict,
-					},
-				})
 			}
 
 		default:
@@ -900,6 +893,24 @@ func convertToolsToLLM(tools []Tool) ([]llm.Tool, error) {
 	}
 
 	return result, nil
+}
+
+func convertCustomToolToLLM(tool Tool) llm.Tool {
+	customTool := &llm.ResponseCustomTool{
+		Name:        tool.Name,
+		Description: tool.Description,
+	}
+	if tool.Format != nil {
+		customTool.Format = &llm.ResponseCustomToolFormat{
+			Type:       tool.Format.Type,
+			Syntax:     tool.Format.Syntax,
+			Definition: tool.Format.Definition,
+		}
+	}
+	return llm.Tool{
+		Type:               llm.ToolTypeResponsesCustomTool,
+		ResponseCustomTool: customTool,
+	}
 }
 
 func namespaceFunctionName(namespaceName, functionName string) string {

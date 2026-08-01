@@ -3,19 +3,46 @@ package responses_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/conversion"
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/pipeline"
+	"github.com/looplj/axonhub/llm/transformer"
+	"github.com/looplj/axonhub/llm/transformer/anthropic"
 	"github.com/looplj/axonhub/llm/transformer/openai/responses"
 )
+
+type canonicalMutationInbound struct {
+	transformer.Inbound
+}
+
+func (inbound canonicalMutationInbound) TransformRequest(ctx context.Context, request *httpclient.Request) (*llm.Request, error) {
+	canonical, err := inbound.Inbound.TransformRequest(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	for index := range canonical.ToolDefinitions {
+		definition := &canonical.ToolDefinitions[index]
+		if definition.LogicalName != "collaboration__send_message" || definition.Function == nil {
+			continue
+		}
+		definition.Description = "Send a policy-reviewed message"
+		definition.Function.Parameters = json.RawMessage(`{"type":"object","properties":{"recipient":{"type":"string"}},"required":["recipient"],"additionalProperties":false}`)
+		strict := true
+		definition.Function.Strict = &strict
+	}
+	return canonical, nil
+}
 
 func TestResponsesMCPDefinitionAndSecretsRoundTripOverRealHTTP(t *testing.T) {
 	t.Parallel()
@@ -165,4 +192,182 @@ func TestResponsesMCPReadOnlyFilterRequiresGatewayBeforeProviderHTTP(t *testing.
 	require.NoError(t, err)
 	_, err = outbound.TransformRequest(context.Background(), decoded)
 	require.ErrorContains(t, err, "read_only requires MCP gateway projection")
+}
+
+func TestResponsesMixedNamespaceIdentityPreservesRawDefinitionOverRealHTTP(t *testing.T) {
+	t.Parallel()
+	requestBody := []byte(`{
+		"model":"fixture-model",
+		"input":"use the namespace",
+		"tools":[
+			{
+				"type":"namespace",
+				"name":"collaboration",
+				"tools":[
+					{"type":"function","name":"send_message","description":"Send a message","parameters":{"type":"object","properties":{"target":{"type":"string"}}}},
+					{"type":"custom","name":"apply_patch","description":"Apply a patch","format":{"type":"grammar","syntax":"lark","definition":"start: /.+/s"}},
+					{"type":"future_tool","name":"handoff","future_field":{"enabled":true}}
+				]
+			},
+			{"type":"function","name":"after","parameters":{"type":"object"}}
+		]
+	}`)
+
+	received := make(chan []byte, 1)
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read provider request", http.StatusBadRequest)
+			return
+		}
+		received <- body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"id":"resp_namespace_identity","object":"response","created_at":1785380000,
+			"model":"fixture-model","status":"completed",
+			"output":[{"id":"msg_1","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"ok","annotations":[]}]}],
+			"usage":{"input_tokens":8,"output_tokens":1,"total_tokens":9}
+		}`)
+	}))
+	t.Cleanup(provider.Close)
+
+	outbound, err := responses.NewOutboundTransformer(provider.URL, "fixture-key")
+	require.NoError(t, err)
+	executor := httpclient.NewHttpClientWithClient(provider.Client())
+	t.Cleanup(executor.CloseIdleConnections)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	result, err := pipeline.NewFactory(executor).
+		Pipeline(responses.NewInboundTransformer(), conversion.NewOutbound(outbound)).
+		Process(ctx, &httpclient.Request{
+			Method: http.MethodPost, URL: "/v1/responses",
+			Headers: http.Header{"Content-Type": []string{"application/json"}}, Body: requestBody,
+		})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.NotNil(t, result.Response)
+	require.Contains(t, string(result.Response.Body), "resp_namespace_identity")
+
+	var source, wire struct {
+		Tools []json.RawMessage `json:"tools"`
+	}
+	require.NoError(t, json.Unmarshal(requestBody, &source))
+	select {
+	case body := <-received:
+		require.NoError(t, json.Unmarshal(body, &wire), "provider body: %s", body)
+	case <-ctx.Done():
+		t.Fatal("provider did not receive identity request")
+	}
+	require.Len(t, source.Tools, 2)
+	require.Len(t, wire.Tools, 2)
+	require.JSONEq(t, string(source.Tools[0]), string(wire.Tools[0]))
+	require.JSONEq(t, string(source.Tools[1]), string(wire.Tools[1]))
+}
+
+func TestResponsesMixedNamespaceCanonicalChildMutationWinsOverRawSidecarOverRealHTTP(t *testing.T) {
+	t.Parallel()
+	requestBody := []byte(`{
+		"model":"fixture-model",
+		"input":"use the namespace",
+		"tools":[{
+			"type":"namespace",
+			"name":"collaboration",
+			"tools":[
+				{"type":"function","name":"send_message","description":"Send a message","parameters":{"type":"object","properties":{"target":{"type":"string"}}}},
+				{"type":"future_tool","name":"handoff","future_field":{"enabled":true}}
+			]
+		}]
+	}`)
+
+	received := make(chan []byte, 1)
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		received <- body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"id":"resp_namespace_mutation","object":"response","created_at":1785380000,
+			"model":"fixture-model","status":"completed",
+			"output":[{"id":"msg_1","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"ok","annotations":[]}]}],
+			"usage":{"input_tokens":8,"output_tokens":1,"total_tokens":9}
+		}`)
+	}))
+	t.Cleanup(provider.Close)
+
+	outbound, err := responses.NewOutboundTransformer(provider.URL, "fixture-key")
+	require.NoError(t, err)
+	executor := httpclient.NewHttpClientWithClient(provider.Client())
+	t.Cleanup(executor.CloseIdleConnections)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	result, err := pipeline.NewFactory(executor).
+		Pipeline(
+			canonicalMutationInbound{Inbound: responses.NewInboundTransformer()},
+			conversion.NewOutbound(outbound),
+		).
+		Process(ctx, &httpclient.Request{
+			Method: http.MethodPost, URL: "/v1/responses",
+			Headers: http.Header{"Content-Type": []string{"application/json"}}, Body: requestBody,
+		})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.NotNil(t, result.Response)
+
+	var wire struct {
+		Tools []responses.Tool `json:"tools"`
+	}
+	select {
+	case body := <-received:
+		require.NoError(t, json.Unmarshal(body, &wire), "provider body: %s", body)
+	case <-ctx.Done():
+		t.Fatal("provider did not receive canonical child mutation request")
+	}
+	require.Len(t, wire.Tools, 1)
+	require.Equal(t, "namespace", wire.Tools[0].Type)
+	require.Equal(t, "collaboration", wire.Tools[0].Name)
+	require.Len(t, wire.Tools[0].Tools, 1, "unsafe raw namespace replay must not restore the unknown child")
+	child := wire.Tools[0].Tools[0]
+	require.Equal(t, "function", child.Type)
+	require.Equal(t, "send_message", child.Name)
+	require.Equal(t, "Send a policy-reviewed message", child.Description)
+	require.NotNil(t, child.Strict)
+	require.True(t, *child.Strict)
+	properties, ok := child.Parameters["properties"].(map[string]any)
+	require.True(t, ok)
+	require.Contains(t, properties, "recipient")
+	require.NotContains(t, properties, "target")
+}
+
+func TestResponsesMixedNamespaceCrossProtocolRejectsBeforeProviderHTTP(t *testing.T) {
+	t.Parallel()
+	var providerCalls atomic.Uint64
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		providerCalls.Add(1)
+		http.Error(w, "cross-protocol request must not be dispatched", http.StatusInternalServerError)
+	}))
+	t.Cleanup(provider.Close)
+
+	outbound, err := anthropic.NewOutboundTransformer(provider.URL, "fixture-key")
+	require.NoError(t, err)
+	executor := httpclient.NewHttpClientWithClient(provider.Client())
+	t.Cleanup(executor.CloseIdleConnections)
+
+	_, err = pipeline.NewFactory(executor).
+		Pipeline(responses.NewInboundTransformer(), conversion.NewOutbound(outbound)).
+		Process(context.Background(), &httpclient.Request{
+			Method: http.MethodPost, URL: "/v1/responses",
+			Headers: http.Header{"Content-Type": []string{"application/json"}},
+			Body: []byte(`{
+				"model":"fixture-model","input":"use the namespace",
+				"tools":[{"type":"namespace","name":"collaboration","tools":[
+					{"type":"function","name":"send_message","parameters":{"type":"object"}},
+					{"type":"future_tool","name":"handoff","future_field":{"enabled":true}}
+				]}]
+			}`),
+		})
+	require.Error(t, err)
+	require.True(t, errors.Is(err, conversion.ErrIncompletePlan), "error = %v", err)
+	require.Zero(t, providerCalls.Load(), "incomplete cross-protocol plan reached provider")
 }

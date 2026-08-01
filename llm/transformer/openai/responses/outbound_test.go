@@ -3,6 +3,7 @@ package responses
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/auth"
+	"github.com/looplj/axonhub/llm/conversion"
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/internal/pkg/xtest"
 	"github.com/looplj/axonhub/llm/transformer/shared"
@@ -340,6 +342,108 @@ func TestOutboundTransformer_TransformRequest_ReplaysNamespaceTool(t *testing.T)
 	functionTool, ok := tools[1].(map[string]any)
 	require.True(t, ok)
 	require.Equal(t, "get_weather", functionTool["name"])
+}
+
+func TestOutboundTransformer_TransformRequest_PreservesMixedNamespaceOnlyOnResponsesIdentity(t *testing.T) {
+	inbound := NewInboundTransformer()
+	inboundReq := &httpclient.Request{
+		Body: []byte(`{
+			"model": "gpt-4o",
+			"input": "Use the available project tools.",
+			"tools": [
+				{
+					"type": "namespace",
+					"name": "project",
+					"tools": [
+						{"type": "function", "name": "list", "parameters": {"type": "object"}},
+						{"type": "custom", "name": "patch", "description": "Apply a patch"},
+						{"type": "future_nested_tool", "name": "future"}
+					]
+				},
+				{"type": "function", "name": "weather", "parameters": {"type": "object"}}
+			]
+		}`),
+	}
+
+	llmReq, err := inbound.TransformRequest(context.Background(), inboundReq)
+	require.NoError(t, err)
+	require.Len(t, llmReq.ToolDefinitions, 3)
+	require.Len(t, llmReq.Tools, 3)
+
+	ext := openAIResponsesRequestExtensions(llmReq)
+	require.NotNil(t, ext)
+	require.Len(t, ext.RawTools, 1)
+	require.Equal(t, 0, ext.RawTools[0].OriginalIndex)
+	require.Equal(t, 1, ext.RawTools[0].RepresentedToolCount)
+	require.JSONEq(t, `{
+		"type":"namespace",
+		"name":"project",
+		"tools":[
+			{"type":"function","name":"list","parameters":{"type":"object"}},
+			{"type":"custom","name":"patch","description":"Apply a patch"},
+			{"type":"future_nested_tool","name":"future"}
+		]
+	}`, string(ext.RawTools[0].Raw))
+
+	identityPlan, err := conversion.NewPlanner().Plan(llmReq, llm.APIFormatOpenAIResponse)
+	require.NoError(t, err)
+	require.True(t, identityPlan.Complete())
+	require.EqualValues(t, 1, identityPlan.Summary.Opaque)
+
+	crossPlan, err := conversion.NewPlanner().Plan(llmReq, llm.APIFormatAnthropicMessage)
+	require.ErrorIs(t, err, conversion.ErrIncompletePlan)
+	require.False(t, crossPlan.Complete())
+	require.EqualValues(t, 1, crossPlan.Summary.Unknown)
+
+	outbound, err := NewOutboundTransformer("https://api.openai.com", "test-api-key")
+	require.NoError(t, err)
+	httpReq, err := outbound.TransformRequest(context.Background(), llmReq)
+	require.NoError(t, err)
+
+	var payload struct {
+		Tools []json.RawMessage `json:"tools"`
+	}
+	require.NoError(t, json.Unmarshal(httpReq.Body, &payload))
+	require.Len(t, payload.Tools, 2)
+	require.JSONEq(t, string(ext.RawTools[0].Raw), string(payload.Tools[0]))
+
+	var trailing Tool
+	require.NoError(t, json.Unmarshal(payload.Tools[1], &trailing))
+	require.Equal(t, "function", trailing.Type)
+	require.Equal(t, "weather", trailing.Name)
+}
+
+func TestOutboundTransformer_TransformRequest_PreservesUnsupportedOnlyNamespaceOnResponsesIdentity(t *testing.T) {
+	inbound := NewInboundTransformer()
+	llmReq, err := inbound.TransformRequest(context.Background(), &httpclient.Request{Body: []byte(`{
+		"model":"gpt-4o",
+		"input":"Use future tools.",
+		"tools":[
+			{"type":"namespace","name":"future","tools":[{"type":"future_nested_tool","name":"run"}]},
+			{"type":"function","name":"weather","parameters":{"type":"object"}}
+		]
+	}`)})
+	require.NoError(t, err)
+
+	ext := openAIResponsesRequestExtensions(llmReq)
+	require.NotNil(t, ext)
+	require.Len(t, ext.RawTools, 1)
+	require.Equal(t, 0, ext.RawTools[0].RepresentedToolCount)
+
+	_, err = conversion.NewPlanner().Plan(llmReq, llm.APIFormatOpenAIChatCompletion)
+	require.True(t, errors.Is(err, conversion.ErrIncompletePlan))
+
+	outbound, err := NewOutboundTransformer("https://api.openai.com", "test-api-key")
+	require.NoError(t, err)
+	httpReq, err := outbound.TransformRequest(context.Background(), llmReq)
+	require.NoError(t, err)
+
+	var payload struct {
+		Tools []json.RawMessage `json:"tools"`
+	}
+	require.NoError(t, json.Unmarshal(httpReq.Body, &payload))
+	require.Len(t, payload.Tools, 2)
+	require.JSONEq(t, string(ext.RawTools[0].Raw), string(payload.Tools[0]))
 }
 
 func TestOutboundTransformer_TransformRequest_ReplaysProviderRawInputItems(t *testing.T) {
