@@ -1,8 +1,12 @@
 package transformer
 
 import (
+	"net/url"
+	"regexp"
 	"strings"
 )
+
+var explicitAPIVersionSegment = regexp.MustCompile(`^v[0-9][A-Za-z0-9._-]*$`)
 
 // NormalizeBaseURL normalizes the base URL for API endpoints.
 // It ensures that the URL ends with the specified version and handles special cases:
@@ -13,34 +17,47 @@ import (
 //
 // This is distinct from transformer-specific "##" handling, which enables true raw URL mode
 // where no default endpoint path is appended.
-func NormalizeBaseURL(url, version string) string {
-	if url == "" {
+func NormalizeBaseURL(rawURL, version string) string {
+	if rawURL == "" {
 		return ""
 	}
 
-	if before, ok := strings.CutSuffix(url, "#"); ok {
+	if before, ok := strings.CutSuffix(rawURL, "#"); ok {
 		normalized := strings.TrimRight(before, "/")
 		return normalized
 	}
 
 	if version == "" {
-		return strings.TrimRight(url, "/")
+		return strings.TrimRight(rawURL, "/")
 	}
 
-	if strings.HasSuffix(url, "/"+version) {
-		return strings.TrimRight(url, "/")
+	if strings.HasSuffix(rawURL, "/"+version) {
+		return strings.TrimRight(rawURL, "/")
 	}
 
-	if strings.Contains(url, "/"+version+"/") {
-		return strings.TrimRight(url, "/")
+	if strings.Contains(rawURL, "/"+version+"/") {
+		return strings.TrimRight(rawURL, "/")
 	}
 
-	trimmed := strings.TrimRight(url, "/")
-	if strings.HasSuffix(trimmed, "/") {
-		return trimmed + "/" + version
+	trimmed := strings.TrimRight(rawURL, "/")
+	if version == "v1" && hasExplicitAPIVersion(trimmed) {
+		return trimmed
 	}
 
 	return trimmed + "/" + version
+}
+
+func hasExplicitAPIVersion(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	for _, segment := range strings.Split(strings.Trim(parsed.Path, "/"), "/") {
+		if explicitAPIVersionSegment.MatchString(segment) {
+			return true
+		}
+	}
+	return false
 }
 
 // BuildRequestURL constructs the full request URL from base URL and path parameters.

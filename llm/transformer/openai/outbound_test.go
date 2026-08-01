@@ -78,6 +78,21 @@ func TestOutboundTransformer_TransformRequest(t *testing.T) {
 				return req.URL == "https://custom.api.com/v1/chat/completions"
 			},
 		},
+		{
+			name:        "valid request with explicit non-v1 upstream version",
+			transformer: createTransformer("https://open.bigmodel.cn/api/paas/v4", "test-key"),
+			request: &llm.Request{
+				Model: "glm-5.2",
+				Messages: []llm.Message{{
+					Role:    "user",
+					Content: llm.MessageContent{Content: lo.ToPtr("Hello, world!")},
+				}},
+			},
+			wantErr: false,
+			validate: func(req *httpclient.Request) bool {
+				return req.URL == "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+			},
+		},
 
 		{
 			name:        "nil request",

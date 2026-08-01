@@ -234,6 +234,18 @@ func TestNormalizeBaseURL(t *testing.T) {
 			expected: "https://api.example.com/v1/v2",
 		},
 		{
+			name:     "explicit non-v1 upstream version is authoritative",
+			url:      "https://open.bigmodel.cn/api/paas/v4",
+			version:  "v1",
+			expected: "https://open.bigmodel.cn/api/paas/v4",
+		},
+		{
+			name:     "explicit beta upstream version is authoritative",
+			url:      "https://api.example.com/gateway/v2beta",
+			version:  "v1",
+			expected: "https://api.example.com/gateway/v2beta",
+		},
+		{
 			name:     "Version in middle of path",
 			url:      "https://api.example.com/v1/api",
 			version:  "v1",

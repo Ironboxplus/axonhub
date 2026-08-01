@@ -123,6 +123,12 @@ func TestOutboundTransformer_buildFullRequestURL(t *testing.T) {
 			expected: "https://api.openai.com/v1/custom/responses",
 		},
 		{
+			name:     "with explicit non-v1 upstream version",
+			baseURL:  "https://open.bigmodel.cn/api/paas/v4",
+			rawURL:   false,
+			expected: "https://open.bigmodel.cn/api/paas/v4/responses",
+		},
+		{
 			name:     "raw url with # suffix",
 			baseURL:  "https://api.openai.com/custom#",
 			rawURL:   true,

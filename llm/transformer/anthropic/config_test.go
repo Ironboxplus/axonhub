@@ -27,6 +27,14 @@ func TestOutboundTransformer_PlatformConfigurations(t *testing.T) {
 			model:          "claude-3-sonnet-20240229",
 			stream:         false,
 		},
+		{
+			name:           "Explicit non-v1 upstream version",
+			baseURL:        "https://open.bigmodel.cn/api/paas/v4",
+			expectedURL:    "https://open.bigmodel.cn/api/paas/v4/messages",
+			expectedHeader: "2023-06-01",
+			model:          "glm-5.2",
+			stream:         false,
+		},
 	}
 
 	for _, tt := range tests {
