@@ -497,7 +497,7 @@ func TestOutboundTransformer_TransformRequest_ReplaysProviderRawInputItems(t *te
 	require.Equal(t, "message", message["type"])
 }
 
-func TestOutboundTransformer_TransformRequest_DoesNotReplayRawToolWhenCanonicalToolsChanged(t *testing.T) {
+func TestOutboundTransformer_TransformRequest_PreservesOpaqueRawToolWhenCanonicalToolsChanged(t *testing.T) {
 	inbound := NewInboundTransformer()
 	inboundReq := &httpclient.Request{
 		Body: []byte(`{
@@ -537,8 +537,14 @@ func TestOutboundTransformer_TransformRequest_DoesNotReplayRawToolWhenCanonicalT
 
 	tools, ok := payload["tools"].([]any)
 	require.True(t, ok)
-	require.Len(t, tools, 1)
-	tool, ok := tools[0].(map[string]any)
+	require.Len(t, tools, 2)
+	rawTool, ok := tools[0].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "tool_search", rawTool["type"])
+	require.Equal(t, "search_docs", rawTool["name"])
+	require.Equal(t, "docs", rawTool["namespace"])
+
+	tool, ok := tools[1].(map[string]any)
 	require.True(t, ok)
 	require.Equal(t, "function", tool["type"])
 	require.Equal(t, "different_tool", tool["name"])

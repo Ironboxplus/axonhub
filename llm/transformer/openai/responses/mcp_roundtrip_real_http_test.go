@@ -19,6 +19,7 @@ import (
 	"github.com/looplj/axonhub/llm/pipeline"
 	"github.com/looplj/axonhub/llm/transformer"
 	"github.com/looplj/axonhub/llm/transformer/anthropic"
+	"github.com/looplj/axonhub/llm/transformer/openai"
 	"github.com/looplj/axonhub/llm/transformer/openai/responses"
 )
 
@@ -41,6 +42,20 @@ func (inbound canonicalMutationInbound) TransformRequest(ctx context.Context, re
 		strict := true
 		definition.Function.Strict = &strict
 	}
+	return canonical, nil
+}
+
+type canonicalToolRemovalInbound struct {
+	transformer.Inbound
+}
+
+func (inbound canonicalToolRemovalInbound) TransformRequest(ctx context.Context, request *httpclient.Request) (*llm.Request, error) {
+	canonical, err := inbound.Inbound.TransformRequest(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	canonical.Tools = nil
+	canonical.ToolDefinitions = nil
 	return canonical, nil
 }
 
@@ -273,6 +288,7 @@ func TestResponsesMixedNamespaceCanonicalChildMutationWinsOverRawSidecarOverReal
 		"tools":[{
 			"type":"namespace",
 			"name":"collaboration",
+			"future_namespace_field":{"mode":"opaque"},
 			"tools":[
 				{"type":"function","name":"send_message","description":"Send a message","parameters":{"type":"object","properties":{"target":{"type":"string"}}}},
 				{"type":"future_tool","name":"handoff","future_field":{"enabled":true}}
@@ -316,7 +332,7 @@ func TestResponsesMixedNamespaceCanonicalChildMutationWinsOverRawSidecarOverReal
 	require.NotNil(t, result.Response)
 
 	var wire struct {
-		Tools []responses.Tool `json:"tools"`
+		Tools []json.RawMessage `json:"tools"`
 	}
 	select {
 	case body := <-received:
@@ -325,10 +341,22 @@ func TestResponsesMixedNamespaceCanonicalChildMutationWinsOverRawSidecarOverReal
 		t.Fatal("provider did not receive canonical child mutation request")
 	}
 	require.Len(t, wire.Tools, 1)
-	require.Equal(t, "namespace", wire.Tools[0].Type)
-	require.Equal(t, "collaboration", wire.Tools[0].Name)
-	require.Len(t, wire.Tools[0].Tools, 1, "unsafe raw namespace replay must not restore the unknown child")
-	child := wire.Tools[0].Tools[0]
+	var namespace struct {
+		Type                 string            `json:"type"`
+		Name                 string            `json:"name"`
+		Tools                []json.RawMessage `json:"tools"`
+		FutureNamespaceField struct {
+			Mode string `json:"mode"`
+		} `json:"future_namespace_field"`
+	}
+	require.NoError(t, json.Unmarshal(wire.Tools[0], &namespace))
+	require.Equal(t, "namespace", namespace.Type)
+	require.Equal(t, "collaboration", namespace.Name)
+	require.Equal(t, "opaque", namespace.FutureNamespaceField.Mode)
+	require.Len(t, namespace.Tools, 2, "canonical mutation must not discard the opaque unknown child")
+
+	var child responses.Tool
+	require.NoError(t, json.Unmarshal(namespace.Tools[0], &child))
 	require.Equal(t, "function", child.Type)
 	require.Equal(t, "send_message", child.Name)
 	require.Equal(t, "Send a policy-reviewed message", child.Description)
@@ -338,6 +366,18 @@ func TestResponsesMixedNamespaceCanonicalChildMutationWinsOverRawSidecarOverReal
 	require.True(t, ok)
 	require.Contains(t, properties, "recipient")
 	require.NotContains(t, properties, "target")
+
+	var unknown struct {
+		Type        string `json:"type"`
+		Name        string `json:"name"`
+		FutureField struct {
+			Enabled bool `json:"enabled"`
+		} `json:"future_field"`
+	}
+	require.NoError(t, json.Unmarshal(namespace.Tools[1], &unknown))
+	require.Equal(t, "future_tool", unknown.Type)
+	require.Equal(t, "handoff", unknown.Name)
+	require.True(t, unknown.FutureField.Enabled)
 }
 
 func TestResponsesMixedNamespaceCrossProtocolRejectsBeforeProviderHTTP(t *testing.T) {
@@ -370,4 +410,70 @@ func TestResponsesMixedNamespaceCrossProtocolRejectsBeforeProviderHTTP(t *testin
 	require.Error(t, err)
 	require.True(t, errors.Is(err, conversion.ErrIncompletePlan), "error = %v", err)
 	require.Zero(t, providerCalls.Load(), "incomplete cross-protocol plan reached provider")
+}
+
+func TestResponsesMixedNamespaceToChatRejectsBeforeProviderHTTP(t *testing.T) {
+	t.Parallel()
+	var providerCalls atomic.Uint64
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		providerCalls.Add(1)
+		http.Error(w, "cross-protocol request must not be dispatched", http.StatusInternalServerError)
+	}))
+	t.Cleanup(provider.Close)
+
+	outbound, err := openai.NewOutboundTransformer(provider.URL, "fixture-key")
+	require.NoError(t, err)
+	executor := httpclient.NewHttpClientWithClient(provider.Client())
+	t.Cleanup(executor.CloseIdleConnections)
+
+	_, err = pipeline.NewFactory(executor).
+		Pipeline(responses.NewInboundTransformer(), conversion.NewOutbound(outbound)).
+		Process(context.Background(), &httpclient.Request{
+			Method: http.MethodPost, URL: "/v1/responses",
+			Headers: http.Header{"Content-Type": []string{"application/json"}},
+			Body: []byte(`{
+				"model":"fixture-model","input":"use the namespace",
+				"tools":[{"type":"namespace","name":"collaboration","tools":[
+					{"type":"function","name":"send_message","parameters":{"type":"object"}},
+					{"type":"future_tool","name":"handoff","future_field":{"enabled":true}}
+				]}]
+			}`),
+		})
+	require.Error(t, err)
+	require.True(t, errors.Is(err, conversion.ErrIncompletePlan), "error = %v", err)
+	require.Zero(t, providerCalls.Load(), "incomplete Responses-to-Chat plan reached provider")
+}
+
+func TestResponsesOpaqueToolMergeFailsClosedBeforeProviderWhenCanonicalLayoutChanges(t *testing.T) {
+	t.Parallel()
+	var providerCalls atomic.Uint64
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		providerCalls.Add(1)
+		http.Error(w, "ambiguous opaque merge must not be dispatched", http.StatusInternalServerError)
+	}))
+	t.Cleanup(provider.Close)
+
+	outbound, err := responses.NewOutboundTransformer(provider.URL, "fixture-key")
+	require.NoError(t, err)
+	executor := httpclient.NewHttpClientWithClient(provider.Client())
+	t.Cleanup(executor.CloseIdleConnections)
+
+	_, err = pipeline.NewFactory(executor).
+		Pipeline(
+			canonicalToolRemovalInbound{Inbound: responses.NewInboundTransformer()},
+			conversion.NewOutbound(outbound),
+		).
+		Process(context.Background(), &httpclient.Request{
+			Method: http.MethodPost, URL: "/v1/responses",
+			Headers: http.Header{"Content-Type": []string{"application/json"}},
+			Body: []byte(`{
+				"model":"fixture-model","input":"use the namespace",
+				"tools":[{"type":"namespace","name":"collaboration","tools":[
+					{"type":"function","name":"send_message","parameters":{"type":"object"}},
+					{"type":"future_tool","name":"handoff","future_field":{"enabled":true}}
+				]}]
+			}`),
+		})
+	require.ErrorContains(t, err, "cannot safely merge opaque Responses tools after canonical tool count changed")
+	require.Zero(t, providerCalls.Load(), "ambiguous Responses identity merge reached provider")
 }
