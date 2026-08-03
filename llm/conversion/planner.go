@@ -383,11 +383,18 @@ func appendResponsesExtensionActions(plan *Plan, request *llm.Request, target ll
 		return
 	}
 	extension := request.ProviderExtensions.OpenAIResponses.Request
-	appendAction := func(ref ObjectRef) {
+	appendAction := func(ref ObjectRef, behaviorRepresented bool) {
 		if request.APIFormat == target {
 			plan.Actions = append(plan.Actions, Action{
 				Ref: ref, Kind: ActionOpaque, Strategy: StrategyOpaqueSidecar,
 				Reason: ReasonSameProtocolOpaque, Reversible: true,
+			})
+			return
+		}
+		if behaviorRepresented {
+			plan.Actions = append(plan.Actions, Action{
+				Ref: ref, Kind: ActionLower, Strategy: StrategyOpaqueSidecar,
+				Reason: ReasonSemanticProjection, Reversible: false,
 			})
 			return
 		}
@@ -396,23 +403,42 @@ func appendResponsesExtensionActions(plan *Plan, request *llm.Request, target ll
 			Reason: ReasonProviderPrivate,
 		})
 	}
+	appendReasoningContextAction := func(ref ObjectRef) {
+		if request.APIFormat == target {
+			plan.Actions = append(plan.Actions, Action{
+				Ref: ref, Kind: ActionOpaque, Strategy: StrategyOpaqueSidecar,
+				Reason: ReasonSameProtocolOpaque, Reversible: true,
+			})
+			return
+		}
+		// Responses reasoning.context controls how much request history the
+		// provider may use for reasoning (for example, "all_turns"). Chat and
+		// Anthropic have no equivalent wire field, but the canonical request
+		// already carries the conversation history. Project that history and
+		// record the dropped protocol control as an explicit, non-reversible
+		// degradation instead of rejecting an otherwise valid request.
+		plan.Actions = append(plan.Actions, Action{
+			Ref: ref, Kind: ActionLower, Strategy: StrategyReasoningProject,
+			Reason: ReasonProtocolConstraint, Reversible: false,
+		})
+	}
 	for index := range extension.RawTools {
 		appendAction(ObjectRef{
 			Kind: ObjectToolDefinition, ToolIndex: extension.RawTools[index].OriginalIndex,
 			ItemIndex: -1, MessageIndex: -1, ToolCallIndex: -1,
-		})
+		}, false)
 	}
 	for index := range extension.RawInputItems {
 		appendAction(ObjectRef{
 			Kind: ObjectProviderData, ToolIndex: -1, ItemIndex: extension.RawInputItems[index].OriginalIndex,
 			MessageIndex: -1, ToolCallIndex: -1,
-		})
+		}, extension.RawInputItems[index].BehaviorFullyRepresented)
 	}
 	if len(extension.RawToolChoice) > 0 {
-		appendAction(ObjectRef{Kind: ObjectToolChoice, ToolIndex: -1, ItemIndex: -1, MessageIndex: -1, ToolCallIndex: -1})
+		appendAction(ObjectRef{Kind: ObjectToolChoice, ToolIndex: -1, ItemIndex: -1, MessageIndex: -1, ToolCallIndex: -1}, false)
 	}
 	if extension.ReasoningContext != "" {
-		appendAction(ObjectRef{Kind: ObjectProviderData, ToolIndex: -1, ItemIndex: -1, MessageIndex: -1, ToolCallIndex: -1})
+		appendReasoningContextAction(ObjectRef{Kind: ObjectProviderData, ToolIndex: -1, ItemIndex: -1, MessageIndex: -1, ToolCallIndex: -1})
 	}
 }
 

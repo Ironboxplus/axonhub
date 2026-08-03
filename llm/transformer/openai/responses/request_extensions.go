@@ -187,7 +187,29 @@ func buildRawOnlyInputFragments(input Input, rawItems []json.RawMessage) []llm.O
 	fragments := make([]llm.OpenAIResponsesRawFragment, 0)
 	for i := range input.Items {
 		item := input.Items[i]
-		if i >= len(rawItems) || len(rawItems[i]) == 0 || isStructurallyRepresentedInputItemValue(item) {
+		if i >= len(rawItems) || len(rawItems[i]) == 0 {
+			continue
+		}
+		if item.Type == "additional_tools" {
+			// additional_tools is behaviorally represented by canonical tool
+			// definitions, but its raw envelope also carries Responses Lite metadata
+			// such as namespace descriptions. Keep the original object as an
+			// overlay over the one structured item instead of dropping it or
+			// inventing replacement metadata later.
+			representedCount := 0
+			if additionalToolsHaveRepresentedBehavior(item.AdditionalTools) {
+				representedCount = 1
+			}
+			fragments = append(fragments, llm.OpenAIResponsesRawFragment{
+				Type:                      item.Type,
+				OriginalIndex:             i,
+				RepresentedInputItemCount: representedCount,
+				BehaviorFullyRepresented:  additionalToolsBehaviorFullyRepresented(item.AdditionalTools),
+				Raw:                       cloneRaw(rawItems[i]),
+			})
+			continue
+		}
+		if isStructurallyRepresentedInputItemValue(item) {
 			continue
 		}
 
@@ -201,6 +223,35 @@ func buildRawOnlyInputFragments(input Input, rawItems []json.RawMessage) []llm.O
 	}
 
 	return fragments
+}
+
+func additionalToolsHaveRepresentedBehavior(tools []Tool) bool {
+	for _, tool := range tools {
+		if tool.Type == "namespace" {
+			for _, child := range tool.Tools {
+				if isStructurallyRepresentedNamespaceChild(child) {
+					return true
+				}
+			}
+			continue
+		}
+		if isStructurallyRepresentedTool(tool) {
+			return true
+		}
+	}
+	return false
+}
+
+func additionalToolsBehaviorFullyRepresented(tools []Tool) bool {
+	if len(tools) == 0 {
+		return false
+	}
+	for _, tool := range tools {
+		if !isStructurallyRepresentedTool(tool) {
+			return false
+		}
+	}
+	return true
 }
 
 func isStructurallyRepresentedInputItem(itemType string) bool {
@@ -264,7 +315,9 @@ func marshalRequestPayload(payload Request, llmReq *llm.Request) ([]byte, error)
 		obj["tool_choice"] = cloneRaw(requestExt.RawToolChoice)
 	}
 
-	if input, ok := mergeRawOnlyInputItems(obj["input"], requestExt); ok {
+	if input, ok, err := mergeRawOnlyInputItems(obj["input"], requestExt); err != nil {
+		return nil, err
+	} else if ok {
 		inputRaw, err := json.Marshal(input)
 		if err != nil {
 			return nil, err
@@ -275,46 +328,236 @@ func marshalRequestPayload(payload Request, llmReq *llm.Request) ([]byte, error)
 	return json.Marshal(obj)
 }
 
-func mergeRawOnlyInputItems(structuredRaw json.RawMessage, requestExt *llm.OpenAIResponsesRequestExtensions) ([]json.RawMessage, bool) {
+func mergeRawOnlyInputItems(structuredRaw json.RawMessage, requestExt *llm.OpenAIResponsesRequestExtensions) ([]json.RawMessage, bool, error) {
 	if requestExt == nil || len(requestExt.RawInputItems) == 0 {
-		return nil, false
+		return nil, false, nil
 	}
 
 	var structuredItems []json.RawMessage
 	if len(structuredRaw) > 0 {
 		if err := json.Unmarshal(structuredRaw, &structuredItems); err != nil {
-			return nil, false
+			return nil, false, fmt.Errorf("decode canonical Responses input for raw merge: %w", err)
 		}
 	}
 
-	total := len(structuredItems) + len(requestExt.RawInputItems)
+	representedCount := 0
+	for _, fragment := range requestExt.RawInputItems {
+		if fragment.RepresentedInputItemCount < 0 {
+			return nil, false, fmt.Errorf("invalid represented input item count %d", fragment.RepresentedInputItemCount)
+		}
+		representedCount += fragment.RepresentedInputItemCount
+	}
+	if representedCount > len(structuredItems) {
+		return nil, false, fmt.Errorf(
+			"raw Responses input overlays replace %d canonical items, only %d available",
+			representedCount, len(structuredItems),
+		)
+	}
+
+	total := len(structuredItems) - representedCount + len(requestExt.RawInputItems)
 	items := make([]json.RawMessage, 0, total)
 	structuredIndex := 0
-	rawByIndex := make(map[int]json.RawMessage, len(requestExt.RawInputItems))
+	rawByIndex := make(map[int]llm.OpenAIResponsesRawFragment, len(requestExt.RawInputItems))
 	for _, fragment := range requestExt.RawInputItems {
 		if len(fragment.Raw) == 0 || fragment.OriginalIndex < 0 {
-			return nil, false
+			return nil, false, fmt.Errorf("invalid raw Responses input fragment at index %d", fragment.OriginalIndex)
 		}
-		rawByIndex[fragment.OriginalIndex] = cloneRaw(fragment.Raw)
+		if _, duplicate := rawByIndex[fragment.OriginalIndex]; duplicate {
+			return nil, false, fmt.Errorf("duplicate raw Responses input fragment at index %d", fragment.OriginalIndex)
+		}
+		rawByIndex[fragment.OriginalIndex] = fragment
 	}
 
 	for i := 0; i < total; i++ {
-		if raw, ok := rawByIndex[i]; ok {
-			items = append(items, raw)
+		if fragment, ok := rawByIndex[i]; ok {
+			switch fragment.RepresentedInputItemCount {
+			case 0:
+				items = append(items, cloneRaw(fragment.Raw))
+			case 1:
+				if structuredIndex >= len(structuredItems) {
+					return nil, false, fmt.Errorf("raw Responses input overlay at index %d has no canonical counterpart", i)
+				}
+				if fragment.Type != "additional_tools" {
+					return nil, false, fmt.Errorf("unsupported raw Responses input overlay type %q at index %d", fragment.Type, i)
+				}
+				merged, err := mergeChangedAdditionalToolsItem(structuredItems[structuredIndex], fragment.Raw)
+				if err != nil {
+					return nil, false, fmt.Errorf("merge Responses additional_tools at index %d: %w", i, err)
+				}
+				items = append(items, merged)
+				structuredIndex++
+			default:
+				return nil, false, fmt.Errorf(
+					"cannot safely merge Responses input at index %d replacing %d canonical items",
+					i, fragment.RepresentedInputItemCount,
+				)
+			}
 			continue
 		}
 		if structuredIndex >= len(structuredItems) {
-			return nil, false
+			return nil, false, fmt.Errorf("canonical Responses input ended before output index %d", i)
 		}
 		items = append(items, cloneRaw(structuredItems[structuredIndex]))
 		structuredIndex++
 	}
 
 	if structuredIndex != len(structuredItems) {
-		return nil, false
+		return nil, false, fmt.Errorf("canonical Responses input left %d unmerged items", len(structuredItems)-structuredIndex)
 	}
 
-	return items, true
+	return items, true, nil
+}
+
+func mergeChangedAdditionalToolsItem(currentRaw, originalRaw json.RawMessage) (json.RawMessage, error) {
+	var currentObject map[string]json.RawMessage
+	if err := json.Unmarshal(currentRaw, &currentObject); err != nil {
+		return nil, fmt.Errorf("decode current additional_tools item: %w", err)
+	}
+	var originalObject map[string]json.RawMessage
+	if err := json.Unmarshal(originalRaw, &originalObject); err != nil {
+		return nil, fmt.Errorf("decode original additional_tools item: %w", err)
+	}
+
+	currentType, err := rawInputItemType(currentObject)
+	if err != nil {
+		return nil, fmt.Errorf("current item identity: %w", err)
+	}
+	originalType, err := rawInputItemType(originalObject)
+	if err != nil {
+		return nil, fmt.Errorf("original item identity: %w", err)
+	}
+	if currentType != "additional_tools" || originalType != "additional_tools" {
+		return nil, fmt.Errorf("input item changed identity from %q to %q", originalType, currentType)
+	}
+
+	var currentTools []json.RawMessage
+	if err := json.Unmarshal(currentObject["tools"], &currentTools); err != nil {
+		return nil, fmt.Errorf("decode current additional_tools tools: %w", err)
+	}
+	var originalTools []json.RawMessage
+	if err := json.Unmarshal(originalObject["tools"], &originalTools); err != nil {
+		return nil, fmt.Errorf("decode original additional_tools tools: %w", err)
+	}
+	mergedTools, err := mergeAdditionalToolList(currentTools, originalTools)
+	if err != nil {
+		return nil, err
+	}
+	mergedToolsRaw, err := json.Marshal(mergedTools)
+	if err != nil {
+		return nil, fmt.Errorf("encode merged additional_tools tools: %w", err)
+	}
+
+	for key, value := range currentObject {
+		originalObject[key] = cloneRaw(value)
+	}
+	originalObject["tools"] = mergedToolsRaw
+	merged, err := json.Marshal(originalObject)
+	if err != nil {
+		return nil, fmt.Errorf("encode merged additional_tools item: %w", err)
+	}
+	return merged, nil
+}
+
+func mergeAdditionalToolList(currentTools, originalTools []json.RawMessage) ([]json.RawMessage, error) {
+	merged := make([]json.RawMessage, 0, len(currentTools)+len(originalTools))
+	usedCurrent := make([]bool, len(currentTools))
+	for originalIndex, original := range originalTools {
+		originalKey, err := rawToolStableKey(original)
+		if err != nil {
+			return nil, fmt.Errorf("original additional tool %d: %w", originalIndex, err)
+		}
+		currentIndex := -1
+		for index, current := range currentTools {
+			if usedCurrent[index] {
+				continue
+			}
+			currentKey, keyErr := rawToolStableKey(current)
+			if keyErr != nil {
+				return nil, fmt.Errorf("current additional tool %d: %w", index, keyErr)
+			}
+			if currentKey == originalKey {
+				currentIndex = index
+				break
+			}
+		}
+		if currentIndex < 0 {
+			var originalTool Tool
+			if err := json.Unmarshal(original, &originalTool); err != nil {
+				return nil, fmt.Errorf("decode original additional tool %d: %w", originalIndex, err)
+			}
+			if !isStructurallyRepresentedTool(originalTool) {
+				merged = append(merged, cloneRaw(original))
+			}
+			continue
+		}
+		usedCurrent[currentIndex] = true
+		current := currentTools[currentIndex]
+		currentType, err := rawToolType(current)
+		if err != nil {
+			return nil, fmt.Errorf("current additional tool %d type: %w", currentIndex, err)
+		}
+		if currentType == "namespace" {
+			tool, mergeErr := mergeChangedNamespaceTool(current, original)
+			if mergeErr != nil {
+				return nil, fmt.Errorf("merge additional namespace %d: %w", currentIndex, mergeErr)
+			}
+			merged = append(merged, tool)
+			continue
+		}
+		tool, mergeErr := mergeRawObject(current, original)
+		if mergeErr != nil {
+			return nil, fmt.Errorf("merge additional tool %d: %w", currentIndex, mergeErr)
+		}
+		merged = append(merged, tool)
+	}
+	for index, current := range currentTools {
+		if !usedCurrent[index] {
+			merged = append(merged, cloneRaw(current))
+		}
+	}
+	return merged, nil
+}
+
+func mergeRawObject(currentRaw, originalRaw json.RawMessage) (json.RawMessage, error) {
+	var current map[string]json.RawMessage
+	if err := json.Unmarshal(currentRaw, &current); err != nil {
+		return nil, err
+	}
+	var original map[string]json.RawMessage
+	if err := json.Unmarshal(originalRaw, &original); err != nil {
+		return nil, err
+	}
+	for key, value := range current {
+		original[key] = cloneRaw(value)
+	}
+	return json.Marshal(original)
+}
+
+func rawInputItemType(object map[string]json.RawMessage) (string, error) {
+	var itemType string
+	if err := json.Unmarshal(object["type"], &itemType); err != nil {
+		return "", err
+	}
+	return itemType, nil
+}
+
+func rawToolStableKey(raw json.RawMessage) (string, error) {
+	var identity struct {
+		Type        string `json:"type"`
+		Name        string `json:"name"`
+		ServerLabel string `json:"server_label"`
+	}
+	if err := json.Unmarshal(raw, &identity); err != nil {
+		return "", err
+	}
+	if identity.Type == "" {
+		return "", fmt.Errorf("tool type is required")
+	}
+	keyName := identity.Name
+	if identity.Type == "mcp" {
+		keyName = identity.ServerLabel
+	}
+	return identity.Type + "\x00" + keyName, nil
 }
 
 func mergeRawOnlyTools(structuredRaw json.RawMessage, requestExt *llm.OpenAIResponsesRequestExtensions) ([]json.RawMessage, bool, error) {

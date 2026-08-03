@@ -578,6 +578,38 @@ func TestPlannerKeepsResponsesPrivateSidecarsOnlyOnNativeResponsesTarget(t *test
 	}
 }
 
+func TestPlannerProjectsResponsesReasoningContextAsExplicitCrossProtocolDegradation(t *testing.T) {
+	request := &llm.Request{
+		APIFormat: llm.APIFormatOpenAIResponse,
+		ProviderExtensions: &llm.ProviderExtensions{OpenAIResponses: &llm.OpenAIResponsesProviderExtensions{
+			Request: &llm.OpenAIResponsesRequestExtensions{ReasoningContext: "all_turns"},
+		}},
+	}
+
+	identity, err := NewPlanner().Plan(request, llm.APIFormatOpenAIResponse)
+	if err != nil || len(identity.Actions) != 1 {
+		t.Fatalf("identity reasoning context plan = %#v, err=%v", identity, err)
+	}
+	if action := identity.Actions[0]; action.Kind != ActionOpaque ||
+		action.Strategy != StrategyOpaqueSidecar || action.Reason != ReasonSameProtocolOpaque || !action.Reversible {
+		t.Fatalf("identity reasoning context action = %#v", action)
+	}
+
+	for _, target := range []llm.APIFormat{
+		llm.APIFormatOpenAIChatCompletion,
+		llm.APIFormatAnthropicMessage,
+	} {
+		cross, planErr := NewPlanner().Plan(request, target)
+		if planErr != nil || len(cross.Actions) != 1 || !cross.Complete() || cross.Summary.Unknown != 0 {
+			t.Fatalf("cross-protocol reasoning context plan for %s = %#v, err=%v", target, cross, planErr)
+		}
+		if action := cross.Actions[0]; action.Kind != ActionLower ||
+			action.Strategy != StrategyReasoningProject || action.Reason != ReasonProtocolConstraint || action.Reversible {
+			t.Fatalf("cross-protocol reasoning context action for %s = %#v", target, action)
+		}
+	}
+}
+
 func TestPlannerAllowsUnknownItemOnlyOnIdentityRoute(t *testing.T) {
 	request := &llm.Request{
 		APIFormat: llm.APIFormatOpenAIResponse,

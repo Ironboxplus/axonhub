@@ -38,8 +38,15 @@ type OpenAIResponsesRawFragment struct {
 	CallID        string `json:"-"`
 	OriginalIndex int    `json:"-"`
 	// RepresentedToolCount is the number of structured tools replaced when Raw is replayed.
-	RepresentedToolCount int             `json:"-"`
-	Raw                  json.RawMessage `json:"-"`
+	RepresentedToolCount int `json:"-"`
+	// RepresentedInputItemCount is the number of structured input items replaced
+	// when Raw is replayed. A value of one is used for Responses Lite
+	// additional_tools: canonical state owns the behavioral tool definitions,
+	// while Raw retains provider-private envelope and namespace metadata for an
+	// identity Responses route.
+	RepresentedInputItemCount int             `json:"-"`
+	BehaviorFullyRepresented  bool            `json:"-"`
+	Raw                       json.RawMessage `json:"-"`
 }
 
 func EnsureOpenAIChatProviderExtensions(req *Request) *OpenAIChatProviderExtensions {

@@ -304,6 +304,7 @@ func TestResponsesAdditionalNamespaceToolsRoundTripOverRealHTTP(t *testing.T) {
 					Headers: http.Header{"Content-Type": []string{"application/json"}},
 					Body: []byte(`{
 						"model":"fixture-model",
+						"reasoning":{"effort":"low","context":"all_turns"},
 						"input":[
 							{"type":"additional_tools","tools":[
 								{"type":"namespace","name":"collaboration","tools":[
