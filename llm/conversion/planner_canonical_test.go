@@ -537,6 +537,112 @@ func TestPlannerRoutesPortableResponsesMCPThroughGatewayWhenTargetProfileDoesNot
 	}
 }
 
+func TestPlannerRoutesSameProtocolHostedWebSearchThroughGatewayWhenProviderIsNotAdmitted(t *testing.T) {
+	t.Parallel()
+	request := &llm.Request{
+		APIFormat: llm.APIFormatOpenAIResponse,
+		ToolDefinitions: []llm.ToolDefinition{{
+			Kind: llm.ToolKindWebSearch, LogicalName: "web_search", Execution: llm.ExecutionOwnerProvider,
+			Hosted: &llm.HostedToolDefinition{Type: "web_search", WebSearch: &llm.WebSearch{}},
+		}},
+		Input: []llm.Item{{
+			Kind: llm.ItemKindHostedCall,
+			HostedCall: &llm.HostedToolCall{Invocation: llm.ToolInvocation{
+				Kind: llm.ToolKindWebSearch, CallID: "search_1", LogicalName: "web_search",
+				Execution: llm.ExecutionOwnerProvider,
+			}},
+		}},
+	}
+	profile, _ := ProfileFor(llm.APIFormatOpenAIResponse)
+	profile.NativeTools &^= CapabilityWebSearchTool
+	profile.EmulatedTools |= CapabilityWebSearchTool
+
+	plan, err := NewPlannerWithProfile(profile).Plan(request, llm.APIFormatOpenAIResponse)
+	if err != nil || plan == nil || !plan.Complete() || plan.Summary.Emulated != 2 || plan.Summary.Native != 0 {
+		t.Fatalf("same-protocol non-native web-search plan = %#v, err=%v", plan, err)
+	}
+	for _, action := range plan.Actions {
+		if action.Kind != ActionEmulate || action.Strategy != StrategyHostedGateway || !action.Reversible {
+			t.Fatalf("same-protocol non-native web-search action = %#v", action)
+		}
+	}
+}
+
+func TestHostedPlannerBranchesFailClosedOrProjectExplicitly(t *testing.T) {
+	t.Parallel()
+	responsesProfile, _ := ProfileFor(llm.APIFormatOpenAIResponse)
+	chatProfile, _ := ProfileFor(llm.APIFormatOpenAIChatCompletion)
+	ref := ObjectRef{Kind: ObjectToolDefinition, ToolIndex: 0, ItemIndex: -1, ContentIndex: -1, MessageIndex: -1, ToolCallIndex: -1}
+
+	if action := actionForHostedCall(llm.APIFormatOpenAIResponse, responsesProfile, nil, 0); action.Kind != ActionUnknown {
+		t.Fatalf("nil hosted call action = %#v", action)
+	}
+	responsesWithoutSearch := responsesProfile
+	responsesWithoutSearch.NativeTools &^= CapabilityWebSearchTool
+	unsupportedCall := &llm.Item{Kind: llm.ItemKindHostedCall, HostedCall: &llm.HostedToolCall{Invocation: llm.ToolInvocation{
+		Kind: llm.ToolKindWebSearch, Execution: llm.ExecutionOwnerProvider,
+	}}}
+	if action := actionForHostedCall(llm.APIFormatOpenAIResponse, responsesWithoutSearch, unsupportedCall, 0); action.Kind != ActionUnknown {
+		t.Fatalf("unadmitted hosted call action = %#v", action)
+	}
+
+	tests := []struct {
+		name       string
+		definition *llm.ToolDefinition
+		wantKind   ActionKind
+		want       StrategyID
+	}{
+		{name: "nil", wantKind: ActionUnknown, want: StrategyUnavailable},
+		{name: "provider tool search unavailable", definition: &llm.ToolDefinition{
+			Kind: llm.ToolKindToolSearch, Execution: llm.ExecutionOwnerProvider,
+		}, wantKind: ActionUnknown, want: StrategyUnavailable},
+		{name: "cross protocol web search missing typed hosted config", definition: &llm.ToolDefinition{
+			Kind: llm.ToolKindWebSearch, Execution: llm.ExecutionOwnerProvider,
+		}, wantKind: ActionUnknown, want: StrategyUnavailable},
+		{name: "unknown client tool projects as function", definition: &llm.ToolDefinition{
+			Kind: llm.ToolKind("future_client_tool"), Execution: llm.ExecutionOwnerClient,
+		}, wantKind: ActionLower, want: StrategyClientToolAsFunc},
+		{name: "provider non hosted definition falls through policy", definition: &llm.ToolDefinition{
+			Kind: llm.ToolKindFunction, Execution: llm.ExecutionOwnerProvider,
+		}, wantKind: ActionNative, want: StrategyNative},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			action := actionForToolDefinition(test.definition, llm.APIFormatOpenAIResponse, chatProfile, ref)
+			if action.Kind != test.wantKind || action.Strategy != test.want {
+				t.Fatalf("tool definition action = %#v", action)
+			}
+		})
+	}
+}
+
+func TestProfileAdmitsToolCapabilitySeparatesProtocolIdentityFromProviderAdmission(t *testing.T) {
+	t.Parallel()
+	profile, _ := ProfileFor(llm.APIFormatOpenAIResponse)
+	for _, test := range []struct {
+		name       string
+		source     llm.APIFormat
+		capability ToolCapabilitySet
+		mutate     func(*CapabilityProfile)
+		want       bool
+	}{
+		{name: "known native", source: llm.APIFormatOpenAIResponse, capability: CapabilityWebSearchTool, want: true},
+		{name: "known capability removed", source: llm.APIFormatOpenAIResponse, capability: CapabilityWebSearchTool, mutate: func(profile *CapabilityProfile) { profile.NativeTools &^= CapabilityWebSearchTool }},
+		{name: "unknown same protocol", source: llm.APIFormatOpenAIResponse, capability: 0, want: true},
+		{name: "unknown cross protocol", source: llm.APIFormatAnthropicMessage, capability: 0, want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := profile
+			if test.mutate != nil {
+				test.mutate(&candidate)
+			}
+			if got := profileAdmitsToolCapability(test.source, candidate, test.capability); got != test.want {
+				t.Fatalf("profileAdmitsToolCapability() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestPlannerLowersCrossProtocolReasoningAndRejectsOnlyUnknownContent(t *testing.T) {
 	t.Parallel()
 	request := &llm.Request{

@@ -239,7 +239,7 @@ func TestControllerRunsResponsesHostedHTTPFamiliesThroughChatOverRealHTTP(t *tes
 	}
 }
 
-func TestHostedExecutionFailureRetainsResponsesLifecycleAndTraceOverRealHTTP(t *testing.T) {
+func TestHostedExecutionInfrastructureFailureStopsBeforeAnotherProviderRoundOverRealHTTP(t *testing.T) {
 	t.Parallel()
 	var executorCalls atomic.Int64
 	executorServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
@@ -285,11 +285,7 @@ func TestHostedExecutionFailureRetainsResponsesLifecycleAndTraceOverRealHTTP(t *
 			_, _ = fmt.Fprintf(writer, `{"id":"chat-hosted-failure-1","object":"chat.completion","created":1785381000,"model":"fixture-model","choices":[{"index":0,"message":{"role":"assistant","tool_calls":[{"id":"hosted_failure_1","type":"function","function":{"name":%q,"arguments":"{\"code\":\"panic()\"}"}}]},"finish_reason":"tool_calls"}]}`, payload.Tools[0].Function.Name)
 			return
 		}
-		if !bytes.Contains(body, []byte("hosted code_interpreter service returned HTTP 503")) {
-			http.Error(writer, "typed executor failure missing from internal continuation", http.StatusBadRequest)
-			return
-		}
-		_, _ = io.WriteString(writer, `{"id":"chat-hosted-failure-2","object":"chat.completion","created":1785381001,"model":"fixture-model","choices":[{"index":0,"message":{"role":"assistant","content":"recovered after hosted failure"},"finish_reason":"stop"}]}`)
+		http.Error(writer, "local executor failure must not trigger another provider round", http.StatusInternalServerError)
 	}))
 	t.Cleanup(provider.Close)
 
@@ -308,34 +304,23 @@ func TestHostedExecutionFailureRetainsResponsesLifecycleAndTraceOverRealHTTP(t *
 	observer := &controllerObservationRecorder{}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	result, err := pipeline.NewFactory(client).Pipeline(
+	_, err = pipeline.NewFactory(client).Pipeline(
 		responses.NewInboundTransformer(), conversion.NewOutbound(outbound),
 		pipeline.WithToolLoopController(controller), pipeline.WithObserver(observer),
 	).Process(ctx, &httpclient.Request{
 		Method: http.MethodPost, URL: "/v1/responses", Headers: http.Header{"Content-Type": []string{"application/json"}},
 		Body: []byte(`{"model":"fixture-model","input":"run failing code","tools":[{"type":"code_interpreter","container":{"type":"auto"}}],"tool_choice":"required"}`),
 	})
-	require.NoError(t, err)
-	require.EqualValues(t, 2, providerRounds.Load())
+	require.Error(t, err)
+	require.Equal(t, "gateway tool loop failed: hosted tool execution failed", err.Error())
+	require.NotContains(t, err.Error(), "private executor diagnostic")
+	require.EqualValues(t, 1, providerRounds.Load())
 	require.EqualValues(t, 1, executorCalls.Load())
 	summary := observer.emulation()
 	require.NotNil(t, summary)
 	require.EqualValues(t, 1, summary.Failures)
 	require.EqualValues(t, 1, summary.HostedCodeCalls)
 	require.EqualValues(t, 1, totalHostedExecutions(summary))
-	var responseBody struct {
-		Output []struct {
-			Type   string `json:"type"`
-			Status string `json:"status"`
-		} `json:"output"`
-	}
-	wire := string(result.Response.Body)
-	require.NoError(t, json.Unmarshal(result.Response.Body, &responseBody), wire)
-	require.Len(t, responseBody.Output, 2, wire)
-	require.Equal(t, "code_interpreter_call", responseBody.Output[0].Type, wire)
-	require.Equal(t, "failed", responseBody.Output[0].Status, wire)
-	require.Equal(t, "message", responseBody.Output[1].Type, wire)
-	require.NotContains(t, wire, "private executor diagnostic")
 }
 
 func TestControllerDoesNotInterceptResponsesClientOwnedComputerOverRealHTTP(t *testing.T) {

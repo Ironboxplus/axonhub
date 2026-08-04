@@ -34,6 +34,22 @@ func TestControllerPreflightMergesOnlyConfiguredEmulators(t *testing.T) {
 	if err != nil || !webPlan.Complete() || webPlan.Summary.Emulated != 1 || webPlan.Actions[0].Strategy != conversion.StrategyHostedGateway {
 		t.Fatalf("hosted preflight = %#v, err=%v", webPlan, err)
 	}
+	forcedWebController, err := NewController(ControllerConfig{
+		Hosted:             webController.config.Hosted,
+		ForceHostedGateway: conversion.CapabilityWebSearchTool,
+	})
+	if err != nil {
+		t.Fatalf("new forced Responses hosted controller: %v", err)
+	}
+	forcedWebPlan, err := forcedWebController.Preflight(webRequest, llm.APIFormatOpenAIResponse)
+	if err != nil || !forcedWebPlan.Complete() || forcedWebPlan.Summary.Emulated != 1 ||
+		forcedWebPlan.Actions[0].Strategy != conversion.StrategyHostedGateway ||
+		!forcedWebController.needsHostedEmulation(webRequest, llm.APIFormatOpenAIResponse) {
+		t.Fatalf("forced Responses hosted preflight = %#v, err=%v", forcedWebPlan, err)
+	}
+	if webController.needsHostedEmulation(webRequest, llm.APIFormatOpenAIResponse) {
+		t.Fatal("same-protocol hosted tool was forced without attempt admission policy")
+	}
 
 	mcpOnlyController, err := NewController(ControllerConfig{MCP: mcp.RegistryConfig{
 		SyntheticNameKey: []byte(strings.Repeat("preflight-mcp-key-", 2)),
@@ -45,6 +61,16 @@ func TestControllerPreflightMergesOnlyConfiguredEmulators(t *testing.T) {
 	missingPlan, missingErr := mcpOnlyController.Preflight(webRequest, llm.APIFormatOpenAIChatCompletion)
 	if !errors.Is(missingErr, conversion.ErrIncompletePlan) || missingPlan == nil || missingPlan.Summary.Unknown != 1 {
 		t.Fatalf("missing hosted executor preflight = %#v, err=%v", missingPlan, missingErr)
+	}
+	forcedMissingController, err := NewController(ControllerConfig{
+		MCP: mcpOnlyController.config.MCP, ForceHostedGateway: conversion.CapabilityWebSearchTool,
+	})
+	if err != nil {
+		t.Fatalf("new missing forced hosted controller: %v", err)
+	}
+	forcedMissingPlan, forcedMissingErr := forcedMissingController.Preflight(webRequest, llm.APIFormatOpenAIResponse)
+	if !errors.Is(forcedMissingErr, conversion.ErrIncompletePlan) || forcedMissingPlan == nil || forcedMissingPlan.Summary.Unknown != 1 {
+		t.Fatalf("missing forced hosted executor preflight = %#v, err=%v", forcedMissingPlan, forcedMissingErr)
 	}
 
 	mcpRequest := &llm.Request{
@@ -80,6 +106,32 @@ func TestControllerRejectsMismatchedHostedExecutorRegistration(t *testing.T) {
 	}})
 	if !errors.Is(err, hosted.ErrConfig) {
 		t.Fatalf("mismatched hosted executor error = %v", err)
+	}
+}
+
+func TestControllerCapabilityProfileDefensiveBoundaries(t *testing.T) {
+	t.Parallel()
+	future := llm.APIFormat("future/protocol")
+	if profile, ok := (&Controller{}).CapabilityProfile(future); ok || profile.ID != "" {
+		t.Fatalf("unknown capability profile = %#v, ok=%v", profile, ok)
+	}
+	var nilController *Controller
+	if profile, ok := nilController.CapabilityProfile(llm.APIFormatOpenAIResponse); !ok || profile.ID == "" {
+		t.Fatalf("nil controller base profile = %#v, ok=%v", profile, ok)
+	}
+	invalidExecutorController := &Controller{config: ControllerConfig{Hosted: hosted.Config{
+		SyntheticNameKey: []byte(strings.Repeat("profile-invalid-executor-", 2)),
+		Executors:        map[llm.ToolKind]hosted.Executor{llm.ToolKindWebSearch: nil},
+	}}}
+	profile, ok := invalidExecutorController.CapabilityProfile(llm.APIFormatOpenAIResponse)
+	if !ok || profile.EmulatedTools.Supports(conversion.CapabilityWebSearchTool) {
+		t.Fatalf("nil executor was advertised by profile = %#v, ok=%v", profile, ok)
+	}
+	if invalidExecutorController.needsHostedEmulation(nil, llm.APIFormatOpenAIResponse) {
+		t.Fatal("nil request requires hosted emulation")
+	}
+	if plan, err := (&Controller{}).Preflight(&llm.Request{APIFormat: llm.APIFormatOpenAIResponse}, future); err == nil || plan == nil {
+		t.Fatalf("unknown target preflight = %#v, err=%v", plan, err)
 	}
 }
 

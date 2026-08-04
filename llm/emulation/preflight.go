@@ -38,6 +38,10 @@ func (controller *Controller) CapabilityProfile(target llm.APIFormat) (conversio
 			profile.EmulatedTools |= conversion.CapabilityForToolKind(kind)
 		}
 	}
+	// Only capabilities with a configured emulator can be forced through the
+	// gateway. If a caller forces an unavailable capability, leaving it absent
+	// from both NativeTools and EmulatedTools makes Preflight fail closed.
+	profile.NativeTools &^= controller.config.ForceHostedGateway
 	if profile.EmulatedTools != 0 {
 		profile.ID = fmt.Sprintf("%s+gateway-%x", profile.ID, uint32(profile.EmulatedTools))
 	}

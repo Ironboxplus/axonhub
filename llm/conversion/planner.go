@@ -405,10 +405,10 @@ func actionForHostedCall(source llm.APIFormat, target CapabilityProfile, item *l
 	if item == nil || item.HostedCall == nil || item.HostedCall.Invocation.Execution != llm.ExecutionOwnerProvider {
 		return Action{Ref: ref, Kind: ActionUnknown, Strategy: StrategyUnavailable, Reason: ReasonNoStrategy}
 	}
-	if source == target.APIFormat {
+	capability := capabilityForToolKind(string(item.HostedCall.Invocation.Kind))
+	if source == target.APIFormat && profileAdmitsToolCapability(source, target, capability) {
 		return Action{Ref: ref, Kind: ActionNative, Strategy: StrategyNative, Reason: ReasonTargetNative, Reversible: true}
 	}
-	capability := capabilityForToolKind(string(item.HostedCall.Invocation.Kind))
 	if target.NativeTools.Supports(capability) {
 		return Action{Ref: ref, Kind: ActionLower, Strategy: StrategyHostedProject, Reason: ReasonSemanticProjection}
 	}
@@ -416,6 +416,13 @@ func actionForHostedCall(source llm.APIFormat, target CapabilityProfile, item *l
 		return Action{Ref: ref, Kind: ActionEmulate, Strategy: StrategyHostedGateway, Reason: ReasonGatewayExecution, Reversible: true}
 	}
 	return Action{Ref: ref, Kind: ActionUnknown, Strategy: StrategyUnavailable, Reason: ReasonNoStrategy}
+}
+
+func profileAdmitsToolCapability(source llm.APIFormat, target CapabilityProfile, capability ToolCapabilitySet) bool {
+	if capability == 0 {
+		return source == target.APIFormat
+	}
+	return target.NativeTools.Supports(capability)
 }
 
 func actionForProviderData(source, target llm.APIFormat, ref ObjectRef) Action {
@@ -566,7 +573,7 @@ func actionForToolDefinition(definition *llm.ToolDefinition, source llm.APIForma
 		}
 		return Action{Ref: ref, Kind: ActionUnknown, Strategy: StrategyUnavailable, Reason: ReasonNoStrategy}
 	}
-	if source == target.APIFormat {
+	if source == target.APIFormat && profileAdmitsToolCapability(source, target, capability) {
 		return Action{Ref: ref, Kind: ActionNative, Strategy: StrategyNative, Reason: ReasonTargetNative, Reversible: true}
 	}
 	if definition.Kind == llm.ToolKindToolSearch && definition.Execution != llm.ExecutionOwnerClient &&
@@ -578,7 +585,7 @@ func actionForToolDefinition(definition *llm.ToolDefinition, source llm.APIForma
 		return Action{Ref: ref, Kind: ActionUnknown, Strategy: StrategyUnavailable, Reason: ReasonNoStrategy}
 	}
 	if definition.Execution == llm.ExecutionOwnerProvider && definition.Hosted != nil {
-		if HostedToolNativeEquivalent(*definition, target.APIFormat) {
+		if profileAdmitsToolCapability(source, target, capability) && HostedToolNativeEquivalent(*definition, target.APIFormat) {
 			return Action{Ref: ref, Kind: ActionNative, Strategy: StrategyNative, Reason: ReasonTargetNative, Reversible: true}
 		}
 		if target.EmulatedTools.Supports(capability) && target.NativeTools.Supports(CapabilityFunctionTool) {

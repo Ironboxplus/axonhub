@@ -38,6 +38,7 @@ type coverBlock struct {
 
 var targets = []target{
 	{File: "conversion_trace.go"},
+	{File: "error_diagnostic.go", Function: "ErrorDiagnosticFrom"},
 	{File: "request_controls.go"},
 	{File: "event_state.go"},
 	{File: "event.go", Receiver: "Event", Function: "Validate"},
@@ -46,7 +47,25 @@ var targets = []target{
 	{File: "conversion/outbound.go", Function: "WithCapabilityProfile"},
 	{File: "conversion/outbound.go", Receiver: "Outbound", Function: "Preflight"},
 	{File: "conversion/outbound.go", Function: "appendRequestControlActions"},
+	{File: "conversion/planner.go", Function: "profileAdmitsToolCapability"},
+	{File: "conversion/planner.go", Function: "actionForHostedCall"},
+	{File: "conversion/planner.go", Function: "actionForToolDefinition"},
 	{File: "conversion/ledger.go", Receiver: "Session", Function: "recordDebug"},
+	{File: "emulation/controller.go", Receiver: "Controller", Function: "needsHostedEmulation"},
+	{File: "emulation/controller.go", Receiver: "Controller", Function: "emulateHostedDefinition"},
+	{File: "emulation/controller.go", Function: "appendHostedExecutions"},
+	{File: "emulation/controller.go", Receiver: "hostedExecutionError", Function: "Error"},
+	{File: "emulation/controller.go", Receiver: "hostedExecutionError", Function: "Unwrap"},
+	{File: "emulation/preflight.go", Receiver: "Controller", Function: "CapabilityProfile"},
+	{File: "emulation/preflight.go", Receiver: "Controller", Function: "Preflight"},
+	{File: "emulation/hosted/web_search.go", Function: "NewWebSearchExecutor"},
+	{File: "emulation/hosted/web_search.go", Receiver: "WebSearchExecutor", Function: "Execute"},
+	{File: "emulation/hosted/web_search.go", Function: "webSearchToolResult"},
+	{File: "emulation/hosted/web_search.go", Function: "validateWebSearchOutput"},
+	{File: "emulation/mcp/types.go", Receiver: "Error", Function: "SafeDiagnostic"},
+	{File: "emulation/mcp/types.go", Function: "safeDiagnosticKind"},
+	{File: "emulation/mcp/types.go", Function: "safeDiagnosticMethod"},
+	{File: "emulation/mcp/types.go", Function: "safeDiagnosticMessage"},
 	{File: "transformer/openai/responses/residual.go"},
 	{File: "transformer/openai/responses/request_validation.go"},
 	{File: "transformer/openai/responses/stream_event.go", Receiver: "StreamEvent", Function: "UnmarshalJSON"},
@@ -113,6 +132,9 @@ func run() error {
 	}{
 		{pkg: ".", path: ".coverage/critical_llm.out"},
 		{pkg: "./conversion", path: ".coverage/critical_conversion.out"},
+		{pkg: "./emulation", path: ".coverage/critical_emulation.out"},
+		{pkg: "./emulation/mcp", path: ".coverage/critical_mcp.out"},
+		{pkg: "./emulation/hosted", path: ".coverage/critical_hosted.out"},
 		{pkg: "./transformer/openai/responses", path: ".coverage/critical_responses.out"},
 	}
 	var blocks []coverBlock

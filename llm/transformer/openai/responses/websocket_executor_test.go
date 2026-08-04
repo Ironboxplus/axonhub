@@ -548,7 +548,7 @@ func TestWebSocketExecutorExpiredConnectionReconnectsWithFullContext(t *testing.
 
 	executor := NewWebSocketExecutor(nil)
 	executor.idleTTL = time.Hour
-	executor.maxLifetime = 15 * time.Millisecond
+	executor.maxLifetime = time.Hour
 	defer func() { require.NoError(t, executor.Close()) }()
 	ctx := shared.WithSessionScope(context.Background(), "api-key:17")
 	inputs := []string{
@@ -572,7 +572,18 @@ func TestWebSocketExecutorExpiredConnectionReconnectsWithFullContext(t *testing.
 		require.NoError(t, stream.Err())
 		require.NoError(t, stream.Close())
 		if turn == 0 {
-			time.Sleep(30 * time.Millisecond)
+			executor.mu.Lock()
+			var pooled *pooledWebSocketConn
+			for _, candidate := range executor.pool {
+				pooled = candidate
+				break
+			}
+			executor.mu.Unlock()
+			require.NotNil(t, pooled)
+
+			pooled.mu.Lock()
+			pooled.createdAt = time.Now().Add(-2 * executor.maxLifetime)
+			pooled.mu.Unlock()
 		}
 	}
 

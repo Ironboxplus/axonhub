@@ -38,7 +38,12 @@ type ControllerConfig struct {
 	// verified to execute it. The wire format alone is not proof of provider
 	// capability; callers set this attempt-local policy from their channel
 	// capability profile.
-	ForceMCPGateway            bool
+	ForceMCPGateway bool
+	// ForceHostedGateway marks provider-owned hosted capabilities that this
+	// concrete upstream has not been admitted to execute natively. Protocol
+	// compatibility alone is insufficient: same-protocol providers may accept
+	// a hosted tool definition while ignoring or rejecting its lifecycle.
+	ForceHostedGateway         conversion.ToolCapabilitySet
 	ContinuePauseTurns         bool
 	DefaultRequireApproval     bool
 	MaxRounds                  int
@@ -85,7 +90,7 @@ func (controller *Controller) Complete(ctx context.Context, request *llm.Request
 	if controller == nil || request == nil || rounds == nil {
 		return nil, errors.New("gateway tool loop requires controller, request, and round tripper")
 	}
-	if !controller.needsMCPEmulation(request, rounds.TargetFormat()) && !hasHostedDefinitionsForTarget(request, rounds.TargetFormat()) &&
+	if !controller.needsMCPEmulation(request, rounds.TargetFormat()) && !controller.needsHostedEmulation(request, rounds.TargetFormat()) &&
 		!controller.needsPauseTurnContinuation(request, rounds.TargetFormat()) &&
 		!(controller.config.EnableCustomConstraints && NeedsCustomConstraintEmulation(request, rounds.TargetFormat())) {
 		return rounds.Complete(ctx, request)
@@ -97,7 +102,7 @@ func (controller *Controller) Stream(ctx context.Context, request *llm.Request, 
 	if controller == nil || request == nil || rounds == nil {
 		return nil, errors.New("gateway tool loop requires controller, request, and round tripper")
 	}
-	if !controller.needsMCPEmulation(request, rounds.TargetFormat()) && !hasHostedDefinitionsForTarget(request, rounds.TargetFormat()) &&
+	if !controller.needsMCPEmulation(request, rounds.TargetFormat()) && !controller.needsHostedEmulation(request, rounds.TargetFormat()) &&
 		!controller.needsPauseTurnContinuation(request, rounds.TargetFormat()) &&
 		!(controller.config.EnableCustomConstraints && NeedsCustomConstraintEmulation(request, rounds.TargetFormat())) {
 		return rounds.Stream(ctx, request)
@@ -134,7 +139,7 @@ func (controller *Controller) completeMCP(ctx context.Context, request *llm.Requ
 	}
 	defer func() { _ = registry.Close(context.WithoutCancel(loopCtx)) }()
 	hostedRegistry, err := hosted.DiscoverRegistry(gatewayRequest, controller.config.Hosted, func(definition llm.ToolDefinition) bool {
-		return emulateHostedDefinition(gatewayRequest.APIFormat, rounds.TargetFormat(), definition)
+		return controller.emulateHostedDefinition(gatewayRequest.APIFormat, rounds.TargetFormat(), definition)
 	})
 	if err != nil {
 		pipeline.RecordEmulationFailure(loopCtx)
@@ -379,10 +384,8 @@ func (controller *Controller) processRound(
 		processed.results[callID] = execution.result
 	}
 	hostedExecutions := controller.executeHostedCalls(ctx, hostedRegistry, hostedCalls)
-	for _, execution := range hostedExecutions {
-		callID := execution.call.item.ToolCall.CallID
-		processed.replacements[callID] = execution.public
-		processed.results[callID] = execution.result
+	if err := appendHostedExecutions(processed, hostedExecutions); err != nil {
+		return nil, err
 	}
 	for callID, approval := range approvals {
 		processed.replacements[callID] = approval
@@ -500,6 +503,7 @@ type hostedCallExecution struct {
 	call   gatewayHostedCall
 	result llm.Item
 	public llm.Item
+	err    error
 }
 
 func (controller *Controller) executeHostedCalls(ctx context.Context, registry *hosted.Registry, calls []gatewayHostedCall) []hostedCallExecution {
@@ -513,16 +517,15 @@ func (controller *Controller) executeHostedCalls(ctx context.Context, registry *
 			defer wait.Done()
 			defer func() {
 				if recover() != nil {
-					pipeline.RecordEmulationFailure(ctx)
 					slog.ErrorContext(ctx, "hosted executor panicked")
-					results[index] = failedHostedExecution(calls[index], errors.New("hosted executor panicked"))
+					results[index] = hostedCallExecution{call: calls[index], err: errors.New("hosted executor panicked")}
 				}
 			}()
 			select {
 			case semaphore <- struct{}{}:
 				defer func() { <-semaphore }()
 			case <-ctx.Done():
-				results[index] = failedHostedExecution(calls[index], ctx.Err())
+				results[index] = hostedCallExecution{call: calls[index], err: ctx.Err()}
 				return
 			}
 			results[index] = executeHostedCall(ctx, registry, calls[index])
@@ -563,11 +566,10 @@ func executeHostedCall(ctx context.Context, registry *hosted.Registry, call gate
 		err = errors.New("hosted executor is missing")
 	}
 	if err != nil {
-		pipeline.RecordEmulationFailure(ctx)
-		return failedHostedExecution(call, err)
+		return hostedCallExecution{call: call, err: err}
 	}
 	if result == nil {
-		return failedHostedExecution(call, errors.New("hosted executor returned no result"))
+		return hostedCallExecution{call: call, err: errors.New("hosted executor returned no result")}
 	}
 	result.Kind = call.binding.Definition.Kind
 	result.CallID = invocation.CallID
@@ -596,34 +598,22 @@ func executeHostedCall(ctx context.Context, registry *hosted.Registry, call gate
 	}
 }
 
-func failedHostedExecution(call gatewayHostedCall, err error) hostedCallExecution {
-	message := "hosted tool execution failed"
-	if err != nil {
-		message = err.Error()
+type hostedExecutionError struct{ cause error }
+
+func (*hostedExecutionError) Error() string { return "hosted tool execution failed" }
+
+func (err *hostedExecutionError) Unwrap() error { return err.cause }
+
+func appendHostedExecutions(processed *processedRound, executions []hostedCallExecution) error {
+	for _, execution := range executions {
+		if execution.err != nil {
+			return &hostedExecutionError{cause: execution.err}
+		}
+		callID := execution.call.item.ToolCall.CallID
+		processed.replacements[callID] = execution.public
+		processed.results[callID] = execution.result
 	}
-	invocation := *call.item.ToolCall
-	invocation.Kind = call.binding.Definition.Kind
-	invocation.LogicalName = call.binding.Definition.LogicalName
-	invocation.Execution = llm.ExecutionOwnerProvider
-	result := &llm.ToolResult{
-		Kind: invocation.Kind, CallID: invocation.CallID, LogicalName: invocation.LogicalName,
-		Content: []llm.ContentBlock{{Kind: llm.ContentKindText, Text: message}},
-		IsError: true, Status: llm.ToolResultStatusFailed,
-	}
-	return hostedCallExecution{
-		call: call,
-		result: llm.Item{
-			Kind: llm.ItemKindToolResult, Status: llm.ItemStatusFailed,
-			ToolResult: &llm.ToolResult{
-				Kind: llm.ToolKindFunction, CallID: invocation.CallID, LogicalName: call.binding.SyntheticName,
-				Content: []llm.ContentBlock{{Kind: llm.ContentKindText, Text: message}}, IsError: true, Status: llm.ToolResultStatusFailed,
-			},
-		},
-		public: llm.Item{
-			Kind: llm.ItemKindHostedCall, ID: invocation.ID, Role: llm.RoleAssistant, Status: llm.ItemStatusFailed,
-			HostedCall: &llm.HostedToolCall{Invocation: invocation, Result: result},
-		},
-	}
+	return nil
 }
 
 func (controller *Controller) executeCalls(ctx context.Context, registry *mcp.Registry, calls []gatewayCall) []callExecution {
@@ -880,21 +870,28 @@ func (controller *Controller) needsMCPEmulation(request *llm.Request, target llm
 		(target != llm.APIFormatOpenAIResponse || controller != nil && controller.config.ForceMCPGateway || request.HasMCPReadOnlyFilter())
 }
 
-func hasHostedDefinitionsForTarget(request *llm.Request, target llm.APIFormat) bool {
+func (controller *Controller) needsHostedEmulation(request *llm.Request, target llm.APIFormat) bool {
 	if request == nil {
 		return false
 	}
 	for index := range request.ToolDefinitions {
 		definition := request.ToolDefinitions[index]
-		if emulateHostedDefinition(request.APIFormat, target, definition) {
+		if controller.emulateHostedDefinition(request.APIFormat, target, definition) {
 			return true
 		}
 	}
 	return false
 }
 
-func emulateHostedDefinition(source, target llm.APIFormat, definition llm.ToolDefinition) bool {
-	if definition.Execution != llm.ExecutionOwnerProvider || definition.Hosted == nil || source == target {
+func (controller *Controller) emulateHostedDefinition(source, target llm.APIFormat, definition llm.ToolDefinition) bool {
+	if definition.Execution != llm.ExecutionOwnerProvider || definition.Hosted == nil {
+		return false
+	}
+	capability := conversion.CapabilityForToolKind(definition.Kind)
+	if controller != nil && capability != 0 && controller.config.ForceHostedGateway.Supports(capability) {
+		return true
+	}
+	if source == target {
 		return false
 	}
 	return !conversion.HostedToolNativeEquivalent(definition, target)

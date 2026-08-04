@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -176,6 +177,386 @@ func TestControllerRunsResponsesWebSearchThroughChatTargetOverRealHTTP(t *testin
 	require.Equal(t, "message", responseBody.Output[1].Type)
 	require.Equal(t, "It is sunny in Singapore.", responseBody.Output[1].Content[0].Text)
 	require.EqualValues(t, 18, responseBody.Usage.TotalTokens)
+}
+
+func TestControllerForcesResponsesWebSearchThroughGatewayOverRealHTTP(t *testing.T) {
+	t.Parallel()
+	var searchCalls atomic.Int64
+	searchServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		searchCalls.Add(1)
+		var input hosted.WebSearchInput
+		if request.Method != http.MethodPost || json.NewDecoder(request.Body).Decode(&input) != nil || input.Query != "same protocol search" {
+			http.Error(writer, "bad search request", http.StatusBadRequest)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(writer, `{"text":"same protocol gateway result","sources":[{"url":"https://example.test/evidence","title":"evidence"}]}`)
+	}))
+	t.Cleanup(searchServer.Close)
+	searchEndpoint, err := url.Parse(searchServer.URL)
+	require.NoError(t, err)
+	webExecutor, err := hosted.NewWebSearchExecutor(hosted.WebSearchExecutorConfig{
+		Endpoint: searchServer.URL, Client: searchServer.Client(),
+		EndpointPolicy: func(candidate *url.URL) error {
+			if candidate.Scheme != searchEndpoint.Scheme || candidate.Host != searchEndpoint.Host {
+				return fmt.Errorf("search endpoint is not allowlisted")
+			}
+			return nil
+		},
+	})
+	require.NoError(t, err)
+
+	var providerRounds atomic.Int64
+	var syntheticName string
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		round := providerRounds.Add(1)
+		body, readErr := io.ReadAll(request.Body)
+		if readErr != nil {
+			http.Error(writer, "read", http.StatusBadRequest)
+			return
+		}
+		var payload struct {
+			Tools []struct {
+				Type string `json:"type"`
+				Name string `json:"name"`
+			} `json:"tools"`
+			Input json.RawMessage `json:"input"`
+		}
+		if json.Unmarshal(body, &payload) != nil || len(payload.Tools) != 1 || payload.Tools[0].Type != "function" ||
+			bytes.Contains(body, []byte(`"type":"web_search"`)) {
+			http.Error(writer, "native hosted tool reached unadmitted provider", http.StatusBadRequest)
+			return
+		}
+		if round == 1 {
+			syntheticName = payload.Tools[0].Name
+			if !strings.HasPrefix(syntheticName, "axh_") || strings.Contains(syntheticName, "search") {
+				http.Error(writer, "hosted function name is not opaque", http.StatusBadRequest)
+				return
+			}
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(writer, `{"id":"resp_forced_search_1","object":"response","created_at":1785382000,"model":"fixture-model","status":"completed","output":[{"id":"item_search_1","type":"function_call","call_id":"search_call_1","name":%q,"arguments":"{\"query\":\"same protocol search\"}","status":"completed"}],"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}`, syntheticName)
+			return
+		}
+		var inputItems []struct {
+			Type   string `json:"type"`
+			CallID string `json:"call_id"`
+			Output any    `json:"output"`
+		}
+		foundResult := json.Unmarshal(payload.Input, &inputItems) == nil
+		if foundResult {
+			foundResult = false
+			for _, item := range inputItems {
+				encodedOutput, _ := json.Marshal(item.Output)
+				if item.Type == "function_call_output" && item.CallID == "search_call_1" &&
+					bytes.Contains(encodedOutput, []byte("same protocol gateway result")) {
+					foundResult = true
+					break
+				}
+			}
+		}
+		if round != 2 || !foundResult {
+			http.Error(writer, "gateway result missing from continuation", http.StatusBadRequest)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(writer, `{"id":"resp_forced_search_2","object":"response","created_at":1785382001,"model":"fixture-model","status":"completed","output":[{"id":"msg_forced_search","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"search finished","annotations":[]}]}],"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}`)
+	}))
+	t.Cleanup(provider.Close)
+
+	controller, err := emulation.NewController(emulation.ControllerConfig{
+		Hosted: hosted.Config{
+			SyntheticNameKey: []byte(strings.Repeat("forced-same-protocol-hosted-key-", 2)),
+			Executors:        map[llm.ToolKind]hosted.Executor{llm.ToolKindWebSearch: webExecutor},
+		},
+		ForceHostedGateway: conversion.CapabilityWebSearchTool,
+		MaxRounds:          4, MaxToolCalls: 8, MaxParallelCalls: 2,
+	})
+	require.NoError(t, err)
+	outbound, err := responses.NewOutboundTransformer(provider.URL, "provider-key")
+	require.NoError(t, err)
+	executor := httpclient.NewHttpClientWithProxy(&httpclient.ProxyConfig{Type: httpclient.ProxyTypeDisabled})
+	t.Cleanup(executor.CloseIdleConnections)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result, err := pipeline.NewFactory(executor).Pipeline(
+		responses.NewInboundTransformer(), conversion.NewOutbound(outbound),
+		pipeline.WithToolLoopController(controller),
+	).Process(ctx, &httpclient.Request{
+		Method: http.MethodPost, URL: "/v1/responses", Headers: http.Header{"Content-Type": []string{"application/json"}},
+		Body: []byte(`{"model":"fixture-model","input":"search","tools":[{"type":"web_search"}]}`),
+	})
+	require.NoError(t, err)
+	require.EqualValues(t, 2, providerRounds.Load())
+	require.EqualValues(t, 1, searchCalls.Load())
+	wire := string(result.Response.Body)
+	require.Contains(t, wire, `"type":"web_search_call"`)
+	require.Contains(t, wire, "https://example.test/evidence")
+	require.Contains(t, wire, "search finished")
+	require.NotContains(t, wire, syntheticName)
+}
+
+type hostedSafeFailure struct{}
+
+func (hostedSafeFailure) Error() string { return "Authorization: Bearer private-hosted-secret" }
+
+func (hostedSafeFailure) SafeDiagnostic() llm.ErrorDiagnostic {
+	return llm.ErrorDiagnostic{
+		Component: "web_search", Code: "search_unavailable", Message: "Web search is unavailable", StatusCode: http.StatusBadGateway,
+	}
+}
+
+type failingWebSearchService struct{ calls *atomic.Int64 }
+
+func (service failingWebSearchService) Search(context.Context, hosted.WebSearchInput) (hosted.WebSearchOutput, error) {
+	service.calls.Add(1)
+	return hosted.WebSearchOutput{}, hostedSafeFailure{}
+}
+
+func TestControllerStopsAfterHostedExecutorFailureOverRealHTTP(t *testing.T) {
+	t.Parallel()
+	var providerCalls atomic.Int64
+	var searchCalls atomic.Int64
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		providerCalls.Add(1)
+		var payload struct {
+			Tools []struct {
+				Type string `json:"type"`
+				Name string `json:"name"`
+			} `json:"tools"`
+		}
+		if json.NewDecoder(request.Body).Decode(&payload) != nil || len(payload.Tools) != 1 ||
+			payload.Tools[0].Type != "function" || !strings.HasPrefix(payload.Tools[0].Name, "axh_") {
+			http.Error(writer, "native hosted tool reached provider", http.StatusBadRequest)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(writer, `{"id":"resp_failed_search","object":"response","created_at":1785382002,"model":"fixture-model","status":"completed","output":[{"id":"item_failed_search","type":"function_call","call_id":"failed_search_call","name":%q,"arguments":"{\"query\":\"same protocol search\"}","status":"completed"}],"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}`, payload.Tools[0].Name)
+	}))
+	t.Cleanup(provider.Close)
+
+	webExecutor, err := hosted.NewWebSearchExecutor(hosted.WebSearchExecutorConfig{
+		Service: failingWebSearchService{calls: &searchCalls},
+	})
+	require.NoError(t, err)
+	controller, err := emulation.NewController(emulation.ControllerConfig{
+		Hosted: hosted.Config{
+			SyntheticNameKey: []byte(strings.Repeat("failed-same-protocol-hosted-key-", 2)),
+			Executors:        map[llm.ToolKind]hosted.Executor{llm.ToolKindWebSearch: webExecutor},
+		},
+		ForceHostedGateway: conversion.CapabilityWebSearchTool,
+		MaxRounds:          4, MaxToolCalls: 8, MaxParallelCalls: 2,
+	})
+	require.NoError(t, err)
+	outbound, err := responses.NewOutboundTransformer(provider.URL, "provider-key")
+	require.NoError(t, err)
+	executor := httpclient.NewHttpClientWithProxy(&httpclient.ProxyConfig{Type: httpclient.ProxyTypeDisabled})
+	t.Cleanup(executor.CloseIdleConnections)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err = pipeline.NewFactory(executor).Pipeline(
+		responses.NewInboundTransformer(), conversion.NewOutbound(outbound),
+		pipeline.WithToolLoopController(controller),
+	).Process(ctx, &httpclient.Request{
+		Method: http.MethodPost, URL: "/v1/responses", Headers: http.Header{"Content-Type": []string{"application/json"}},
+		Body: []byte(`{"model":"fixture-model","input":"search","tools":[{"type":"web_search"}]}`),
+	})
+	require.Error(t, err)
+	require.EqualValues(t, 1, providerCalls.Load(), "a local hosted failure must not trigger another provider round")
+	require.EqualValues(t, 1, searchCalls.Load())
+	require.NotContains(t, err.Error(), "private-hosted-secret")
+	require.Equal(t, &llm.ErrorDiagnostic{
+		Component: "web_search", Code: "search_unavailable", Message: "Web search is unavailable", StatusCode: http.StatusBadGateway,
+	}, llm.ErrorDiagnosticFrom(err))
+}
+
+func TestControllerForcesResponsesWebSearchThroughGatewayStreamOverRealHTTP(t *testing.T) {
+	t.Parallel()
+	var searchCalls atomic.Int64
+	searchServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		searchCalls.Add(1)
+		var input hosted.WebSearchInput
+		if request.Method != http.MethodPost || json.NewDecoder(request.Body).Decode(&input) != nil || input.Query != "stream same protocol search" {
+			http.Error(writer, "bad search request", http.StatusBadRequest)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(writer, `{"text":"stream same protocol result","sources":[{"url":"https://example.test/stream-evidence","title":"stream evidence"}]}`)
+	}))
+	t.Cleanup(searchServer.Close)
+	searchEndpoint, err := url.Parse(searchServer.URL)
+	require.NoError(t, err)
+	webExecutor, err := hosted.NewWebSearchExecutor(hosted.WebSearchExecutorConfig{
+		Endpoint: searchServer.URL, Client: searchServer.Client(),
+		EndpointPolicy: func(candidate *url.URL) error {
+			if candidate.Scheme != searchEndpoint.Scheme || candidate.Host != searchEndpoint.Host {
+				return fmt.Errorf("search endpoint is not allowlisted")
+			}
+			return nil
+		},
+	})
+	require.NoError(t, err)
+
+	var providerRounds atomic.Int64
+	providerErrors := make(chan error, 2)
+	var syntheticName string
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		round := providerRounds.Add(1)
+		body, readErr := io.ReadAll(request.Body)
+		if readErr != nil {
+			providerErrors <- readErr
+			http.Error(writer, "read", http.StatusBadRequest)
+			return
+		}
+		var payload struct {
+			Stream bool `json:"stream"`
+			Tools  []struct {
+				Type string `json:"type"`
+				Name string `json:"name"`
+			} `json:"tools"`
+			Input json.RawMessage `json:"input"`
+		}
+		if json.Unmarshal(body, &payload) != nil || !payload.Stream || len(payload.Tools) != 1 || payload.Tools[0].Type != "function" ||
+			bytes.Contains(body, []byte(`"type":"web_search"`)) {
+			providerErrors <- fmt.Errorf("unexpected same-protocol streaming request: %s", body)
+			http.Error(writer, "request", http.StatusBadRequest)
+			return
+		}
+		if round == 1 {
+			syntheticName = payload.Tools[0].Name
+			if !strings.HasPrefix(syntheticName, "axh_") || strings.Contains(syntheticName, "search") {
+				providerErrors <- fmt.Errorf("hosted name is not opaque: %s", syntheticName)
+				http.Error(writer, "tool", http.StatusBadRequest)
+				return
+			}
+		} else if round == 2 {
+			if !bytes.Contains(payload.Input, []byte(`"type":"function_call_output"`)) ||
+				!bytes.Contains(payload.Input, []byte("stream same protocol result")) {
+				providerErrors <- fmt.Errorf("gateway result missing from continuation: %s", payload.Input)
+				http.Error(writer, "result", http.StatusBadRequest)
+				return
+			}
+		} else {
+			providerErrors <- fmt.Errorf("unexpected provider round %d", round)
+			http.Error(writer, "round", http.StatusBadRequest)
+			return
+		}
+
+		writer.Header().Set("Content-Type", "text/event-stream")
+		writer.Header().Set("Cache-Control", "no-cache")
+		flusher, ok := writer.(http.Flusher)
+		if !ok {
+			providerErrors <- errors.New("response writer has no flusher")
+			return
+		}
+		writeFrame := func(eventType string, value map[string]any) bool {
+			encoded, marshalErr := json.Marshal(value)
+			if marshalErr != nil {
+				providerErrors <- marshalErr
+				return false
+			}
+			if _, writeErr := fmt.Fprintf(writer, "event: %s\ndata: %s\n\n", eventType, encoded); writeErr != nil {
+				providerErrors <- writeErr
+				return false
+			}
+			flusher.Flush()
+			return true
+		}
+		responseID := fmt.Sprintf("resp_same_stream_%d", round)
+		if !writeFrame("response.created", map[string]any{
+			"type": "response.created", "sequence_number": 0,
+			"response": map[string]any{"id": responseID, "object": "response", "model": "fixture-model", "status": "in_progress", "output": []any{}},
+		}) {
+			return
+		}
+		if round == 1 {
+			arguments := `{"query":"stream same protocol search"}`
+			if !writeFrame("response.output_item.added", map[string]any{
+				"type": "response.output_item.added", "sequence_number": 1, "output_index": 0,
+				"item": map[string]any{"id": "item_same_stream_search", "type": "function_call", "status": "in_progress", "call_id": "same_stream_search_call", "name": syntheticName, "arguments": ""},
+			}) || !writeFrame("response.function_call_arguments.delta", map[string]any{
+				"type": "response.function_call_arguments.delta", "sequence_number": 2, "output_index": 0,
+				"item_id": "item_same_stream_search", "delta": arguments,
+			}) || !writeFrame("response.function_call_arguments.done", map[string]any{
+				"type": "response.function_call_arguments.done", "sequence_number": 3, "output_index": 0,
+				"item_id": "item_same_stream_search", "call_id": "same_stream_search_call", "name": syntheticName, "arguments": arguments,
+			}) || !writeFrame("response.output_item.done", map[string]any{
+				"type": "response.output_item.done", "sequence_number": 4, "output_index": 0,
+				"item": map[string]any{"id": "item_same_stream_search", "type": "function_call", "status": "completed", "call_id": "same_stream_search_call", "name": syntheticName, "arguments": arguments},
+			}) {
+				return
+			}
+		} else {
+			if !writeFrame("response.output_item.added", map[string]any{
+				"type": "response.output_item.added", "sequence_number": 1, "output_index": 0,
+				"item": map[string]any{"id": "msg_same_stream", "type": "message", "role": "assistant", "status": "in_progress", "content": []any{}},
+			}) || !writeFrame("response.output_text.delta", map[string]any{
+				"type": "response.output_text.delta", "sequence_number": 2, "output_index": 0,
+				"item_id": "msg_same_stream", "content_index": 0, "delta": "stream search finished",
+			}) || !writeFrame("response.output_text.done", map[string]any{
+				"type": "response.output_text.done", "sequence_number": 3, "output_index": 0,
+				"item_id": "msg_same_stream", "content_index": 0, "text": "stream search finished",
+			}) || !writeFrame("response.output_item.done", map[string]any{
+				"type": "response.output_item.done", "sequence_number": 4, "output_index": 0,
+				"item": map[string]any{"id": "msg_same_stream", "type": "message", "role": "assistant", "status": "completed", "content": []any{map[string]any{"type": "output_text", "text": "stream search finished", "annotations": []any{}}}},
+			}) {
+				return
+			}
+		}
+		if !writeFrame("response.completed", map[string]any{
+			"type": "response.completed", "sequence_number": 5,
+			"response": map[string]any{"id": responseID, "object": "response", "model": "fixture-model", "status": "completed", "output": []any{}, "usage": map[string]any{"input_tokens": 4, "output_tokens": 2, "total_tokens": 6}},
+		}) {
+			return
+		}
+		providerErrors <- nil
+	}))
+	t.Cleanup(provider.Close)
+
+	controller, err := emulation.NewController(emulation.ControllerConfig{
+		Hosted: hosted.Config{
+			SyntheticNameKey: []byte(strings.Repeat("forced-same-protocol-stream-key-", 2)),
+			Executors:        map[llm.ToolKind]hosted.Executor{llm.ToolKindWebSearch: webExecutor},
+		},
+		ForceHostedGateway: conversion.CapabilityWebSearchTool,
+		MaxRounds:          4, MaxToolCalls: 8, MaxParallelCalls: 2,
+	})
+	require.NoError(t, err)
+	outbound, err := responses.NewOutboundTransformer(provider.URL, "provider-key")
+	require.NoError(t, err)
+	executor := httpclient.NewHttpClientWithProxy(&httpclient.ProxyConfig{Type: httpclient.ProxyTypeDisabled})
+	t.Cleanup(executor.CloseIdleConnections)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result, err := pipeline.NewFactory(executor).Pipeline(
+		responses.NewInboundTransformer(), conversion.NewOutbound(outbound), pipeline.WithToolLoopController(controller),
+	).Process(ctx, &httpclient.Request{
+		Method: http.MethodPost, URL: "/v1/responses", Headers: http.Header{"Content-Type": []string{"application/json"}},
+		Body: []byte(`{"model":"fixture-model","stream":true,"input":"search","tools":[{"type":"web_search"}]}`),
+	})
+	require.NoError(t, err)
+	require.True(t, result.Stream)
+	var eventTypes []string
+	var wire strings.Builder
+	for result.EventStream.Next() {
+		event := result.EventStream.Current()
+		if event != nil {
+			eventTypes = append(eventTypes, event.Type)
+			wire.Write(event.Data)
+		}
+	}
+	require.NoError(t, result.EventStream.Err())
+	require.NoError(t, <-providerErrors)
+	require.NoError(t, <-providerErrors)
+	require.EqualValues(t, 2, providerRounds.Load())
+	require.EqualValues(t, 1, searchCalls.Load())
+	encoded := wire.String()
+	require.Contains(t, encoded, `"type":"web_search_call"`)
+	require.Contains(t, encoded, "https://example.test/stream-evidence")
+	require.Contains(t, encoded, "stream search finished")
+	require.NotContains(t, encoded, syntheticName)
+	require.NotContains(t, encoded, "response.function_call_arguments")
+	require.Equal(t, 1, countString(eventTypes, "response.created"))
+	require.Equal(t, 1, countString(eventTypes, "response.completed"))
 }
 
 func TestControllerStreamsResponsesWebSearchThroughChatTargetOverRealHTTP(t *testing.T) {

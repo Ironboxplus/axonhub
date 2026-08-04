@@ -14,7 +14,10 @@ import (
 	"github.com/looplj/axonhub/llm"
 )
 
-const defaultWebSearchResponseLimit int64 = 2 << 20
+const (
+	defaultWebSearchResponseLimit int64 = 2 << 20
+	maxWebSearchSources                 = 100
+)
 
 type EndpointPolicy func(*url.URL) error
 
@@ -24,6 +27,17 @@ type WebSearchExecutorConfig struct {
 	Headers          http.Header
 	EndpointPolicy   EndpointPolicy
 	MaxResponseBytes int64
+	// Service provides the same typed contract without an extra HTTP hop. It is
+	// mutually exclusive with Endpoint and HTTP transport settings. The response
+	// byte limit applies equally to HTTP and in-process services.
+	Service WebSearchService
+}
+
+// WebSearchService is the provider-neutral execution boundary used by hosts
+// that already own a hardened search implementation. Credentials, transport
+// state, and provider-specific response bodies remain outside canonical data.
+type WebSearchService interface {
+	Search(context.Context, WebSearchInput) (WebSearchOutput, error)
 }
 
 // WebSearchExecutor calls a configured typed search service. Its transport
@@ -35,6 +49,7 @@ type WebSearchExecutor struct {
 	client   *http.Client
 	headers  http.Header
 	limit    int64
+	service  WebSearchService
 }
 
 type WebSearchInput struct {
@@ -56,13 +71,19 @@ type WebSearchOutput struct {
 }
 
 func NewWebSearchExecutor(config WebSearchExecutorConfig) (*WebSearchExecutor, error) {
-	endpoint, client, err := policyHTTPClient("web search executor", config.Endpoint, config.Client, config.EndpointPolicy)
-	if err != nil {
-		return nil, err
-	}
 	limit := config.MaxResponseBytes
 	if limit <= 0 {
 		limit = defaultWebSearchResponseLimit
+	}
+	if config.Service != nil {
+		if strings.TrimSpace(config.Endpoint) != "" || config.Client != nil || len(config.Headers) != 0 || config.EndpointPolicy != nil {
+			return nil, errors.New("web search service cannot be combined with HTTP transport configuration")
+		}
+		return &WebSearchExecutor{service: config.Service, limit: limit}, nil
+	}
+	endpoint, client, err := policyHTTPClient("web search executor", config.Endpoint, config.Client, config.EndpointPolicy)
+	if err != nil {
+		return nil, err
 	}
 	headers := config.Headers.Clone()
 	if headers == nil {
@@ -89,43 +110,66 @@ func (*WebSearchExecutor) Function(definition llm.ToolDefinition) (llm.FunctionD
 }
 
 func (executor *WebSearchExecutor) Execute(ctx context.Context, definition llm.ToolDefinition, invocation llm.ToolInvocation) (*llm.ToolResult, error) {
-	if executor == nil || executor.endpoint == nil {
+	if executor == nil || executor.endpoint == nil && executor.service == nil {
 		return nil, errors.New("web search executor is not initialized")
 	}
 	input, err := webSearchInput(definition, invocation)
 	if err != nil {
 		return nil, err
 	}
+	var output WebSearchOutput
+	if executor.service != nil {
+		output, err = executor.service.Search(ctx, input)
+		if err != nil {
+			return nil, fmt.Errorf("execute web search service: %w", err)
+		}
+	} else {
+		output, err = executor.executeHTTP(ctx, input)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err := validateWebSearchOutput(output, executor.limit); err != nil {
+		return nil, err
+	}
+	return webSearchToolResult(definition, invocation, output), nil
+}
+
+func (executor *WebSearchExecutor) executeHTTP(ctx context.Context, input WebSearchInput) (WebSearchOutput, error) {
 	body, err := json.Marshal(input)
 	if err != nil {
-		return nil, fmt.Errorf("encode web search request: %w", err)
+		return WebSearchOutput{}, fmt.Errorf("encode web search request: %w", err)
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, executor.endpoint.String(), bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("create web search request: %w", err)
+		return WebSearchOutput{}, fmt.Errorf("create web search request: %w", err)
 	}
 	request.Header = executor.headers.Clone()
 	request.Header.Set("Content-Type", "application/json")
 	response, err := executor.client.Do(request)
 	if err != nil {
-		return nil, fmt.Errorf("execute web search request: %w", err)
+		return WebSearchOutput{}, fmt.Errorf("execute web search request: %w", err)
 	}
 	defer response.Body.Close()
 	limited := io.LimitReader(response.Body, executor.limit+1)
 	responseBody, err := io.ReadAll(limited)
 	if err != nil {
-		return nil, fmt.Errorf("read web search response: %w", err)
+		return WebSearchOutput{}, fmt.Errorf("read web search response: %w", err)
 	}
 	if int64(len(responseBody)) > executor.limit {
-		return nil, errors.New("web search response exceeds limit")
+		return WebSearchOutput{}, errors.New("web search response exceeds limit")
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return nil, fmt.Errorf("web search service returned HTTP %d", response.StatusCode)
+		return WebSearchOutput{}, fmt.Errorf("web search service returned HTTP %d", response.StatusCode)
 	}
 	var output WebSearchOutput
 	if err := json.Unmarshal(responseBody, &output); err != nil {
-		return nil, fmt.Errorf("decode web search response: %w", err)
+		return WebSearchOutput{}, fmt.Errorf("decode web search response: %w", err)
 	}
+	return output, nil
+}
+
+func webSearchToolResult(definition llm.ToolDefinition, invocation llm.ToolInvocation, output WebSearchOutput) *llm.ToolResult {
 	result := &llm.ToolResult{
 		Kind: llm.ToolKindWebSearch, CallID: invocation.CallID, LogicalName: definition.LogicalName,
 		Status: llm.ToolResultStatusCompleted,
@@ -142,7 +186,24 @@ func (executor *WebSearchExecutor) Execute(ctx context.Context, definition llm.T
 			Kind: llm.ContentKindCitation, Citation: &llm.URLCitation{URL: source.URL, Title: source.Title},
 		})
 	}
-	return result, nil
+	return result
+}
+
+func validateWebSearchOutput(output WebSearchOutput, limit int64) error {
+	if len(output.Sources) > maxWebSearchSources {
+		return errors.New("web search response has too many sources")
+	}
+	used := int64(len(output.Text))
+	for index := range output.Sources {
+		used += int64(len(output.Sources[index].URL) + len(output.Sources[index].Title))
+		if used > limit {
+			return errors.New("web search response exceeds limit")
+		}
+	}
+	if used > limit {
+		return errors.New("web search response exceeds limit")
+	}
+	return nil
 }
 
 func webSearchInput(definition llm.ToolDefinition, invocation llm.ToolInvocation) (WebSearchInput, error) {

@@ -122,7 +122,7 @@ func (controller *Controller) streamMCP(ctx context.Context, request *llm.Reques
 		}
 	}
 	hostedRegistry, err := hosted.DiscoverRegistry(gatewayRequest, controller.config.Hosted, func(definition llm.ToolDefinition) bool {
-		return emulateHostedDefinition(gatewayRequest.APIFormat, rounds.TargetFormat(), definition)
+		return controller.emulateHostedDefinition(gatewayRequest.APIFormat, rounds.TargetFormat(), definition)
 	})
 	if err != nil {
 		closeOnError()
