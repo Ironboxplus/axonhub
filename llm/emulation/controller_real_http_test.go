@@ -1,6 +1,7 @@
 package emulation_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -187,6 +188,138 @@ func TestControllerRunsResponsesMCPThroughChatTargetOverRealHTTP(t *testing.T) {
 	require.NotNil(t, emulationObservation)
 	require.EqualValues(t, 2, emulationObservation.InternalRounds)
 	require.EqualValues(t, 1, emulationObservation.ToolCalls)
+}
+
+func TestControllerStopsAfterMCPInfrastructureFailureOverRealHTTP(t *testing.T) {
+	t.Parallel()
+	for _, stream := range []bool{false, true} {
+		stream := stream
+		t.Run(fmt.Sprintf("stream_%t", stream), func(t *testing.T) {
+			t.Parallel()
+			const authorization = "Bearer private-failing-mcp-token"
+			var mcpCalls atomic.Int64
+			mcpServer := newFailingControllerMCPServer(t, authorization, &mcpCalls)
+			allowedMCP, err := url.Parse(mcpServer.URL)
+			require.NoError(t, err)
+
+			var providerCalls atomic.Int64
+			provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				round := providerCalls.Add(1)
+				body, readErr := io.ReadAll(request.Body)
+				if readErr != nil {
+					http.Error(writer, "read", http.StatusBadRequest)
+					return
+				}
+				var payload struct {
+					Stream bool `json:"stream"`
+					Tools  []struct {
+						Type string `json:"type"`
+						Name string `json:"name"`
+					} `json:"tools"`
+				}
+				if round != 1 || json.Unmarshal(body, &payload) != nil || payload.Stream != stream || len(payload.Tools) != 1 ||
+					payload.Tools[0].Type != "function" || !strings.HasPrefix(payload.Tools[0].Name, "axon_mcp_") ||
+					bytes.Contains(body, []byte(authorization)) {
+					http.Error(writer, "unexpected provider request", http.StatusBadRequest)
+					return
+				}
+				if !stream {
+					writer.Header().Set("Content-Type", "application/json")
+					_, _ = fmt.Fprintf(writer, `{"id":"resp_mcp_failure","object":"response","created_at":1785383000,"model":"fixture-model","status":"completed","output":[{"id":"item_mcp_failure","type":"function_call","call_id":"mcp_failure_call","name":%q,"arguments":"{\"sku\":\"A-1\"}","status":"completed"}],"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}`, payload.Tools[0].Name)
+					return
+				}
+				writer.Header().Set("Content-Type", "text/event-stream")
+				flusher := writer.(http.Flusher)
+				writeFrame := func(eventType string, value map[string]any) {
+					encoded, _ := json.Marshal(value)
+					_, _ = fmt.Fprintf(writer, "event: %s\ndata: %s\n\n", eventType, encoded)
+					flusher.Flush()
+				}
+				writeFrame("response.created", map[string]any{
+					"type": "response.created", "sequence_number": 0,
+					"response": map[string]any{"id": "resp_mcp_failure", "object": "response", "model": "fixture-model", "status": "in_progress", "output": []any{}},
+				})
+				arguments := `{"sku":"A-1"}`
+				writeFrame("response.output_item.added", map[string]any{
+					"type": "response.output_item.added", "sequence_number": 1, "output_index": 0,
+					"item": map[string]any{"id": "item_mcp_failure", "type": "function_call", "status": "in_progress", "call_id": "mcp_failure_call", "name": payload.Tools[0].Name, "arguments": ""},
+				})
+				writeFrame("response.function_call_arguments.delta", map[string]any{
+					"type": "response.function_call_arguments.delta", "sequence_number": 2, "output_index": 0,
+					"item_id": "item_mcp_failure", "delta": arguments,
+				})
+				writeFrame("response.function_call_arguments.done", map[string]any{
+					"type": "response.function_call_arguments.done", "sequence_number": 3, "output_index": 0,
+					"item_id": "item_mcp_failure", "call_id": "mcp_failure_call", "name": payload.Tools[0].Name, "arguments": arguments,
+				})
+				writeFrame("response.output_item.done", map[string]any{
+					"type": "response.output_item.done", "sequence_number": 4, "output_index": 0,
+					"item": map[string]any{"id": "item_mcp_failure", "type": "function_call", "status": "completed", "call_id": "mcp_failure_call", "name": payload.Tools[0].Name, "arguments": arguments},
+				})
+				writeFrame("response.completed", map[string]any{
+					"type": "response.completed", "sequence_number": 5,
+					"response": map[string]any{"id": "resp_mcp_failure", "object": "response", "model": "fixture-model", "status": "completed", "output": []any{}, "usage": map[string]any{"input_tokens": 4, "output_tokens": 2, "total_tokens": 6}},
+				})
+			}))
+			t.Cleanup(provider.Close)
+
+			controller, err := emulation.NewController(emulation.ControllerConfig{
+				MCP: mcp.RegistryConfig{
+					SyntheticNameKey: []byte(strings.Repeat("failing-mcp-controller-key-", 2)),
+					EndpointPolicy: func(candidate *url.URL) error {
+						if candidate.Scheme != allowedMCP.Scheme || candidate.Host != allowedMCP.Host {
+							return fmt.Errorf("MCP endpoint is not allowlisted")
+						}
+						return nil
+					},
+				},
+				ForceMCPGateway: true,
+				MaxRounds:       4, MaxToolCalls: 8, MaxParallelCalls: 2,
+			})
+			require.NoError(t, err)
+			outbound, err := responses.NewOutboundTransformer(provider.URL, "provider-key")
+			require.NoError(t, err)
+			executor := httpclient.NewHttpClientWithProxy(&httpclient.ProxyConfig{Type: httpclient.ProxyTypeDisabled})
+			t.Cleanup(executor.CloseIdleConnections)
+			observer := &controllerObservationRecorder{}
+			requestBody := fmt.Sprintf(`{"model":"fixture-model","stream":%t,"input":"check stock","tools":[{"type":"mcp","server_label":"inventory","server_url":%q,"authorization":%q,"require_approval":"never"}]}`, stream, mcpServer.URL, authorization)
+			result, processErr := pipeline.NewFactory(executor).Pipeline(
+				responses.NewInboundTransformer(), conversion.NewOutbound(outbound),
+				pipeline.WithToolLoopController(controller), pipeline.WithObserver(observer),
+			).Process(context.Background(), &httpclient.Request{
+				Method: http.MethodPost, URL: "/v1/responses", Headers: http.Header{"Content-Type": []string{"application/json"}}, Body: []byte(requestBody),
+			})
+			if !stream {
+				require.Error(t, processErr)
+				require.Equal(t, "gateway tool loop failed: MCP tool execution failed", processErr.Error())
+				require.NotContains(t, processErr.Error(), "private MCP content_policy diagnostic")
+				require.Equal(t, &llm.ErrorDiagnostic{
+					Component: "mcp_gateway", Code: "mcp_transport", Message: "MCP tools/call failed: transport (HTTP 503)", StatusCode: http.StatusServiceUnavailable,
+				}, llm.ErrorDiagnosticFrom(processErr))
+			} else {
+				require.NoError(t, processErr)
+				require.True(t, result.Stream)
+				var eventTypes []string
+				var wire strings.Builder
+				for result.EventStream.Next() {
+					event := result.EventStream.Current()
+					if event != nil {
+						eventTypes = append(eventTypes, event.Type)
+						wire.Write(event.Data)
+					}
+				}
+				require.NoError(t, result.EventStream.Err())
+				require.Equal(t, 1, countString(eventTypes, "response.failed"))
+				require.Zero(t, countString(eventTypes, "response.completed"))
+				require.NotContains(t, wire.String(), "private MCP content_policy diagnostic")
+			}
+			require.EqualValues(t, 1, providerCalls.Load(), "MCP infrastructure failure must not trigger another provider round")
+			require.EqualValues(t, 1, mcpCalls.Load())
+			summary := observer.emulation()
+			require.NotNil(t, summary)
+			require.EqualValues(t, 1, summary.Failures)
+		})
+	}
 }
 
 func TestControllerRunsPortableResponsesMCPThroughForcedGatewayOverRealHTTP(t *testing.T) {
@@ -1665,6 +1798,47 @@ func newControllerMCPServer(t *testing.T, authorization string, calls *atomic.In
 			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"7"}],"structuredContent":{"available":7}}}`, envelope.ID)
 		default:
 			http.Error(w, "method", http.StatusBadRequest)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+func newFailingControllerMCPServer(t *testing.T, authorization string, calls *atomic.Int64) *httptest.Server {
+	t.Helper()
+	const sessionID = "controller-failing-mcp-session"
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Authorization") != authorization {
+			http.Error(writer, "authorization", http.StatusUnauthorized)
+			return
+		}
+		if request.Method == http.MethodDelete {
+			writer.WriteHeader(http.StatusNoContent)
+			return
+		}
+		var envelope struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+		}
+		if json.NewDecoder(request.Body).Decode(&envelope) != nil {
+			http.Error(writer, "decode", http.StatusBadRequest)
+			return
+		}
+		switch envelope.Method {
+		case "initialize":
+			writer.Header().Set("Content-Type", "application/json")
+			writer.Header().Set("Mcp-Session-Id", sessionID)
+			_, _ = fmt.Fprintf(writer, `{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"%s","capabilities":{"tools":{}},"serverInfo":{"name":"inventory","version":"1"}}}`, envelope.ID, mcp.ProtocolVersion)
+		case "notifications/initialized":
+			writer.WriteHeader(http.StatusAccepted)
+		case "tools/list":
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(writer, `{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"lookup","description":"look up stock","inputSchema":{"type":"object"}}]}}`, envelope.ID)
+		case "tools/call":
+			calls.Add(1)
+			http.Error(writer, "private MCP content_policy diagnostic Authorization: Bearer secret", http.StatusServiceUnavailable)
+		default:
+			http.Error(writer, "method", http.StatusBadRequest)
 		}
 	}))
 	t.Cleanup(server.Close)

@@ -309,6 +309,7 @@ type callExecution struct {
 	call   gatewayCall
 	result llm.Item
 	public llm.Item
+	err    error
 }
 
 type processedRound struct {
@@ -378,10 +379,8 @@ func (controller *Controller) processRound(
 	}
 	processed.approvals = len(approvals)
 	executions := controller.executeCalls(ctx, registry, executable)
-	for _, execution := range executions {
-		callID := execution.call.item.ToolCall.CallID
-		processed.replacements[callID] = execution.public
-		processed.results[callID] = execution.result
+	if err := appendMCPExecutions(processed, executions); err != nil {
+		return nil, err
 	}
 	hostedExecutions := controller.executeHostedCalls(ctx, hostedRegistry, hostedCalls)
 	if err := appendHostedExecutions(processed, hostedExecutions); err != nil {
@@ -627,17 +626,15 @@ func (controller *Controller) executeCalls(ctx context.Context, registry *mcp.Re
 			defer wait.Done()
 			defer func() {
 				if recover() != nil {
-					pipeline.RecordEmulationFailure(ctx)
 					slog.ErrorContext(ctx, "MCP executor panicked")
-					results[index] = failedExecution(registry, calls[index], errors.New("MCP executor panicked"))
+					results[index] = callExecution{call: calls[index], err: errors.New("MCP executor panicked")}
 				}
 			}()
 			select {
 			case semaphore <- struct{}{}:
 				defer func() { <-semaphore }()
 			case <-ctx.Done():
-				pipeline.RecordEmulationFailure(ctx)
-				results[index] = failedExecution(registry, calls[index], ctx.Err())
+				results[index] = callExecution{call: calls[index], err: ctx.Err()}
 				return
 			}
 			results[index] = executeCall(ctx, registry, calls[index])
@@ -651,18 +648,16 @@ func executeCall(ctx context.Context, registry *mcp.Registry, call gatewayCall) 
 	arguments, err := executableArguments(call.item.ToolCall)
 	if err != nil {
 		pipeline.RecordEmulationFailure(ctx)
-		return failedExecution(registry, call, err)
+		return failedMCPResultExecution(registry, call, err.Error())
 	}
 	if call.binding.IsDiscovery() {
 		result, tools, searchErr := registry.Search(call.binding, arguments)
 		if searchErr != nil {
-			pipeline.RecordEmulationFailure(ctx)
-			return failedExecution(registry, call, searchErr)
+			return callExecution{call: call, err: searchErr}
 		}
 		encoded, encodeErr := json.Marshal(result)
 		if encodeErr != nil {
-			pipeline.RecordEmulationFailure(ctx)
-			return failedExecution(registry, call, errors.New("encode MCP tool search result"))
+			return callExecution{call: call, err: errors.New("encode MCP tool search result")}
 		}
 		return callExecution{
 			call: call, result: toolResultItem(call, string(encoded), false),
@@ -671,13 +666,11 @@ func executeCall(ctx context.Context, registry *mcp.Registry, call gatewayCall) 
 	}
 	result, err := registry.Call(ctx, call.binding, arguments)
 	if err != nil {
-		pipeline.RecordEmulationFailure(ctx)
-		return failedExecution(registry, call, err)
+		return callExecution{call: call, err: err}
 	}
 	encoded, err := json.Marshal(result)
 	if err != nil {
-		pipeline.RecordEmulationFailure(ctx)
-		return failedExecution(registry, call, errors.New("encode MCP result"))
+		return callExecution{call: call, err: errors.New("encode MCP result")}
 	}
 	failed := result.IsError
 	status := llm.ItemStatusCompleted
@@ -700,11 +693,11 @@ func executeCall(ctx context.Context, registry *mcp.Registry, call gatewayCall) 
 	}
 }
 
-func failedExecution(registry *mcp.Registry, call gatewayCall, err error) callExecution {
-	message := "MCP tool execution failed"
-	if err != nil {
-		message = err.Error()
-	}
+// failedMCPResultExecution is reserved for bounded gateway validation failures
+// that the model can correct, such as malformed tool arguments. Transport,
+// protocol, remote, cancellation, panic, and internal encoding errors return a
+// Go error and terminate instead of being copied into another provider round.
+func failedMCPResultExecution(registry *mcp.Registry, call gatewayCall, message string) callExecution {
 	execution := callExecution{
 		call:   call,
 		result: toolResultItem(call, message, true),
@@ -722,6 +715,24 @@ func failedExecution(registry *mcp.Registry, call gatewayCall, err error) callEx
 	}
 	copyInvocationArguments(execution.public.MCPCall, call.item.ToolCall)
 	return execution
+}
+
+type mcpExecutionError struct{ cause error }
+
+func (*mcpExecutionError) Error() string { return "MCP tool execution failed" }
+
+func (err *mcpExecutionError) Unwrap() error { return err.cause }
+
+func appendMCPExecutions(processed *processedRound, executions []callExecution) error {
+	for _, execution := range executions {
+		if execution.err != nil {
+			return &mcpExecutionError{cause: execution.err}
+		}
+		callID := execution.call.item.ToolCall.CallID
+		processed.replacements[callID] = execution.public
+		processed.results[callID] = execution.result
+	}
+	return nil
 }
 
 func interruptedMCPCall(registry *mcp.Registry, call gatewayCall, status llm.ResponseStatus) llm.Item {
