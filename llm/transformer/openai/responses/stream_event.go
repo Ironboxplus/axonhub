@@ -73,6 +73,7 @@ const (
 // StreamEvent represents a streaming event from the OpenAI Responses API.
 // Reference: https://platform.openai.com/docs/api-reference/responses-streaming
 type StreamEvent struct {
+	Residual json.RawMessage `json:"-"`
 	// Common fields
 	Type           StreamEventType `json:"type"`
 	SequenceNumber *int            `json:"sequence_number,omitempty"`
@@ -119,8 +120,29 @@ type StreamEvent struct {
 	Param   *string `json:"param,omitempty"`
 }
 
+func (event *StreamEvent) UnmarshalJSON(data []byte) error {
+	type streamEventWire StreamEvent
+	var wire streamEventWire
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*event = StreamEvent(wire)
+	event.Residual = jsonObjectResidual(data, responsesStreamEventFields)
+	return nil
+}
+
+func (event StreamEvent) MarshalJSON() ([]byte, error) {
+	type streamEventWire StreamEvent
+	typed, err := json.Marshal(streamEventWire(event))
+	if err != nil {
+		return nil, err
+	}
+	return mergeResidualObject(typed, event.Residual)
+}
+
 // StreamEventContentPart represents a content part in streaming events.
 type StreamEventContentPart struct {
+	Residual json.RawMessage `json:"-"`
 	// Any of "output_text", "reasoning", "refusal".
 	Type string `json:"type"`
 	// The text of the part, for output_text.
@@ -129,6 +151,17 @@ type StreamEventContentPart struct {
 	Annotations []Annotation `json:"annotations,omitzero"`
 	// The refusal reason, for refusal.
 	Refusal *string `json:"refusal,omitempty"`
+}
+
+func (part *StreamEventContentPart) UnmarshalJSON(data []byte) error {
+	type contentPartWire StreamEventContentPart
+	var wire contentPartWire
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*part = StreamEventContentPart(wire)
+	part.Residual = jsonObjectResidual(data, responsesStreamPartFields)
+	return nil
 }
 
 // MarshalJSON keeps the Responses wire contract that output_text parts always
@@ -149,14 +182,19 @@ func (part StreamEventContentPart) MarshalJSON() ([]byte, error) {
 		}
 		// A dedicated shape is required because omitempty would otherwise erase
 		// the intentionally empty array.
-		return json.Marshal(struct {
+		typed, err := json.Marshal(struct {
 			Type        string       `json:"type"`
 			Text        string       `json:"text"`
 			Annotations []Annotation `json:"annotations"`
 			Refusal     *string      `json:"refusal,omitempty"`
 		}{wire.Type, wire.Text, wire.Annotations, wire.Refusal})
+		if err != nil {
+			return nil, err
+		}
+		return mergeResidualObject(typed, part.Residual)
 	}
-	return json.Marshal(wire)
+	typed, _ := json.Marshal(wire)
+	return mergeResidualObject(typed, part.Residual)
 }
 
 // MarshalStreamEvent marshals a StreamEvent to JSON bytes suitable for SSE.

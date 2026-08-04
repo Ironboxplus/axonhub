@@ -134,7 +134,9 @@ internal/server/static/dist/*
 !internal/server/static/dist/.gitkeep
 *.b64
 coverage.out
+.coverage/
 *.test
+*.test.exe
 *.backup
 
 .playwright-cli/

@@ -444,12 +444,20 @@ func TestResponsesMixedNamespaceToChatRejectsBeforeProviderHTTP(t *testing.T) {
 	require.Zero(t, providerCalls.Load(), "incomplete Responses-to-Chat plan reached provider")
 }
 
-func TestResponsesOpaqueToolMergeFailsClosedBeforeProviderWhenCanonicalLayoutChanges(t *testing.T) {
+func TestResponsesDeletedOpaqueToolIsNotReplayedOverRealHTTP(t *testing.T) {
 	t.Parallel()
 	var providerCalls atomic.Uint64
-	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		providerCalls.Add(1)
-		http.Error(w, "ambiguous opaque merge must not be dispatched", http.StatusInternalServerError)
+		body, err := io.ReadAll(request.Body)
+		require.NoError(t, err)
+		var payload struct {
+			Tools []json.RawMessage `json:"tools"`
+		}
+		require.NoError(t, json.Unmarshal(body, &payload))
+		require.Empty(t, payload.Tools, "deleted canonical tools were replayed from stale raw state")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_deleted_tool","object":"response","created_at":1,"model":"fixture-model","status":"completed","output":[{"id":"msg_1","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"ok","annotations":[]}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)
 	}))
 	t.Cleanup(provider.Close)
 
@@ -458,7 +466,7 @@ func TestResponsesOpaqueToolMergeFailsClosedBeforeProviderWhenCanonicalLayoutCha
 	executor := httpclient.NewHttpClientWithClient(provider.Client())
 	t.Cleanup(executor.CloseIdleConnections)
 
-	_, err = pipeline.NewFactory(executor).
+	result, err := pipeline.NewFactory(executor).
 		Pipeline(
 			canonicalToolRemovalInbound{Inbound: responses.NewInboundTransformer()},
 			conversion.NewOutbound(outbound),
@@ -474,6 +482,7 @@ func TestResponsesOpaqueToolMergeFailsClosedBeforeProviderWhenCanonicalLayoutCha
 				]}]
 			}`),
 		})
-	require.ErrorContains(t, err, "cannot safely merge opaque Responses tools after canonical tool count changed")
-	require.Zero(t, providerCalls.Load(), "ambiguous Responses identity merge reached provider")
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.EqualValues(t, 1, providerCalls.Load())
 }

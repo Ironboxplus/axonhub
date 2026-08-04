@@ -33,39 +33,44 @@ const (
 	ObjectContentBlock   ObjectKind = "content_block"
 	ObjectProviderData   ObjectKind = "provider_data"
 	ObjectCompaction     ObjectKind = "compaction"
+	ObjectRequestControl ObjectKind = "request_control"
 )
 
 type StrategyID string
 
 const (
-	StrategyNative              StrategyID = "native"
-	StrategyCustomAsFunction    StrategyID = "custom_as_function"
-	StrategyReasoningProject    StrategyID = "reasoning_projection"
-	StrategyCitationProject     StrategyID = "citation_projection"
-	StrategyHostedProject       StrategyID = "hosted_lifecycle_projection"
-	StrategyHostedGateway       StrategyID = "hosted_gateway"
-	StrategyClientToolAsFunc    StrategyID = "client_tool_as_function"
-	StrategyMCPGateway          StrategyID = "mcp_gateway"
-	StrategyAllowedTools        StrategyID = "allowed_tools_projection"
-	StrategyIdentifierNormalize StrategyID = "identifier_normalization"
-	StrategySchemaNormalize     StrategyID = "schema_normalization"
-	StrategyOpaqueSidecar       StrategyID = "opaque_sidecar"
-	StrategyCompactAsChat       StrategyID = "compact_as_chat"
-	StrategyUnavailable         StrategyID = "unavailable"
+	StrategyNative                     StrategyID = "native"
+	StrategyCustomAsFunction           StrategyID = "custom_as_function"
+	StrategyReasoningProject           StrategyID = "reasoning_projection"
+	StrategyCitationProject            StrategyID = "citation_projection"
+	StrategyHostedProject              StrategyID = "hosted_lifecycle_projection"
+	StrategyHostedGateway              StrategyID = "hosted_gateway"
+	StrategyClientToolAsFunc           StrategyID = "client_tool_as_function"
+	StrategyMCPGateway                 StrategyID = "mcp_gateway"
+	StrategyAllowedTools               StrategyID = "allowed_tools_projection"
+	StrategyToolDeclaration            StrategyID = "tool_declaration_projection"
+	StrategyRequestControl             StrategyID = "request_control_normalization"
+	StrategyRequestControlMultiplicity StrategyID = "request_control_multiplicity"
+	StrategyIdentifierNormalize        StrategyID = "identifier_normalization"
+	StrategySchemaNormalize            StrategyID = "schema_normalization"
+	StrategyOpaqueSidecar              StrategyID = "opaque_sidecar"
+	StrategyCompactAsChat              StrategyID = "compact_as_chat"
+	StrategyUnavailable                StrategyID = "unavailable"
 )
 
 type ReasonCode string
 
 const (
-	ReasonTargetNative       ReasonCode = "target_native"
-	ReasonTargetFunctionOnly ReasonCode = "target_function_only"
-	ReasonSemanticProjection ReasonCode = "semantic_projection"
-	ReasonGatewayExecution   ReasonCode = "gateway_execution"
-	ReasonProviderPrivate    ReasonCode = "provider_private"
-	ReasonSameProtocolOpaque ReasonCode = "same_protocol_opaque"
-	ReasonProtocolConstraint ReasonCode = "protocol_constraint"
-	ReasonTargetNoCompact    ReasonCode = "target_no_compact"
-	ReasonNoStrategy         ReasonCode = "no_strategy"
+	ReasonTargetNative            ReasonCode = "target_native"
+	ReasonTargetFunctionOnly      ReasonCode = "target_function_only"
+	ReasonSemanticProjection      ReasonCode = "semantic_projection"
+	ReasonGatewayExecution        ReasonCode = "gateway_execution"
+	ReasonProviderPrivate         ReasonCode = "provider_private"
+	ReasonSameProtocolOpaque      ReasonCode = "same_protocol_opaque"
+	ReasonProtocolConstraint      ReasonCode = "protocol_constraint"
+	ReasonDuplicateRequestControl ReasonCode = "duplicate_request_control"
+	ReasonTargetNoCompact         ReasonCode = "target_no_compact"
+	ReasonNoStrategy              ReasonCode = "no_strategy"
 )
 
 type ObjectRef struct {
@@ -78,11 +83,12 @@ type ObjectRef struct {
 }
 
 type Action struct {
-	Ref        ObjectRef
-	Kind       ActionKind
-	Strategy   StrategyID
-	Reason     ReasonCode
-	Reversible bool
+	Ref             ObjectRef
+	DestinationPath string
+	Kind            ActionKind
+	Strategy        StrategyID
+	Reason          ReasonCode
+	Reversible      bool
 }
 
 type CapabilityProfile struct {
@@ -149,6 +155,38 @@ type Plan struct {
 	Actions []Action
 	Summary llm.ConversionTraceSummary
 	Debug   *llm.ConversionDebugTrace
+}
+
+// ConversionPlanError preserves the bounded plan that rejected a request
+// before provider dispatch. Callers can expose its object-level evidence
+// without parsing an error string or retaining the request payload.
+type ConversionPlanError struct {
+	Cause error
+	Plan  *Plan
+}
+
+func (err *ConversionPlanError) Error() string {
+	if err == nil || err.Cause == nil {
+		return ErrIncompletePlan.Error()
+	}
+	return fmt.Sprintf("%s: %v", ErrIncompletePlan, err.Cause)
+}
+
+func (err *ConversionPlanError) Unwrap() []error {
+	if err == nil || err.Cause == nil {
+		return []error{ErrIncompletePlan}
+	}
+	return []error{ErrIncompletePlan, err.Cause}
+}
+
+// PlanFromError returns the exact bounded plan attached to a pre-dispatch
+// rejection. The plan contains no request payload or credentials.
+func PlanFromError(err error) (*Plan, bool) {
+	var planErr *ConversionPlanError
+	if !errors.As(err, &planErr) || planErr.Plan == nil {
+		return nil, false
+	}
+	return planErr.Plan, true
 }
 
 func (p *Plan) Complete() bool {

@@ -215,7 +215,7 @@ func TestInboundTransformer_TransformRequest(t *testing.T) {
 			},
 		},
 		{
-			name: "captures responses provider raw tools and tool choice",
+			name: "captures responses provider tools and tool choice as canonical owners",
 			httpReq: &httpclient.Request{
 				Body: []byte(`{
 					"model": "gpt-4o",
@@ -243,12 +243,18 @@ func TestInboundTransformer_TransformRequest(t *testing.T) {
 			expectError: false,
 			validate: func(t *testing.T, result *llm.Request) {
 				require.Len(t, result.Tools, 1)
-				require.NotNil(t, result.ProviderExtensions)
-				require.NotNil(t, result.ProviderExtensions.OpenAIResponses)
-				require.NotNil(t, result.ProviderExtensions.OpenAIResponses.Request)
-				require.Len(t, result.ProviderExtensions.OpenAIResponses.Request.RawTools, 1)
-				require.JSONEq(t, `{"type":"tool_search","name":"search_docs","namespace":"docs"}`, string(result.ProviderExtensions.OpenAIResponses.Request.RawTools[0].Raw))
-				require.JSONEq(t, `{"type":"tool_search","tools":[{"type":"tool_search","name":"search_docs"}]}`, string(result.ProviderExtensions.OpenAIResponses.Request.RawToolChoice))
+				require.Len(t, result.ToolDefinitions, 2)
+				require.Equal(t, llm.ToolKindUnknownBehavioral, result.ToolDefinitions[0].Kind)
+				require.Equal(t, "search_docs", result.ToolDefinitions[0].LogicalName)
+				require.NotNil(t, result.ToolChoice)
+				require.NotNil(t, result.ToolChoice.NamedToolChoice)
+				require.Equal(t, "tool_search", result.ToolChoice.NamedToolChoice.Type)
+				require.Len(t, result.ToolChoice.NamedToolChoice.Options, 1)
+				if result.ProviderExtensions != nil && result.ProviderExtensions.OpenAIResponses != nil &&
+					result.ProviderExtensions.OpenAIResponses.Request != nil {
+					require.Empty(t, result.ProviderExtensions.OpenAIResponses.Request.RawTools)
+					require.Empty(t, result.ProviderExtensions.OpenAIResponses.Request.RawToolChoice)
+				}
 			},
 		},
 		{

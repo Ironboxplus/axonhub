@@ -27,6 +27,10 @@ type Tool struct {
 	// not interpret. Only provider/client built-ins populate it; ordinary
 	// function and custom tools continue to use the typed representation.
 	Raw json.RawMessage `json:"-"`
+	// Residual contains future fields not owned by the typed Tool model. Unlike
+	// Raw, it is overlaid by current canonical fields during marshaling so an
+	// edited definition cannot be silently replaced by its stale source object.
+	Residual json.RawMessage `json:"-"`
 	// Any of "function", "image_generation", "custom", "web_search", "namespace", "mcp".
 	Type        string `json:"type,omitempty"`
 	Name        string `json:"name,omitempty"`
@@ -103,6 +107,7 @@ func (tool *Tool) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*tool = Tool(wire)
+	tool.Residual = responseToolResidual(data)
 	switch tool.Type {
 	case "file_search", "code_interpreter", "computer_use_preview", "computer", "shell", "apply_patch":
 		tool.Raw = append(json.RawMessage(nil), data...)
@@ -111,11 +116,12 @@ func (tool *Tool) UnmarshalJSON(data []byte) error {
 }
 
 func (tool Tool) MarshalJSON() ([]byte, error) {
-	if len(tool.Raw) > 0 && json.Valid(tool.Raw) {
-		return append([]byte(nil), tool.Raw...), nil
-	}
 	type toolWire Tool
-	return json.Marshal(toolWire(tool))
+	raw, err := json.Marshal(toolWire(tool))
+	if err != nil {
+		return nil, err
+	}
+	return mergeResidualObject(raw, tool.Residual)
 }
 
 type WebSearchFilters struct {
@@ -238,6 +244,7 @@ type StreamOptions struct {
 
 // ToolChoice represents how the model should select which tool to use (for requests).
 type ToolChoice struct {
+	Residual json.RawMessage `json:"-"`
 	// Mode can be "none", "auto", "required".
 	Mode *string `json:"mode,omitempty"`
 	// Type for specific tool choice. Any of "function", "file_search", "web_search", "shell" etc.
@@ -250,9 +257,27 @@ type ToolChoice struct {
 }
 
 type ToolOption struct {
-	Type        string `json:"type"`
-	Name        string `json:"name,omitempty"`
-	ServerLabel string `json:"server_label,omitempty"`
+	Residual    json.RawMessage `json:"-"`
+	Type        string          `json:"type"`
+	Name        string          `json:"name,omitempty"`
+	ServerLabel string          `json:"server_label,omitempty"`
+}
+
+func (option *ToolOption) UnmarshalJSON(data []byte) error {
+	type optionWire ToolOption
+	var wire optionWire
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*option = ToolOption(wire)
+	option.Residual = jsonObjectResidual(data, responsesToolOptionFields)
+	return nil
+}
+
+func (option ToolOption) MarshalJSON() ([]byte, error) {
+	type optionWire ToolOption
+	typed, _ := json.Marshal(optionWire(option))
+	return mergeResidualObject(typed, option.Residual)
 }
 
 type ToolChoiceAlias ToolChoice
@@ -261,12 +286,14 @@ func (t *ToolChoice) UnmarshalJSON(data []byte) error {
 	mode, err := xjson.To[string](data)
 	if err == nil {
 		t.Mode = &mode
+		t.Residual = nil
 		return nil
 	}
 
 	tc, err := xjson.To[ToolChoiceAlias](data)
 	if err == nil {
 		*t = ToolChoice(tc)
+		t.Residual = responseToolChoiceResidual(data)
 		return nil
 	}
 
@@ -279,9 +306,7 @@ func (t *ToolChoice) MarshalJSON() ([]byte, error) {
 	}
 
 	// For other cases, marshal as object
-	type Alias ToolChoice
-
-	return json.Marshal(&struct {
+	raw, _ := json.Marshal(&struct {
 		Mode  *string      `json:"mode,omitempty"`
 		Type  *string      `json:"type,omitempty"`
 		Name  *string      `json:"name,omitempty"`
@@ -292,6 +317,7 @@ func (t *ToolChoice) MarshalJSON() ([]byte, error) {
 		Name:  t.Name,
 		Tools: t.Tools,
 	})
+	return mergeResidualObject(raw, t.Residual)
 }
 
 // ResponseToolChoice represents tool_choice in responses, which can be a string or object.
@@ -431,6 +457,7 @@ func (i Input) MarshalJSON() ([]byte, error) {
 }
 
 type Annotation struct {
+	Residual json.RawMessage `json:"-"`
 	// Type is the type of annotation, e.g., "url_citation".
 	Type string `json:"type,omitempty"`
 	// StartIndex is the start offset of the annotated span in the output text.
@@ -456,6 +483,7 @@ func (a *Annotation) UnmarshalJSON(data []byte) error {
 	}
 
 	*a = Annotation(raw.rawAnnotation)
+	a.Residual = jsonObjectResidual(data, responsesAnnotationFields)
 	if a.URLCitation == nil && (raw.URL != nil || raw.Title != nil) {
 		a.URLCitation = &URLCitation{}
 		if raw.URL != nil {
@@ -469,12 +497,53 @@ func (a *Annotation) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+func (a Annotation) MarshalJSON() ([]byte, error) {
+	type rawAnnotation Annotation
+	wire := rawAnnotation(a)
+	var source map[string]json.RawMessage
+	_ = json.Unmarshal(a.Residual, &source)
+	_, hadURL := source["url"]
+	_, hadTitle := source["title"]
+	if a.URLCitation != nil && (hadURL || hadTitle) {
+		wire.URLCitation = nil
+		typed, _ := json.Marshal(struct {
+			rawAnnotation
+			URL   string `json:"url,omitempty"`
+			Title string `json:"title,omitempty"`
+		}{rawAnnotation: wire, URL: a.URLCitation.URL, Title: a.URLCitation.Title})
+		return mergeResidualObject(typed, a.Residual)
+	}
+	typed, err := json.Marshal(wire)
+	if err != nil {
+		return nil, err
+	}
+	return mergeResidualObject(typed, a.Residual)
+}
+
 // URLCitation represents a URL-based citation.
 type URLCitation struct {
+	Residual json.RawMessage `json:"-"`
 	// URL is the citation URL.
 	URL string `json:"url,omitempty"`
 	// Title is the title of the cited source.
 	Title string `json:"title,omitempty"`
+}
+
+func (citation *URLCitation) UnmarshalJSON(data []byte) error {
+	type citationWire URLCitation
+	var wire citationWire
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*citation = URLCitation(wire)
+	citation.Residual = jsonObjectResidual(data, responsesCitationFields)
+	return nil
+}
+
+func (citation URLCitation) MarshalJSON() ([]byte, error) {
+	type citationWire URLCitation
+	typed, _ := json.Marshal(citationWire(citation))
+	return mergeResidualObject(typed, citation.Residual)
 }
 
 const responsesWebSearchCallsTransformerMetadataKey = "openai_responses_web_search_calls"
@@ -486,9 +555,27 @@ type responsesReasoningItemMetadata struct {
 }
 
 type WebSearchSource struct {
-	Type  string `json:"type,omitempty"`
-	URL   string `json:"url,omitempty"`
-	Title string `json:"title,omitempty"`
+	Residual json.RawMessage `json:"-"`
+	Type     string          `json:"type,omitempty"`
+	URL      string          `json:"url,omitempty"`
+	Title    string          `json:"title,omitempty"`
+}
+
+func (source *WebSearchSource) UnmarshalJSON(data []byte) error {
+	type sourceWire WebSearchSource
+	var wire sourceWire
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*source = WebSearchSource(wire)
+	source.Residual = jsonObjectResidual(data, responsesWebSourceFields)
+	return nil
+}
+
+func (source WebSearchSource) MarshalJSON() ([]byte, error) {
+	type sourceWire WebSearchSource
+	typed, _ := json.Marshal(sourceWire(source))
+	return mergeResidualObject(typed, source.Residual)
 }
 
 type WebSearchAction struct {
@@ -508,21 +595,58 @@ type LocalShellAction struct {
 }
 
 type ComputerSafetyCheck struct {
-	ID      string `json:"id,omitempty"`
-	Code    string `json:"code,omitempty"`
-	Message string `json:"message,omitempty"`
+	Residual json.RawMessage `json:"-"`
+	ID       string          `json:"id,omitempty"`
+	Code     string          `json:"code,omitempty"`
+	Message  string          `json:"message,omitempty"`
+}
+
+func (check *ComputerSafetyCheck) UnmarshalJSON(data []byte) error {
+	type checkWire ComputerSafetyCheck
+	var wire checkWire
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*check = ComputerSafetyCheck(wire)
+	check.Residual = jsonObjectResidual(data, responsesSafetyCheckFields)
+	return nil
+}
+
+func (check ComputerSafetyCheck) MarshalJSON() ([]byte, error) {
+	type checkWire ComputerSafetyCheck
+	typed, _ := json.Marshal(checkWire(check))
+	return mergeResidualObject(typed, check.Residual)
 }
 
 type ComputerScreenshot struct {
-	Type     string `json:"type"`
-	FileID   string `json:"file_id,omitempty"`
-	ImageURL string `json:"image_url,omitempty"`
+	Residual json.RawMessage `json:"-"`
+	Type     string          `json:"type"`
+	FileID   string          `json:"file_id,omitempty"`
+	ImageURL string          `json:"image_url,omitempty"`
+}
+
+func (screenshot *ComputerScreenshot) UnmarshalJSON(data []byte) error {
+	type screenshotWire ComputerScreenshot
+	var wire screenshotWire
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*screenshot = ComputerScreenshot(wire)
+	screenshot.Residual = jsonObjectResidual(data, responsesScreenshotFields)
+	return nil
+}
+
+func (screenshot ComputerScreenshot) MarshalJSON() ([]byte, error) {
+	type screenshotWire ComputerScreenshot
+	typed, _ := json.Marshal(screenshotWire(screenshot))
+	return mergeResidualObject(typed, screenshot.Residual)
 }
 
 // ItemAction is the polymorphic "action" field of an output item.
 // ImageGenerationAction and WebSearch are mutually exclusive;
 // if both are set, ImageGenerationAction takes precedence during marshaling.
 type ItemAction struct {
+	Residual json.RawMessage
 	// ImageGenerationAction holds the bare-string action for image_generation_call items
 	// (e.g. "generate", "edit").
 	ImageGenerationAction string
@@ -563,6 +687,7 @@ func (a *ItemAction) UnmarshalJSON(data []byte) error {
 		a.ImageGenerationAction = str
 		a.LocalShell = nil
 		a.WebSearch = nil
+		a.Residual = nil
 
 		return nil
 	}
@@ -578,6 +703,7 @@ func (a *ItemAction) UnmarshalJSON(data []byte) error {
 		a.ImageGenerationAction = ""
 		a.LocalShell = &action
 		a.WebSearch = nil
+		a.Residual = responseItemActionResidual(data)
 		return nil
 	}
 
@@ -587,6 +713,7 @@ func (a *ItemAction) UnmarshalJSON(data []byte) error {
 		a.ImageGenerationAction = ""
 		a.LocalShell = nil
 		a.WebSearch = &obj
+		a.Residual = responseItemActionResidual(data)
 
 		return nil
 	}
@@ -598,21 +725,30 @@ func (a ItemAction) MarshalJSON() ([]byte, error) {
 	if a.ImageGenerationAction != "" {
 		return json.Marshal(a.ImageGenerationAction)
 	}
+	var typed json.RawMessage
+	var err error
 	if a.LocalShell != nil {
-		return json.Marshal(a.LocalShell)
+		typed, err = json.Marshal(a.LocalShell)
+	} else if a.WebSearch != nil {
+		typed, err = json.Marshal(a.WebSearch)
+	} else {
+		return []byte("null"), nil
 	}
-
-	if a.WebSearch != nil {
-		return json.Marshal(a.WebSearch)
+	if err != nil {
+		return nil, err
 	}
-
-	return []byte("null"), nil
+	return mergeResidualObject(typed, a.Residual)
 }
 
 // Item is a unified structure for both input and output items in the Responses API.
 // This follows the openai-go pattern where input and output items share the same structure.
 // Reference: github.com/openai/openai-go/v3/responses.ResponseOutputItemUnion.
 type Item struct {
+	// Residual contains source fields not owned by the typed wire model. Custom
+	// marshaling overlays the current typed object on this residual so canonical
+	// edits win while future fields remain attached to their original object.
+	Residual json.RawMessage `json:"-"`
+
 	// The ID of the item, generated by the server.
 	ID string `json:"id,omitempty"`
 
@@ -741,11 +877,11 @@ func (item *Item) UnmarshalJSON(data []byte) error {
 	}
 
 	*item = Item(raw.itemAlias)
+	item.Residual = responseItemResidual(data)
 	if len(raw.Action) > 0 && !bytes.Equal(raw.Action, []byte("null")) {
 		if item.Type == "computer_call" || item.Type == "shell_call" {
-			if !json.Valid(raw.Action) {
-				return fmt.Errorf("computer_call action must be valid JSON")
-			}
+			// raw.Action came from a successful outer JSON decode and is therefore
+			// already syntactically valid. Keep it byte-for-byte for future variants.
 			item.ComputerAction = append(json.RawMessage(nil), raw.Action...)
 		} else {
 			var action ItemAction
@@ -763,9 +899,8 @@ func (item *Item) UnmarshalJSON(data []byte) error {
 			}
 			item.ComputerOutput = &output
 		} else if item.Type == "shell_call_output" {
-			if !json.Valid(raw.Output) {
-				return fmt.Errorf("shell_call_output output must be valid JSON")
-			}
+			// raw.Output is valid JSON by construction; its provider-owned shape is
+			// intentionally not narrowed here.
 			item.RawOutput = append(json.RawMessage(nil), raw.Output...)
 		} else {
 			var output Input
@@ -796,9 +931,7 @@ func (item *Item) UnmarshalJSON(data []byte) error {
 	}
 
 	var compacted bytes.Buffer
-	if err := json.Compact(&compacted, raw.Arguments); err != nil {
-		return err
-	}
+	_ = json.Compact(&compacted, raw.Arguments)
 	item.Arguments = compacted.String()
 
 	return nil
@@ -806,6 +939,14 @@ func (item *Item) UnmarshalJSON(data []byte) error {
 
 // MarshalJSON omits summary for non-reasoning items and forces an empty array for reasoning items.
 func (item Item) MarshalJSON() ([]byte, error) {
+	raw, err := item.marshalTypedJSON()
+	if err != nil {
+		return nil, err
+	}
+	return mergeResidualObject(raw, item.Residual)
+}
+
+func (item Item) marshalTypedJSON() ([]byte, error) {
 	type itemAlias Item
 
 	if item.Type == "computer_call" || item.Type == "shell_call" {
@@ -951,10 +1092,31 @@ func (item Item) MarshalJSON() ([]byte, error) {
 // result. Raw JSON retains arbitrary JSON Schema and MCP annotation objects
 // without routing them through a provider-private sidecar.
 type MCPListedTool struct {
+	Residual    json.RawMessage `json:"-"`
 	Name        string          `json:"name"`
 	Description string          `json:"description,omitempty"`
 	InputSchema json.RawMessage `json:"input_schema"`
 	Annotations json.RawMessage `json:"annotations,omitempty"`
+}
+
+func (tool *MCPListedTool) UnmarshalJSON(data []byte) error {
+	type toolWire MCPListedTool
+	var wire toolWire
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*tool = MCPListedTool(wire)
+	tool.Residual = jsonObjectResidual(data, responsesMCPListedToolFields)
+	return nil
+}
+
+func (tool MCPListedTool) MarshalJSON() ([]byte, error) {
+	type toolWire MCPListedTool
+	typed, err := json.Marshal(toolWire(tool))
+	if err != nil {
+		return nil, err
+	}
+	return mergeResidualObject(typed, tool.Residual)
 }
 
 // isOutputMessageContent checks if Content.Items contains output message content items.
@@ -1017,21 +1179,60 @@ func (item *Item) SetContentItems(items []ContentItem) {
 
 // ReasoningSummary represents a summary text from the model.
 type ReasoningSummary struct {
+	Residual json.RawMessage `json:"-"`
 	// A summary of the reasoning output from the model.
 	Text string `json:"text"`
 	// The type of the object. Always "summary_text".
 	Type string `json:"type"`
 }
 
+func (summary *ReasoningSummary) UnmarshalJSON(data []byte) error {
+	type summaryWire ReasoningSummary
+	var wire summaryWire
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*summary = ReasoningSummary(wire)
+	summary.Residual = jsonObjectResidual(data, responsesSummaryFields)
+	return nil
+}
+
+func (summary ReasoningSummary) MarshalJSON() ([]byte, error) {
+	type summaryWire ReasoningSummary
+	typed, _ := json.Marshal(summaryWire(summary))
+	return mergeResidualObject(typed, summary.Residual)
+}
+
 // ReasoningContent represents reasoning text from the model.
 type ReasoningContent struct {
+	Residual json.RawMessage `json:"-"`
 	// The reasoning text from the model.
 	Text string `json:"text"`
 	// The type of the reasoning text. Always "reasoning_text".
 	Type string `json:"type"`
 }
 
+func (content *ReasoningContent) UnmarshalJSON(data []byte) error {
+	type contentWire ReasoningContent
+	var wire contentWire
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*content = ReasoningContent(wire)
+	content.Residual = jsonObjectResidual(data, responsesReasoningFields)
+	return nil
+}
+
+func (content ReasoningContent) MarshalJSON() ([]byte, error) {
+	type contentWire ReasoningContent
+	typed, _ := json.Marshal(contentWire(content))
+	return mergeResidualObject(typed, content.Residual)
+}
+
 type Response struct {
+	// Residual contains provider response fields not owned by the typed model.
+	// Current canonical fields overlay it during an identity projection.
+	Residual json.RawMessage `json:"-"`
 	// The object type of this resource - always set to "response".
 	Object string `json:"object"`
 	// Unique identifier for this Response.
@@ -1121,6 +1322,26 @@ type Response struct {
 
 	// A stable identifier for your end-users (deprecated, use safety_identifier).
 	User *string `json:"user,omitempty"`
+}
+
+func (response *Response) UnmarshalJSON(data []byte) error {
+	type responseWire Response
+	var wire responseWire
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*response = Response(wire)
+	response.Residual = responseResponseResidual(data)
+	return nil
+}
+
+func (response Response) MarshalJSON() ([]byte, error) {
+	type responseWire Response
+	raw, err := json.Marshal(responseWire(response))
+	if err != nil {
+		return nil, err
+	}
+	return mergeResidualObject(raw, response.Residual)
 }
 
 type ContentItem struct {

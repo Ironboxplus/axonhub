@@ -19,6 +19,10 @@ const (
 	// MaxConversionDebugActions is a hard privacy and storage bound. Callers
 	// cannot raise it through configuration.
 	MaxConversionDebugActions = 64
+	// DefaultRequiredConversionActions bounds evidence that is retained even
+	// when full debug sampling is disabled. Required evidence contains only
+	// compatibility changes and failures, never native pass-through actions.
+	DefaultRequiredConversionActions = 32
 )
 
 type conversionDebugTraceConfig struct {
@@ -70,29 +74,83 @@ const (
 	ConversionDirectionStream   ConversionDirection = "stream"
 )
 
+// ConversionEvidenceMode distinguishes always-on compatibility/failure
+// evidence from sampled full traces. Required mode intentionally omits the
+// request-scoped logical hash; ObjectID is already a payload-free structural
+// location such as input[3].content[1].
+type ConversionEvidenceMode string
+
+const (
+	ConversionEvidenceRequired ConversionEvidenceMode = "required"
+	ConversionEvidenceSampled  ConversionEvidenceMode = "sampled"
+)
+
+// ConversionEvidenceStage is a closed, user-facing processing boundary. It
+// deliberately avoids internal Go function names.
+type ConversionEvidenceStage string
+
+const (
+	ConversionStageRequestPlanning  ConversionEvidenceStage = "request_planning"
+	ConversionStageRequestTransform ConversionEvidenceStage = "request_transform"
+	ConversionStageResponseRestore  ConversionEvidenceStage = "response_restore"
+	ConversionStageStreamRestore    ConversionEvidenceStage = "stream_restore"
+)
+
+// ConversionEvidenceResult describes what happened to one canonical object or
+// field at the stage above.
+type ConversionEvidenceResult string
+
+const (
+	ConversionResultNative      ConversionEvidenceResult = "native"
+	ConversionResultLowered     ConversionEvidenceResult = "lowered"
+	ConversionResultEmulated    ConversionEvidenceResult = "emulated"
+	ConversionResultOpaque      ConversionEvidenceResult = "opaque"
+	ConversionResultUnknown     ConversionEvidenceResult = "unknown"
+	ConversionResultRestored    ConversionEvidenceResult = "restored"
+	ConversionResultRestoreMiss ConversionEvidenceResult = "restore_miss"
+	ConversionResultNormalized  ConversionEvidenceResult = "normalized"
+	ConversionResultRepaired    ConversionEvidenceResult = "repaired"
+)
+
+type ConversionEvidenceSeverity string
+
+const (
+	ConversionSeverityInfo     ConversionEvidenceSeverity = "info"
+	ConversionSeverityWarning  ConversionEvidenceSeverity = "warning"
+	ConversionSeverityCritical ConversionEvidenceSeverity = "critical"
+)
+
 // ConversionActionTrace explains one sampled conversion decision without
 // carrying payloads, names, call IDs, schemas, arguments, results, or URLs.
 type ConversionActionTrace struct {
-	Seq           uint32              `json:"seq"`
-	Direction     ConversionDirection `json:"direction"`
-	ObjectKind    string              `json:"object_kind"`
-	Action        string              `json:"action"`
-	Strategy      string              `json:"strategy"`
-	Reason        string              `json:"reason"`
-	Reversible    bool                `json:"reversible"`
-	LogicalIDHash string              `json:"logical_id_hash"`
+	Seq             uint32                     `json:"seq"`
+	Direction       ConversionDirection        `json:"direction"`
+	ObjectKind      string                     `json:"object_kind"`
+	ObjectID        string                     `json:"object_id"`
+	FieldPath       string                     `json:"field_path"`
+	DestinationPath string                     `json:"destination_path,omitempty"`
+	Stage           ConversionEvidenceStage    `json:"stage"`
+	Action          string                     `json:"action"`
+	Strategy        string                     `json:"strategy"`
+	Reason          string                     `json:"reason"`
+	Result          ConversionEvidenceResult   `json:"result"`
+	Severity        ConversionEvidenceSeverity `json:"severity"`
+	Reversible      bool                       `json:"reversible"`
+	LogicalIDHash   string                     `json:"logical_id_hash,omitempty"`
 }
 
 // ConversionDebugTrace is emitted only for sampled requests. Actions are
 // always bounded by MaxConversionDebugActions; Truncated preserves evidence
 // that additional decisions existed without retaining them.
 type ConversionDebugTrace struct {
+	Mode      ConversionEvidenceMode  `json:"mode"`
 	Actions   []ConversionActionTrace `json:"actions,omitempty"`
 	Truncated uint32                  `json:"truncated,omitempty"`
 
-	key        [sha256.Size]byte
-	maxActions int
-	mu         sync.Mutex
+	key           [sha256.Size]byte
+	maxActions    int
+	hashLogicalID bool
+	mu            sync.Mutex
 }
 
 // NewConversionDebugTrace returns nil unless the caller explicitly enabled
@@ -111,20 +169,33 @@ func NewConversionDebugTrace(ctx context.Context, expectedActions int) *Conversi
 		capacity = 0
 	}
 	return &ConversionDebugTrace{
+		Mode:          ConversionEvidenceSampled,
+		Actions:       make([]ConversionActionTrace, 0, capacity),
+		key:           config.key,
+		maxActions:    config.maxActions,
+		hashLogicalID: true,
+	}
+}
+
+// NewRequiredConversionDebugTrace creates a bounded trace for compatibility
+// changes and failures that must remain observable even when sampling is off.
+// Callers must still avoid invoking it for native-only requests.
+func NewRequiredConversionDebugTrace(expectedActions int) *ConversionDebugTrace {
+	maxActions := DefaultRequiredConversionActions
+	capacity := min(expectedActions, maxActions)
+	if capacity < 0 {
+		capacity = 0
+	}
+	return &ConversionDebugTrace{
+		Mode:       ConversionEvidenceRequired,
 		Actions:    make([]ConversionActionTrace, 0, capacity),
-		key:        config.key,
-		maxActions: config.maxActions,
+		maxActions: maxActions,
 	}
 }
 
 // Append records a payload-free decision. logicalRef must be a structural
 // reference (indexes/kinds), never a raw tool name or provider call ID.
-func (trace *ConversionDebugTrace) Append(
-	direction ConversionDirection,
-	objectKind, action, strategy, reason string,
-	reversible bool,
-	logicalRef []byte,
-) {
+func (trace *ConversionDebugTrace) Append(action ConversionActionTrace, logicalRef []byte) {
 	if trace == nil {
 		return
 	}
@@ -134,21 +205,16 @@ func (trace *ConversionDebugTrace) Append(
 		trace.Truncated++
 		return
 	}
-	hasher := hmac.New(sha256.New, trace.key[:])
-	_, _ = hasher.Write(logicalRef)
-	digest := hasher.Sum(nil)
-	var logicalHash [16]byte
-	hex.Encode(logicalHash[:], digest[:8])
-	trace.Actions = append(trace.Actions, ConversionActionTrace{
-		Seq:           uint32(len(trace.Actions) + 1),
-		Direction:     direction,
-		ObjectKind:    objectKind,
-		Action:        action,
-		Strategy:      strategy,
-		Reason:        reason,
-		Reversible:    reversible,
-		LogicalIDHash: string(logicalHash[:]),
-	})
+	action.Seq = uint32(len(trace.Actions) + 1)
+	if trace.hashLogicalID {
+		hasher := hmac.New(sha256.New, trace.key[:])
+		_, _ = hasher.Write(logicalRef)
+		digest := hasher.Sum(nil)
+		var logicalHash [16]byte
+		hex.Encode(logicalHash[:], digest[:8])
+		action.LogicalIDHash = string(logicalHash[:])
+	}
+	trace.Actions = append(trace.Actions, action)
 }
 
 // Clone returns a persistence-safe snapshot with no request-scoped hash key.
@@ -159,6 +225,7 @@ func (trace *ConversionDebugTrace) Clone() *ConversionDebugTrace {
 	trace.mu.Lock()
 	defer trace.mu.Unlock()
 	return &ConversionDebugTrace{
+		Mode:      trace.Mode,
 		Actions:   append([]ConversionActionTrace(nil), trace.Actions...),
 		Truncated: trace.Truncated,
 	}

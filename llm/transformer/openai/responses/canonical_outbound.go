@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
-	"sort"
 	"strings"
 
 	"github.com/looplj/axonhub/llm"
@@ -27,6 +26,7 @@ func canonicalRequestTools(request *llm.Request) ([]Tool, bool, error) {
 		if err := definition.Validate(); err != nil {
 			return nil, true, fmt.Errorf("canonical tool %d: %w", index, err)
 		}
+		toolStart := len(tools)
 		switch definition.Kind {
 		case llm.ToolKindFunction:
 			parameters := make(map[string]any)
@@ -41,6 +41,9 @@ func canonicalRequestTools(request *llm.Request) ([]Tool, bool, error) {
 				DeferLoading: definition.DeferLoading,
 			}
 			if namespace := definition.Function.Namespace; namespace != "" {
+				if responseResidualOwnedByWire(definition.ProtocolHints, function.Type) {
+					function.Residual = cloneRaw(definition.ProtocolHints.SourceResidual)
+				}
 				function.Name = strings.TrimPrefix(definition.LogicalName, namespace+"__")
 				if namespaceIndex, ok := namespaceIndexes[namespace]; ok {
 					tools[namespaceIndex].Tools = append(tools[namespaceIndex].Tools, function)
@@ -58,6 +61,9 @@ func canonicalRequestTools(request *llm.Request) ([]Tool, bool, error) {
 			}
 			custom := Tool{Type: "custom", Name: definition.LogicalName, Description: definition.Description, Format: format, DeferLoading: definition.DeferLoading}
 			if namespace := definition.Freeform.Namespace; namespace != "" {
+				if responseResidualOwnedByWire(definition.ProtocolHints, custom.Type) {
+					custom.Residual = cloneRaw(definition.ProtocolHints.SourceResidual)
+				}
 				custom.Name = strings.TrimPrefix(definition.LogicalName, namespace+"__")
 				if namespaceIndex, ok := namespaceIndexes[namespace]; ok {
 					tools[namespaceIndex].Tools = append(tools[namespaceIndex].Tools, custom)
@@ -148,9 +154,37 @@ func canonicalRequestTools(request *llm.Request) ([]Tool, bool, error) {
 				return nil, true, fmt.Errorf("encode canonical MCP tool %d: %w", index, err)
 			}
 			tools = append(tools, tool)
+		case llm.ToolKindUnknownBehavioral:
+			if definition.ProtocolHints.SourceFormat != llm.APIFormatOpenAIResponse || definition.Hosted == nil ||
+				len(definition.Hosted.Configuration) == 0 {
+				return nil, true, fmt.Errorf("canonical opaque tool %d has no Responses source object", index)
+			}
+			var tool Tool
+			if err := json.Unmarshal(definition.Hosted.Configuration, &tool); err != nil {
+				return nil, true, fmt.Errorf("decode canonical opaque tool %d: %w", index, err)
+			}
+			if namespace := definition.Hosted.Namespace; namespace != "" {
+				if namespaceIndex, ok := namespaceIndexes[namespace]; ok {
+					tools[namespaceIndex].Tools = append(tools[namespaceIndex].Tools, tool)
+				} else {
+					namespaceIndexes[namespace] = len(tools)
+					tools = append(tools, Tool{Type: "namespace", Name: namespace, Tools: []Tool{tool}})
+				}
+				continue
+			}
+			tools = append(tools, tool)
 		default:
 			return nil, true, fmt.Errorf("canonical tool %d kind %q has no Responses encoding", index, definition.Kind)
 		}
+		if len(tools) > toolStart && len(definition.ProtocolHints.SourceResidual) > 0 &&
+			responseResidualOwnedByWire(definition.ProtocolHints, tools[len(tools)-1].Type) {
+			tools[len(tools)-1].Residual = cloneRaw(definition.ProtocolHints.SourceResidual)
+		} else if len(tools) > toolStart {
+			tools[len(tools)-1].Residual = nil
+		}
+	}
+	if extension := openAIResponsesRequestExtensions(request); extension != nil {
+		applyToolNamespaceDeclarations(tools, extension.ToolNamespaces)
 	}
 	return tools, true, nil
 }
@@ -256,22 +290,20 @@ func responsesMCPToolFilterObject(filter *llm.MCPToolFilter) (json.RawMessage, e
 }
 
 // canonicalRequestInput converts ordered canonical items directly to Responses
-// wire items. Responses needs this path on both identity and cross-protocol
-// routes because item_id and call_id are distinct identities; unknown native
-// items are still replayed by the raw sidecar merge in marshalRequestPayload.
+// wire items. Request.Input order is authoritative after inbound conversion;
+// source ordinals remain diagnostics and must never undo canonical mutation.
 func canonicalRequestInput(request *llm.Request) (Input, string, bool, error) {
 	if request == nil || len(request.Input) == 0 {
 		return Input{}, "", false, nil
 	}
-	type placedItem struct {
-		ordinal  int
-		sequence int
-		wire     Item
+	canonicalInput, _, err := llm.NormalizeRequestControls(request.Input)
+	if err != nil {
+		return Input{}, "", true, err
 	}
-	placed := make([]placedItem, 0, len(request.Input))
+	items := make([]Item, 0, len(canonicalInput))
 	var instructions []string
-	for index := range request.Input {
-		item := &request.Input[index]
+	for index := range canonicalInput {
+		item := &canonicalInput[index]
 		if item.Kind == llm.ItemKindMessage {
 			// Only reconstruct the top-level instructions field when the item
 			// actually originated there. System/developer message items are valid
@@ -283,70 +315,85 @@ func canonicalRequestInput(request *llm.Request) (Input, string, bool, error) {
 				continue
 			}
 		}
-		// Unknown Responses items are replayed by the raw sidecar. Hosted items
-		// are structurally represented and must pass through the typed encoder;
-		// on an identity route it overlays canonical state onto ProviderData so
-		// Responses-private fields survive without duplicating the item.
-		if item.ProtocolHints.SourceFormat == llm.APIFormatOpenAIResponse &&
-			item.Kind == llm.ItemKindUnknown {
+		if item.Kind == llm.ItemKindToolDeclaration {
+			wire, err := canonicalToolDeclarationToResponses(request, item)
+			if err != nil {
+				return Input{}, "", true, fmt.Errorf("canonical input item %d tool declaration: %w", index, err)
+			}
+			items = append(items, wire)
 			continue
 		}
 		wire, ok := canonicalItemToResponses(item)
 		if !ok {
 			return Input{}, "", true, fmt.Errorf("canonical input item %d kind %q has no Responses encoding", index, item.Kind)
 		}
-		ordinal := len(request.Input) + index
-		if item.ProtocolHints.SourceFormat == llm.APIFormatOpenAIResponse && item.ProtocolHints.Ordinal >= 0 {
-			ordinal = item.ProtocolHints.Ordinal
-		}
-		placed = append(placed, placedItem{ordinal: ordinal, sequence: len(placed), wire: wire})
+		items = append(items, wire)
 		if item.Kind == llm.ItemKindHostedCall && item.HostedCall != nil && item.HostedCall.Result != nil {
 			if output, outputOK := canonicalHostedResultToResponses(item.HostedCall.Invocation.Kind, item.HostedCall.Result); outputOK {
-				placed = append(placed, placedItem{ordinal: ordinal, sequence: len(placed), wire: output})
+				items = append(items, output)
 			}
 		}
 	}
+	return Input{Items: items}, strings.Join(instructions, "\n"), true, nil
+}
 
-	type declarationGroup struct {
-		role        llm.Role
-		definitions []llm.ToolDefinition
+func canonicalToolDeclarationToResponses(request *llm.Request, item *llm.Item) (Item, error) {
+	if request == nil || item == nil || item.ToolDeclaration == nil || item.ToolDeclaration.SourceGroup == "" {
+		return Item{}, fmt.Errorf("missing declaration source group")
 	}
-	groups := make(map[int]*declarationGroup)
+	definitions := make([]llm.ToolDefinition, 0)
 	for index := range request.ToolDefinitions {
 		definition := request.ToolDefinitions[index]
-		hints := definition.ProtocolHints
-		if hints.SourceFormat != llm.APIFormatOpenAIResponse || hints.SourceType != "additional_tools" {
+		if definition.ProtocolHints.SourceGroup != item.ToolDeclaration.SourceGroup {
 			continue
 		}
-		group := groups[hints.Ordinal]
-		if group == nil {
-			group = &declarationGroup{role: hints.SourceRole}
-			groups[hints.Ordinal] = group
+		ownerType := definition.ProtocolHints.ResidualOwnerType
+		if ownerType == "" {
+			ownerType = definition.ProtocolHints.SourceType
 		}
-		definition.ProtocolHints = llm.ProtocolHints{}
-		group.definitions = append(group.definitions, definition)
-	}
-	for ordinal, group := range groups {
-		tools, _, err := canonicalRequestTools(&llm.Request{ToolDefinitions: group.definitions})
-		if err != nil {
-			return Input{}, "", true, fmt.Errorf("encode Responses additional_tools item %d: %w", ordinal, err)
+		definition.ProtocolHints = llm.ProtocolHints{
+			SourceFormat:      llm.APIFormatOpenAIResponse,
+			SourceType:        ownerType,
+			ResidualOwnerType: ownerType,
+			SourceResidual:    cloneRaw(definition.ProtocolHints.SourceResidual),
 		}
-		placed = append(placed, placedItem{
-			ordinal: ordinal, sequence: len(placed),
-			wire: Item{Type: "additional_tools", Role: string(group.role), AdditionalTools: tools},
-		})
+		definitions = append(definitions, definition)
 	}
-	sort.SliceStable(placed, func(i, j int) bool {
-		if placed[i].ordinal == placed[j].ordinal {
-			return placed[i].sequence < placed[j].sequence
+	tools, represented, err := canonicalRequestTools(&llm.Request{ToolDefinitions: definitions})
+	if err != nil {
+		return Item{}, err
+	}
+	if !represented && len(definitions) > 0 {
+		return Item{}, fmt.Errorf("declaration group %q has no Responses encoding", item.ToolDeclaration.SourceGroup)
+	}
+	applyToolNamespaceDeclarations(tools, item.ToolDeclaration.Namespaces)
+	return Item{
+		Type: "additional_tools", Role: string(item.Role), AdditionalTools: tools,
+		Residual: cloneRaw(item.ProtocolHints.SourceResidual),
+	}, nil
+}
+
+func applyToolNamespaceDeclarations(tools []Tool, declarations []llm.ToolNamespaceDeclaration) {
+	if len(tools) == 0 || len(declarations) == 0 {
+		return
+	}
+	byName := make(map[string]*llm.ToolNamespaceDeclaration, len(declarations))
+	for index := range declarations {
+		declaration := &declarations[index]
+		byName[declaration.Name] = declaration
+	}
+	for index := range tools {
+		tool := &tools[index]
+		if tool.Type != "namespace" {
+			continue
 		}
-		return placed[i].ordinal < placed[j].ordinal
-	})
-	items := make([]Item, 0, len(placed))
-	for index := range placed {
-		items = append(items, placed[index].wire)
+		declaration := byName[tool.Name]
+		if declaration == nil {
+			continue
+		}
+		tool.Description = declaration.Description
+		tool.Residual = cloneRaw(declaration.SourceResidual)
 	}
-	return Input{Items: items}, strings.Join(instructions, "\n"), true, nil
 }
 
 func canonicalHostedResultToResponses(kind llm.ToolKind, result *llm.ToolResult) (Item, bool) {
@@ -386,6 +433,18 @@ func canonicalHostedResultToResponses(kind llm.ToolKind, result *llm.ToolResult)
 }
 
 func canonicalItemToResponses(item *llm.Item) (Item, bool) {
+	wire, ok := canonicalItemToResponsesTyped(item)
+	if ok && item != nil {
+		if responseResidualOwnedByWire(item.ProtocolHints, wire.Type) {
+			wire.Residual = cloneRaw(item.ProtocolHints.SourceResidual)
+		} else {
+			wire.Residual = nil
+		}
+	}
+	return wire, ok
+}
+
+func canonicalItemToResponsesTyped(item *llm.Item) (Item, bool) {
 	if item == nil {
 		return Item{}, false
 	}
@@ -400,16 +459,41 @@ func canonicalItemToResponses(item *llm.Item) (Item, bool) {
 		if item.Reasoning == nil {
 			return Item{}, false
 		}
-		summary := make([]ReasoningSummary, 0, 1)
-		if item.Reasoning.Content != "" {
+		summary := make([]ReasoningSummary, 0, len(item.Reasoning.SummaryParts)+1)
+		for index := range item.Reasoning.SummaryParts {
+			part := &item.Reasoning.SummaryParts[index]
+			residual := reasoningPartResidualForWire(part, part.Type)
+			summary = append(summary, ReasoningSummary{Type: part.Type, Text: part.Text, Residual: residual})
+		}
+		if len(summary) == 0 && len(item.Reasoning.ContentParts) == 0 && item.Reasoning.Content != "" {
 			summary = append(summary, ReasoningSummary{Type: "summary_text", Text: item.Reasoning.Content})
+		}
+		reasoningContent := make([]ReasoningContent, 0, len(item.Reasoning.ContentParts))
+		for index := range item.Reasoning.ContentParts {
+			part := &item.Reasoning.ContentParts[index]
+			residual := reasoningPartResidualForWire(part, part.Type)
+			reasoningContent = append(reasoningContent, ReasoningContent{Type: part.Type, Text: part.Text, Residual: residual})
 		}
 		var encrypted *string
 		if item.Reasoning.Signature != "" {
 			value := item.Reasoning.Signature
 			encrypted = &value
 		}
-		return Item{ID: item.ID, Type: "reasoning", Summary: summary, EncryptedContent: encrypted, Status: responsesStatus(item.Status)}, true
+		wire := Item{ID: item.ID, Type: "reasoning", Summary: summary, EncryptedContent: encrypted, Status: responsesStatus(item.Status)}
+		if len(reasoningContent) > 0 {
+			if item.Reasoning.ContentField == "content" {
+				content := make([]Item, 0, len(reasoningContent))
+				for index := range reasoningContent {
+					part := &reasoningContent[index]
+					text := part.Text
+					content = append(content, Item{Type: part.Type, Text: &text, Residual: cloneRaw(part.Residual)})
+				}
+				wire.Content = &Input{Items: content}
+			} else {
+				wire.ReasoningContent = reasoningContent
+			}
+		}
+		return wire, true
 	case llm.ItemKindToolCall:
 		if item.ToolCall == nil {
 			return Item{}, false
@@ -513,6 +597,7 @@ func canonicalItemToResponses(item *llm.Item) (Item, bool) {
 				Name: tool.Name, Description: tool.Description,
 				InputSchema: append(json.RawMessage(nil), tool.InputSchema...),
 				Annotations: append(json.RawMessage(nil), tool.Annotations...),
+				Residual:    cloneRaw(tool.SourceResidual),
 			})
 		}
 		var itemError *string
@@ -644,6 +729,11 @@ func canonicalItemToResponses(item *llm.Item) (Item, bool) {
 			itemType = "compaction_summary"
 		}
 		return Item{ID: item.ID, Type: itemType, EncryptedContent: &encrypted, CreatedBy: createdBy, Status: responsesStatus(item.Status)}, true
+	case llm.ItemKindCompactionTrigger:
+		if item.CompactionTrigger == nil {
+			return Item{}, false
+		}
+		return Item{Type: "compaction_trigger"}, true
 	case llm.ItemKindUnknown:
 		if item.Unknown == nil || item.ProtocolHints.SourceFormat != llm.APIFormatOpenAIResponse {
 			return Item{}, false
@@ -652,6 +742,7 @@ func canonicalItemToResponses(item *llm.Item) (Item, bool) {
 		if json.Unmarshal(item.Unknown.Raw, &wire) != nil {
 			return Item{}, false
 		}
+		wire.Residual = append(json.RawMessage(nil), item.Unknown.Raw...)
 		return wire, true
 	default:
 		return Item{}, false
@@ -724,7 +815,10 @@ func canonicalResponsesWebSearchAction(invocation *llm.ToolInvocation, result *l
 			if result.Content[index].Kind != llm.ContentKindCitation || citation == nil {
 				continue
 			}
-			action.Sources = append(action.Sources, WebSearchSource{Type: "url", URL: citation.URL, Title: citation.Title})
+			action.Sources = append(action.Sources, WebSearchSource{
+				Type: "url", URL: citation.URL, Title: citation.Title,
+				Residual: cloneRaw(citation.SourceResidual),
+			})
 		}
 	}
 	return NewWebSearchAction(action)
@@ -737,7 +831,10 @@ func canonicalSafetyChecksToResponses(checks []llm.ToolSafetyCheck) []ComputerSa
 	result := make([]ComputerSafetyCheck, 0, len(checks))
 	for index := range checks {
 		check := &checks[index]
-		result = append(result, ComputerSafetyCheck{ID: check.ID, Code: check.Code, Message: check.Message})
+		result = append(result, ComputerSafetyCheck{
+			ID: check.ID, Code: check.Code, Message: check.Message,
+			Residual: cloneRaw(check.SourceResidual),
+		})
 	}
 	return result
 }
@@ -785,11 +882,11 @@ func canonicalContentToResponses(blocks []llm.ContentBlock, assistant bool) []It
 			if assistant {
 				itemType = "output_text"
 			}
-			items = append(items, Item{ID: block.ID, Type: itemType, Text: &value})
+			items = append(items, Item{ID: block.ID, Type: itemType, Text: &value, Residual: contentResidualForWire(block, itemType)})
 		case llm.ContentKindImage:
 			if block.Image != nil {
 				url := block.Image.URL
-				items = append(items, Item{ID: block.ID, Type: "input_image", ImageURL: &url, Detail: block.Image.Detail})
+				items = append(items, Item{ID: block.ID, Type: "input_image", ImageURL: &url, Detail: block.Image.Detail, Residual: contentResidualForWire(block, "input_image")})
 			}
 		case llm.ContentKindDocument:
 			if assistant || block.Document == nil {
@@ -806,6 +903,7 @@ func canonicalContentToResponses(blocks []llm.ContentBlock, assistant bool) []It
 			default:
 				continue
 			}
+			item.Residual = contentResidualForWire(block, "input_file")
 			items = append(items, item)
 		case llm.ContentKindCitation:
 			if len(items) == 0 || block.Citation == nil {
@@ -813,11 +911,43 @@ func canonicalContentToResponses(blocks []llm.ContentBlock, assistant bool) []It
 			}
 			items[len(items)-1].Annotations = append(items[len(items)-1].Annotations, Annotation{
 				Type: "url_citation", StartIndex: block.StartIndex, EndIndex: block.EndIndex,
-				URLCitation: &URLCitation{URL: block.Citation.URL, Title: block.Citation.Title},
+				URLCitation: &URLCitation{
+					URL: block.Citation.URL, Title: block.Citation.Title,
+					Residual: cloneRaw(block.Citation.SourceResidual),
+				},
+				Residual: contentResidualForWire(block, "url_citation"),
 			})
+		case llm.ContentKindUnknown:
+			if json.Valid(block.UnknownRaw) {
+				items = append(items, Item{Residual: cloneRaw(block.UnknownRaw)})
+			}
 		}
 	}
 	return items
+}
+
+func contentResidualForWire(block *llm.ContentBlock, wireType string) json.RawMessage {
+	if block == nil || len(block.SourceResidual) == 0 {
+		return nil
+	}
+	ownerType := block.ResidualOwnerType
+	if ownerType == "" || ownerType == wireType {
+		return cloneRaw(block.SourceResidual)
+	}
+	if wireType == "input_text" && (ownerType == "text" || ownerType == "") {
+		return cloneRaw(block.SourceResidual)
+	}
+	return nil
+}
+
+func reasoningPartResidualForWire(part *llm.ReasoningPart, wireType string) json.RawMessage {
+	if part == nil || len(part.SourceResidual) == 0 {
+		return nil
+	}
+	if part.ResidualOwnerType == "" || part.ResidualOwnerType == wireType {
+		return cloneRaw(part.SourceResidual)
+	}
+	return nil
 }
 
 // ensureResponsesOutputAnnotations applies the Responses response contract

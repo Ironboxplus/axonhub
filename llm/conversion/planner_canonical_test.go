@@ -558,18 +558,18 @@ func TestPlannerLowersCrossProtocolReasoningAndRejectsOnlyUnknownContent(t *test
 	}
 }
 
-func TestPlannerKeepsResponsesPrivateSidecarsOnlyOnNativeResponsesTarget(t *testing.T) {
+func TestPlannerKeepsResponsesOpaqueCanonicalToolOnlyOnNativeResponsesTarget(t *testing.T) {
 	request := &llm.Request{
 		APIFormat: llm.APIFormatOpenAIResponse,
-		ProviderExtensions: &llm.ProviderExtensions{OpenAIResponses: &llm.OpenAIResponsesProviderExtensions{
-			Request: &llm.OpenAIResponsesRequestExtensions{RawTools: []llm.OpenAIResponsesRawFragment{{
-				Type: "future_hosted_tool", OriginalIndex: 0, Raw: []byte(`{"type":"future_hosted_tool"}`),
-			}}},
+		ToolDefinitions: []llm.ToolDefinition{{
+			Kind: llm.ToolKindUnknownBehavioral, LogicalName: "future_hosted_tool",
+			Hosted:    &llm.HostedToolDefinition{Type: "future_hosted_tool", Configuration: []byte(`{"type":"future_hosted_tool"}`)},
+			Execution: llm.ExecutionOwnerProvider,
 		}},
 	}
 
 	native, err := NewPlanner().Plan(request, llm.APIFormatOpenAIResponse)
-	if err != nil || native.Summary.Opaque != 1 || !native.Complete() {
+	if err != nil || native.Summary.Native != 1 || !native.Complete() {
 		t.Fatalf("native sidecar plan = %#v, err=%v", native, err)
 	}
 	cross, err := NewPlanner().Plan(request, llm.APIFormatAnthropicMessage)

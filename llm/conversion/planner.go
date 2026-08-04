@@ -2,6 +2,7 @@ package conversion
 
 import (
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/looplj/axonhub/llm"
@@ -24,7 +25,60 @@ func NewPlannerWithProfile(profile CapabilityProfile) *Planner {
 }
 
 func (p *Planner) Plan(request *llm.Request, targetFormat llm.APIFormat) (*Plan, error) {
-	return p.plan(request, targetFormat, false)
+	_, plan, err := p.preparePlan(request, targetFormat, false)
+	if plan != nil {
+		plan.Debug = buildConversionDebugTrace(nil, plan.Actions)
+	}
+	return plan, err
+}
+
+func (p *Planner) preparePlan(request *llm.Request, targetFormat llm.APIFormat, trace bool) (*llm.Request, *Plan, error) {
+	prepared, adjustments, err := normalizeRequestControlRequest(request)
+	if err != nil {
+		plan := p.requestControlFailurePlan(request, targetFormat, trace, err)
+		return request, plan, &ConversionPlanError{Cause: err, Plan: plan}
+	}
+	plan, err := p.plan(prepared, targetFormat, trace)
+	appendRequestControlActions(plan, adjustments)
+	return prepared, plan, err
+}
+
+func (p *Planner) profileFor(targetFormat llm.APIFormat) (CapabilityProfile, bool) {
+	profile, ok := ProfileFor(targetFormat)
+	if p != nil && p.profile != nil && p.profile.APIFormat == targetFormat {
+		return *p.profile, true
+	}
+	if !ok {
+		return CapabilityProfile{ID: "unknown/v1", APIFormat: targetFormat}, false
+	}
+	return profile, true
+}
+
+func (p *Planner) requestControlFailurePlan(request *llm.Request, targetFormat llm.APIFormat, trace bool, cause error) *Plan {
+	startedAt := time.Time{}
+	if trace {
+		startedAt = time.Now()
+	}
+	profile, _ := p.profileFor(targetFormat)
+	itemIndex := -1
+	var controlErr *llm.RequestControlError
+	if errors.As(cause, &controlErr) {
+		itemIndex = controlErr.Index
+	}
+	plan := &Plan{Target: profile}
+	if request != nil {
+		plan.Source = request.APIFormat
+	}
+	plan.Actions = []Action{{
+		Ref: ObjectRef{
+			Kind: ObjectRequestControl, ToolIndex: -1, ItemIndex: itemIndex,
+			ContentIndex: -1, MessageIndex: -1, ToolCallIndex: -1,
+		},
+		Kind: ActionUnknown, Strategy: StrategyRequestControlMultiplicity,
+		Reason: ReasonDuplicateRequestControl,
+	}}
+	plan.Summary = summarizePlan(plan.Source, profile, plan.Actions, startedAt)
+	return plan
 }
 
 func (p *Planner) plan(request *llm.Request, targetFormat llm.APIFormat, trace bool) (*Plan, error) {
@@ -32,14 +86,7 @@ func (p *Planner) plan(request *llm.Request, targetFormat llm.APIFormat, trace b
 	if trace {
 		startedAt = time.Now()
 	}
-	profile, ok := ProfileFor(targetFormat)
-	if p != nil && p.profile != nil && p.profile.APIFormat == targetFormat {
-		profile = *p.profile
-		ok = true
-	}
-	if !ok {
-		profile = CapabilityProfile{ID: "unknown/v1", APIFormat: targetFormat}
-	}
+	profile, ok := p.profileFor(targetFormat)
 	plan := &Plan{
 		Target: profile,
 	}
@@ -186,11 +233,23 @@ func (p *Planner) plan(request *llm.Request, targetFormat llm.APIFormat, trace b
 				plan.Actions = append(plan.Actions, actionForReasoningItem(request.APIFormat, profile.APIFormat, itemIndex))
 			case llm.ItemKindHostedCall:
 				plan.Actions = append(plan.Actions, actionForHostedCall(request.APIFormat, profile, item, itemIndex))
-			case llm.ItemKindCompaction:
+			case llm.ItemKindCompaction, llm.ItemKindCompactionTrigger:
 				if request.APIFormat == profile.APIFormat && profile.APIFormat == llm.APIFormatOpenAIResponse {
 					plan.Actions = append(plan.Actions, nativeItemAction(itemIndex))
 				} else {
 					plan.Actions = append(plan.Actions, unknownItemAction(itemIndex, ReasonProviderPrivate))
+				}
+			case llm.ItemKindToolDeclaration:
+				if request.APIFormat == profile.APIFormat && profile.APIFormat == llm.APIFormatOpenAIResponse {
+					plan.Actions = append(plan.Actions, nativeItemAction(itemIndex))
+				} else {
+					// The declaration is a Responses-specific placement container.
+					// Its executable behavior already lives in ToolDefinitions, which
+					// the target encoder projects into its native global tool list.
+					plan.Actions = append(plan.Actions, Action{
+						Ref:  ObjectRef{Kind: ObjectInputItem, ToolIndex: -1, ItemIndex: itemIndex, ContentIndex: -1, MessageIndex: -1, ToolCallIndex: -1},
+						Kind: ActionLower, Strategy: StrategyToolDeclaration, Reason: ReasonSemanticProjection, Reversible: false,
+					})
 				}
 			case llm.ItemKindMCPListTools, llm.ItemKindMCPApprovalRequest,
 				llm.ItemKindMCPApprovalResponse, llm.ItemKindMCPCall:
@@ -383,26 +442,6 @@ func appendResponsesExtensionActions(plan *Plan, request *llm.Request, target ll
 		return
 	}
 	extension := request.ProviderExtensions.OpenAIResponses.Request
-	appendAction := func(ref ObjectRef, behaviorRepresented bool) {
-		if request.APIFormat == target {
-			plan.Actions = append(plan.Actions, Action{
-				Ref: ref, Kind: ActionOpaque, Strategy: StrategyOpaqueSidecar,
-				Reason: ReasonSameProtocolOpaque, Reversible: true,
-			})
-			return
-		}
-		if behaviorRepresented {
-			plan.Actions = append(plan.Actions, Action{
-				Ref: ref, Kind: ActionLower, Strategy: StrategyOpaqueSidecar,
-				Reason: ReasonSemanticProjection, Reversible: false,
-			})
-			return
-		}
-		plan.Actions = append(plan.Actions, Action{
-			Ref: ref, Kind: ActionUnknown, Strategy: StrategyUnavailable,
-			Reason: ReasonProviderPrivate,
-		})
-	}
 	appendReasoningContextAction := func(ref ObjectRef) {
 		if request.APIFormat == target {
 			plan.Actions = append(plan.Actions, Action{
@@ -421,21 +460,6 @@ func appendResponsesExtensionActions(plan *Plan, request *llm.Request, target ll
 			Ref: ref, Kind: ActionLower, Strategy: StrategyReasoningProject,
 			Reason: ReasonProtocolConstraint, Reversible: false,
 		})
-	}
-	for index := range extension.RawTools {
-		appendAction(ObjectRef{
-			Kind: ObjectToolDefinition, ToolIndex: extension.RawTools[index].OriginalIndex,
-			ItemIndex: -1, MessageIndex: -1, ToolCallIndex: -1,
-		}, false)
-	}
-	for index := range extension.RawInputItems {
-		appendAction(ObjectRef{
-			Kind: ObjectProviderData, ToolIndex: -1, ItemIndex: extension.RawInputItems[index].OriginalIndex,
-			MessageIndex: -1, ToolCallIndex: -1,
-		}, extension.RawInputItems[index].BehaviorFullyRepresented)
-	}
-	if len(extension.RawToolChoice) > 0 {
-		appendAction(ObjectRef{Kind: ObjectToolChoice, ToolIndex: -1, ItemIndex: -1, MessageIndex: -1, ToolCallIndex: -1}, false)
 	}
 	if extension.ReasoningContext != "" {
 		appendReasoningContextAction(ObjectRef{Kind: ObjectProviderData, ToolIndex: -1, ItemIndex: -1, MessageIndex: -1, ToolCallIndex: -1})

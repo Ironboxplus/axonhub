@@ -38,6 +38,7 @@ const (
 	StreamInvariantResponseState StreamInvariantCode = "response_state_violation"
 	StreamInvariantItemState     StreamInvariantCode = "item_state_violation"
 	StreamInvariantToolState     StreamInvariantCode = "tool_state_violation"
+	StreamInvariantOutputIndex   StreamInvariantCode = "output_index_collision"
 	StreamInvariantOpenItems     StreamInvariantCode = "terminal_with_open_items"
 	StreamInvariantInvalidEvent  StreamInvariantCode = "invalid_event"
 )
@@ -81,14 +82,16 @@ type StreamStateMachine struct {
 	response   ResponseStreamState
 	terminal   EventKind
 	items      map[string]streamItemLifecycle
+	outputKeys map[int]string
 	lastSeq    uint64
 	hasLastSeq bool
 }
 
 func NewStreamStateMachine() *StreamStateMachine {
 	return &StreamStateMachine{
-		response: ResponseStreamStateInit,
-		items:    make(map[string]streamItemLifecycle),
+		response:   ResponseStreamStateInit,
+		items:      make(map[string]streamItemLifecycle),
+		outputKeys: make(map[int]string),
 	}
 }
 
@@ -169,6 +172,19 @@ func (machine *StreamStateMachine) addItem(event Event) error {
 	key, _ := event.ItemRef.key()
 	if current, exists := machine.items[key]; exists && current.state != StreamItemStateUnknown {
 		return machine.violation(StreamInvariantItemState, event, key, current, fmt.Errorf("item already %s", current.state))
+	}
+	if event.ItemRef.OutputIndex != nil {
+		outputIndex := *event.ItemRef.OutputIndex
+		if existingKey, exists := machine.outputKeys[outputIndex]; exists && existingKey != key {
+			return machine.violation(
+				StreamInvariantOutputIndex,
+				event,
+				key,
+				streamItemLifecycle{},
+				fmt.Errorf("output index %d already belongs to %s", outputIndex, existingKey),
+			)
+		}
+		machine.outputKeys[outputIndex] = key
 	}
 	lifecycle := streamItemLifecycle{state: StreamItemStateAdded, kind: event.Snapshot.Kind}
 	if event.Snapshot.Kind == ItemKindToolCall || event.Snapshot.Kind == ItemKindMCPCall {

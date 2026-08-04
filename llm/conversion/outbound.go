@@ -3,6 +3,8 @@ package conversion
 import (
 	"context"
 	"errors"
+	"fmt"
+	"time"
 
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/httpclient"
@@ -41,11 +43,25 @@ func NewOutbound(wrapped transformer.Outbound, options ...OutboundOption) *Outbo
 	return outbound
 }
 
+// WithCapabilityProfile binds both candidate preflight and the actual
+// attempt-local transform to the same effective channel capabilities. Hosts
+// should merge protocol defaults and registered emulators once, then pass the
+// resulting profile here instead of running a separate planner.
+func WithCapabilityProfile(profile CapabilityProfile) OutboundOption {
+	return func(outbound *Outbound) {
+		outbound.planner = NewPlannerWithProfile(profile)
+	}
+}
+
 // Preflight proves that this concrete target has a complete plan before any
 // provider encoder is invoked. Orchestrators use it while filtering channel
 // candidates; TransformRequest repeats the plan on the attempt-local clone.
 func (o *Outbound) Preflight(request *llm.Request) (*Plan, error) {
-	return o.planner.Plan(request, o.wrapped.APIFormat())
+	plan, err := o.planner.Plan(request, o.wrapped.APIFormat())
+	if err == nil && plan != nil {
+		err = plan.Validate()
+	}
+	return plan, err
 }
 
 func (o *Outbound) APIFormat() llm.APIFormat {
@@ -58,14 +74,14 @@ func (o *Outbound) UnwrapOutbound() transformer.Outbound {
 
 func (o *Outbound) TransformRequest(ctx context.Context, request *llm.Request) (*httpclient.Request, error) {
 	trace := llm.ConversionTraceEnabled(ctx)
-	plan, err := o.planner.plan(request, o.wrapped.APIFormat(), trace)
+	prepared, plan, err := o.planner.preparePlan(request, o.wrapped.APIFormat(), trace)
 	if plan != nil {
 		plan.Debug = buildConversionDebugTrace(ctx, plan.Actions)
 	}
 	if err != nil {
 		return nil, err
 	}
-	projected, err := projectCanonical(request, o.wrapped.APIFormat())
+	projected, err := projectCanonical(prepared, o.wrapped.APIFormat())
 	if err != nil {
 		return nil, err
 	}
@@ -86,6 +102,36 @@ func (o *Outbound) TransformRequest(ctx context.Context, request *llm.Request) (
 	session.continuation = o.continuation
 	setRequestSession(httpRequest, session)
 	return httpRequest, nil
+}
+
+func normalizeRequestControlRequest(request *llm.Request) (*llm.Request, []llm.RequestControlAdjustment, error) {
+	if request == nil {
+		return nil, nil, nil
+	}
+	input, adjustments, err := llm.NormalizeRequestControls(request.Input)
+	if err != nil || len(adjustments) == 0 {
+		return request, adjustments, err
+	}
+	prepared := request.Clone()
+	prepared.Input = input
+	return prepared, adjustments, nil
+}
+
+func appendRequestControlActions(plan *Plan, adjustments []llm.RequestControlAdjustment) {
+	if plan == nil || len(adjustments) == 0 {
+		return
+	}
+	for index := range adjustments {
+		adjustment := &adjustments[index]
+		plan.Actions = append(plan.Actions, Action{
+			Ref:             ObjectRef{Kind: ObjectRequestControl, ToolIndex: -1, ItemIndex: adjustment.FromIndex, ContentIndex: -1, MessageIndex: -1, ToolCallIndex: -1},
+			DestinationPath: fmt.Sprintf("input[%d]", adjustment.ToIndex),
+			Kind:            ActionLower, Strategy: StrategyRequestControl, Reason: ReasonProtocolConstraint, Reversible: true,
+		})
+	}
+	planNanos := plan.Summary.PlanNanos
+	plan.Summary = summarizePlan(plan.Source, plan.Target, plan.Actions, time.Time{})
+	plan.Summary.PlanNanos = planNanos
 }
 
 func (o *Outbound) TransformResponse(ctx context.Context, response *httpclient.Response) (*llm.Response, error) {

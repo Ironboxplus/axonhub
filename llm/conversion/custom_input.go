@@ -67,7 +67,7 @@ func restoreCustomInput(
 		session.recordCustomInputRepair(callID, direction, ref)
 		return input, true
 	default:
-		session.recordCustomInputRawFallback(callID)
+		session.recordCustomInputRawFallback(callID, direction, ref)
 		return input, false
 	}
 }

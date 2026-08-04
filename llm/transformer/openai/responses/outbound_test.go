@@ -246,7 +246,7 @@ func TestOutboundTransformer_TransformRequest_WebSearchRequiredToolChoice(t *tes
 	require.Equal(t, "required", payload["tool_choice"])
 }
 
-func TestOutboundTransformer_TransformRequest_ReplaysProviderRawToolsAndToolChoice(t *testing.T) {
+func TestOutboundTransformer_TransformRequest_EncodesCanonicalOpaqueToolAndChoice(t *testing.T) {
 	inbound := NewInboundTransformer()
 	inboundReq := &httpclient.Request{
 		Body: []byte(`{
@@ -373,28 +373,19 @@ func TestOutboundTransformer_TransformRequest_PreservesMixedNamespaceOnlyOnRespo
 
 	llmReq, err := inbound.TransformRequest(context.Background(), inboundReq)
 	require.NoError(t, err)
-	require.Len(t, llmReq.ToolDefinitions, 3)
+	require.Len(t, llmReq.ToolDefinitions, 4)
 	require.Len(t, llmReq.Tools, 3)
 
 	ext := openAIResponsesRequestExtensions(llmReq)
 	require.NotNil(t, ext)
-	require.Len(t, ext.RawTools, 1)
-	require.Equal(t, 0, ext.RawTools[0].OriginalIndex)
-	require.Equal(t, 1, ext.RawTools[0].RepresentedToolCount)
-	require.JSONEq(t, `{
-		"type":"namespace",
-		"name":"project",
-		"tools":[
-			{"type":"function","name":"list","parameters":{"type":"object"}},
-			{"type":"custom","name":"patch","description":"Apply a patch"},
-			{"type":"future_nested_tool","name":"future"}
-		]
-	}`, string(ext.RawTools[0].Raw))
+	require.Empty(t, ext.RawTools)
+	require.Len(t, ext.ToolNamespaces, 1)
+	require.Equal(t, "project", ext.ToolNamespaces[0].Name)
 
 	identityPlan, err := conversion.NewPlanner().Plan(llmReq, llm.APIFormatOpenAIResponse)
 	require.NoError(t, err)
 	require.True(t, identityPlan.Complete())
-	require.EqualValues(t, 1, identityPlan.Summary.Opaque)
+	require.Zero(t, identityPlan.Summary.Unknown)
 
 	crossPlan, err := conversion.NewPlanner().Plan(llmReq, llm.APIFormatAnthropicMessage)
 	require.ErrorIs(t, err, conversion.ErrIncompletePlan)
@@ -411,7 +402,15 @@ func TestOutboundTransformer_TransformRequest_PreservesMixedNamespaceOnlyOnRespo
 	}
 	require.NoError(t, json.Unmarshal(httpReq.Body, &payload))
 	require.Len(t, payload.Tools, 2)
-	require.JSONEq(t, string(ext.RawTools[0].Raw), string(payload.Tools[0]))
+	require.JSONEq(t, `{
+		"type":"namespace",
+		"name":"project",
+		"tools":[
+			{"type":"function","name":"list","parameters":{"type":"object"}},
+			{"type":"custom","name":"patch","description":"Apply a patch"},
+			{"type":"future_nested_tool","name":"future"}
+		]
+	}`, string(payload.Tools[0]))
 
 	var trailing Tool
 	require.NoError(t, json.Unmarshal(payload.Tools[1], &trailing))
@@ -433,8 +432,9 @@ func TestOutboundTransformer_TransformRequest_PreservesUnsupportedOnlyNamespaceO
 
 	ext := openAIResponsesRequestExtensions(llmReq)
 	require.NotNil(t, ext)
-	require.Len(t, ext.RawTools, 1)
-	require.Equal(t, 0, ext.RawTools[0].RepresentedToolCount)
+	require.Empty(t, ext.RawTools)
+	require.Len(t, ext.ToolNamespaces, 1)
+	require.Len(t, llmReq.ToolDefinitions, 2)
 
 	_, err = conversion.NewPlanner().Plan(llmReq, llm.APIFormatOpenAIChatCompletion)
 	require.True(t, errors.Is(err, conversion.ErrIncompletePlan))
@@ -449,7 +449,7 @@ func TestOutboundTransformer_TransformRequest_PreservesUnsupportedOnlyNamespaceO
 	}
 	require.NoError(t, json.Unmarshal(httpReq.Body, &payload))
 	require.Len(t, payload.Tools, 2)
-	require.JSONEq(t, string(ext.RawTools[0].Raw), string(payload.Tools[0]))
+	require.JSONEq(t, `{"type":"namespace","name":"future","tools":[{"type":"future_nested_tool","name":"run"}]}`, string(payload.Tools[0]))
 }
 
 func TestOutboundTransformer_TransformRequest_ReplaysProviderRawInputItems(t *testing.T) {
@@ -503,7 +503,52 @@ func TestOutboundTransformer_TransformRequest_ReplaysProviderRawInputItems(t *te
 	require.Equal(t, "message", message["type"])
 }
 
-func TestOutboundTransformer_TransformRequest_PreservesOpaqueRawToolWhenCanonicalToolsChanged(t *testing.T) {
+func TestOutboundTransformer_TransformRequest_CompactionTriggerRemainsFinalAfterCanonicalInsertion(t *testing.T) {
+	inbound := NewInboundTransformer()
+	llmReq, err := inbound.TransformRequest(context.Background(), &httpclient.Request{Body: []byte(`{
+		"model":"gpt-5.6-terra",
+		"input":[
+			{"type":"additional_tools","role":"developer","tools":[{"type":"custom","name":"exec","description":"run code"}]},
+			{"type":"custom_tool_call","call_id":"call_exec","name":"exec","input":"run"},
+			{"type":"compaction_trigger"}
+		]
+	}`)})
+	require.NoError(t, err)
+	require.Len(t, llmReq.Input, 3)
+
+	// Octopus can restore an encrypted reasoning item immediately before a
+	// historical tool call. The inserted item has no source-wire ordinal of its
+	// own; Responses encoding must preserve its canonical position without
+	// moving it past the request-final compaction control.
+	llmReq.Input = append(llmReq.Input, llm.Item{
+		Kind: llm.ItemKindReasoning,
+		Role: llm.RoleAssistant,
+		Reasoning: &llm.ReasoningItem{
+			Content:   "restored reasoning",
+			Signature: "opaque-signature",
+		},
+		ProtocolHints: llm.ProtocolHints{
+			SourceFormat: llm.APIFormatOpenAIResponse,
+			SourceType:   "reasoning_cache",
+			Ordinal:      -1,
+		},
+	})
+
+	outbound, err := NewOutboundTransformer("https://api.openai.com", "test-api-key")
+	require.NoError(t, err)
+	httpReq, err := outbound.TransformRequest(context.Background(), llmReq)
+	require.NoError(t, err)
+
+	var payload struct {
+		Input []Item `json:"input"`
+	}
+	require.NoError(t, json.Unmarshal(httpReq.Body, &payload))
+	require.NotEmpty(t, payload.Input)
+	require.Equal(t, "compaction_trigger", payload.Input[len(payload.Input)-1].Type,
+		"provider request must never place canonical or raw items after compaction_trigger")
+}
+
+func TestOutboundTransformer_TransformRequest_DoesNotReplayDeletedOpaqueTool(t *testing.T) {
 	inbound := NewInboundTransformer()
 	inboundReq := &httpclient.Request{
 		Body: []byte(`{
@@ -543,14 +588,8 @@ func TestOutboundTransformer_TransformRequest_PreservesOpaqueRawToolWhenCanonica
 
 	tools, ok := payload["tools"].([]any)
 	require.True(t, ok)
-	require.Len(t, tools, 2)
-	rawTool, ok := tools[0].(map[string]any)
-	require.True(t, ok)
-	require.Equal(t, "tool_search", rawTool["type"])
-	require.Equal(t, "search_docs", rawTool["name"])
-	require.Equal(t, "docs", rawTool["namespace"])
-
-	tool, ok := tools[1].(map[string]any)
+	require.Len(t, tools, 1)
+	tool, ok := tools[0].(map[string]any)
 	require.True(t, ok)
 	require.Equal(t, "function", tool["type"])
 	require.Equal(t, "different_tool", tool["name"])
@@ -566,11 +605,10 @@ func TestProviderExtensions_NotSerializedWithLLMRequest(t *testing.T) {
 		ProviderExtensions: &llm.ProviderExtensions{
 			OpenAIResponses: &llm.OpenAIResponsesProviderExtensions{
 				Request: &llm.OpenAIResponsesRequestExtensions{
-					RawTools: []llm.OpenAIResponsesRawFragment{{
-						Type: "tool_search",
-						Raw:  json.RawMessage(`{"secret":"raw prompt"}`),
+					ResidualFields: json.RawMessage(`{"secret":"raw prompt"}`),
+					ToolNamespaces: []llm.ToolNamespaceDeclaration{{
+						Name: "secret", SourceResidual: json.RawMessage(`{"secret":"raw choice"}`),
 					}},
-					RawToolChoice: json.RawMessage(`{"secret":"raw choice"}`),
 				},
 			},
 		},

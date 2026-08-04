@@ -93,6 +93,15 @@ func TestStreamStateMachineRejectsLifecycleViolations(t *testing.T) {
 			},
 			code: StreamInvariantResponseState,
 		},
+		{
+			name: "different items reuse one output index",
+			events: []Event{
+				{Kind: EventKindResponseStarted, Sequence: 0},
+				toolAddedEvent(1, 0, "item-a", "call-a", "lookup"),
+				toolAddedEvent(2, 0, "item-b", "call-b", "calculate"),
+			},
+			code: StreamInvariantOutputIndex,
+		},
 	}
 
 	for _, tt := range tests {

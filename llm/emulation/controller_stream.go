@@ -644,6 +644,16 @@ func (stream *controllerMCPStream) closeResources() error {
 
 func cloneControllerEvent(event llm.Event) llm.Event {
 	clone := event
+	clone.SourceResidual = append([]byte(nil), event.SourceResidual...)
+	clone.ResponseSourceResidual = append([]byte(nil), event.ResponseSourceResidual...)
+	if len(event.ProtocolFrames) > 0 {
+		clone.ProtocolFrames = make([]llm.ProtocolFrameHint, len(event.ProtocolFrames))
+		copy(clone.ProtocolFrames, event.ProtocolFrames)
+		for index := range clone.ProtocolFrames {
+			clone.ProtocolFrames[index].SourceResidual = append([]byte(nil), event.ProtocolFrames[index].SourceResidual...)
+			clone.ProtocolFrames[index].PayloadResidual = append([]byte(nil), event.ProtocolFrames[index].PayloadResidual...)
+		}
+	}
 	if event.Snapshot != nil {
 		item := llm.CloneCanonicalItem(*event.Snapshot)
 		clone.Snapshot = &item

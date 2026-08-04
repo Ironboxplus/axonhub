@@ -160,7 +160,10 @@ var ignoreFields = cmp.FilterPath(func(p cmp.Path) bool {
 	// Ignore dynamic fields that are generated at runtime
 	if sf, ok := p.Last().(cmp.StructField); ok {
 		switch sf.Name() {
-		case "ID", "ItemID", "Obfuscation", "Logprobs", "Response":
+		case "ID", "ItemID", "Obfuscation", "Logprobs", "Response", "Residual":
+			// This legacy Chat -> Responses fixture intentionally ignores provider-
+			// synthesized logprobs/obfuscation. Residual identity itself is covered
+			// by the canonical Responses -> Responses stream round-trip tests.
 			return true
 		}
 	}

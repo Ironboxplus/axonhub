@@ -153,11 +153,12 @@ func convertCompactMessageToItems(msg llm.Message) []Item {
 			annotationsAttached = attached
 		}
 		items = append(items, Item{
-			ID:      msg.ID,
-			Type:    "message",
-			Role:    role,
-			Content: &Input{Items: contentItems},
-			Status:  lo.ToPtr("completed"),
+			ID:       msg.ID,
+			Type:     "message",
+			Role:     role,
+			Content:  &Input{Items: contentItems},
+			Status:   lo.ToPtr("completed"),
+			Residual: cloneRaw(msg.SourceResidual),
 		})
 		contentItems = nil
 	}
@@ -178,6 +179,7 @@ func convertCompactMessageToItems(msg llm.Message) []Item {
 					Type:        textItemType,
 					Text:        part.Text,
 					Annotations: []Annotation{},
+					Residual:    cloneRaw(part.SourceResidual),
 				})
 			}
 		case "image_url":
@@ -186,6 +188,7 @@ func convertCompactMessageToItems(msg llm.Message) []Item {
 					Type:     "input_image",
 					ImageURL: lo.ToPtr(part.ImageURL.URL),
 					Detail:   part.ImageURL.Detail,
+					Residual: cloneRaw(part.SourceResidual),
 				})
 			}
 		case "compaction", "compaction_summary":

@@ -10,6 +10,8 @@ import (
 // canonicalStreamDecoder converts Responses wire events into the shared
 // lifecycle without first flattening them into Chat Completion deltas.
 // One decoder belongs to one request and therefore needs no synchronization.
+const maxPendingProtocolFramesPerItem = 128
+
 type canonicalStreamDecoder struct {
 	machine            *llm.StreamStateMachine
 	nextSequence       uint64
@@ -21,20 +23,22 @@ type canonicalStreamDecoder struct {
 	itemDone           map[string]bool
 	argumentsByID      map[string]string
 	inputByID          map[string]string
+	protocolFrames     map[string][]llm.ProtocolFrameHint
 	lastSourceSequence int
 	hasSourceSequence  bool
 }
 
 func newCanonicalStreamDecoder() *canonicalStreamDecoder {
 	return &canonicalStreamDecoder{
-		machine:       llm.NewStreamStateMachine(),
-		items:         make(map[string]*llm.Item),
-		refByWireID:   make(map[string]llm.ItemRef),
-		inputDone:     make(map[string]bool),
-		hostedDone:    make(map[string]bool),
-		itemDone:      make(map[string]bool),
-		argumentsByID: make(map[string]string),
-		inputByID:     make(map[string]string),
+		machine:        llm.NewStreamStateMachine(),
+		items:          make(map[string]*llm.Item),
+		refByWireID:    make(map[string]llm.ItemRef),
+		inputDone:      make(map[string]bool),
+		hostedDone:     make(map[string]bool),
+		itemDone:       make(map[string]bool),
+		argumentsByID:  make(map[string]string),
+		inputByID:      make(map[string]string),
+		protocolFrames: make(map[string][]llm.ProtocolFrameHint),
 	}
 }
 
@@ -60,6 +64,11 @@ func (decoder *canonicalStreamDecoder) decode(wire *StreamEvent) ([]llm.Event, e
 	add := func(event llm.Event) error {
 		event.Sequence = decoder.nextSequence
 		event.SourceSequence = sourceSequence
+		event.SourceType = string(wire.Type)
+		event.SourceResidual = cloneRaw(wire.Residual)
+		if wire.Response != nil {
+			event.ResponseSourceResidual = cloneRaw(wire.Response.Residual)
+		}
 		decoder.nextSequence++
 		if err := decoder.machine.Apply(event); err != nil {
 			return fmt.Errorf("Responses %s: %w", wire.Type, err)
@@ -96,7 +105,7 @@ func (decoder *canonicalStreamDecoder) decode(wire *StreamEvent) ([]llm.Event, e
 		if err := add(llm.Event{Kind: llm.EventKindItemAdded, ItemRef: ref, Snapshot: cloneCanonicalItem(item)}); err != nil {
 			return nil, err
 		}
-	case StreamEventTypeOutputTextDelta:
+	case StreamEventTypeOutputTextDelta, StreamEventTypeRefusalDelta:
 		ref, found := decoder.knownRefForWire(wire)
 		if !found {
 			var err error
@@ -105,8 +114,20 @@ func (decoder *canonicalStreamDecoder) decode(wire *StreamEvent) ([]llm.Event, e
 				return nil, err
 			}
 		}
-		decoder.appendText(decoder.storageKey(ref), wire.Delta)
-		if err := add(llm.Event{Kind: llm.EventKindTextDelta, ItemRef: ref, ContentIndex: wire.ContentIndex, Delta: llm.Delta{Text: wire.Delta}}); err != nil {
+		key := decoder.storageKey(ref)
+		if wire.Type == StreamEventTypeRefusalDelta {
+			if item := decoder.items[key]; item != nil && len(item.Content) > 0 {
+				item.Content[0].Kind = llm.ContentKindRefusal
+			}
+		}
+		decoder.appendText(key, wire.Delta)
+		eventKind := llm.EventKindTextDelta
+		if wire.Type == StreamEventTypeRefusalDelta {
+			eventKind = llm.EventKindRefusalDelta
+		}
+		event := llm.Event{Kind: eventKind, ItemRef: ref, ContentIndex: wire.ContentIndex, Delta: llm.Delta{Text: wire.Delta}}
+		event.ProtocolFrames = decoder.takeProtocolFrames(key, StreamEventTypeContentPartAdded)
+		if err := add(event); err != nil {
 			return nil, err
 		}
 	case StreamEventTypeReasoningSummaryTextDelta:
@@ -115,7 +136,9 @@ func (decoder *canonicalStreamDecoder) decode(wire *StreamEvent) ([]llm.Event, e
 			return nil, err
 		}
 		decoder.appendReasoning(decoder.storageKey(ref), wire.Delta)
-		if err := add(llm.Event{Kind: llm.EventKindReasoningDelta, ItemRef: ref, ContentIndex: wire.SummaryIndex, Delta: llm.Delta{Text: wire.Delta}}); err != nil {
+		event := llm.Event{Kind: llm.EventKindReasoningDelta, ItemRef: ref, ContentIndex: wire.SummaryIndex, Delta: llm.Delta{Text: wire.Delta}}
+		event.ProtocolFrames = decoder.takeProtocolFrames(decoder.storageKey(ref), StreamEventTypeReasoningSummaryPartAdded)
+		if err := add(event); err != nil {
 			return nil, err
 		}
 	case StreamEventTypeFunctionCallArgumentsDelta:
@@ -279,7 +302,9 @@ func (decoder *canonicalStreamDecoder) decode(wire *StreamEvent) ([]llm.Event, e
 			decoder.hostedDone[key] = true
 		}
 		decoder.items[key] = cloneCanonicalItem(item)
-		if err := add(llm.Event{Kind: llm.EventKindItemDone, ItemRef: ref, Snapshot: cloneCanonicalItem(item)}); err != nil {
+		doneEvent := llm.Event{Kind: llm.EventKindItemDone, ItemRef: ref, Snapshot: cloneCanonicalItem(item)}
+		doneEvent.ProtocolFrames = decoder.takeProtocolFrames(key)
+		if err := add(doneEvent); err != nil {
 			return nil, err
 		}
 		decoder.itemDone[key] = true
@@ -322,10 +347,14 @@ func (decoder *canonicalStreamDecoder) decode(wire *StreamEvent) ([]llm.Event, e
 			return nil, err
 		}
 	case StreamEventTypeContentPartAdded, StreamEventTypeContentPartDone,
-		StreamEventTypeOutputTextDone, StreamEventTypeReasoningSummaryPartAdded,
-		StreamEventTypeReasoningSummaryPartDone, StreamEventTypeReasoningSummaryTextDone,
-		StreamEventType("keepalive"):
-		// These are wire framing around an already typed item/delta lifecycle.
+		StreamEventTypeOutputTextDone, StreamEventTypeRefusalDone,
+		StreamEventTypeReasoningSummaryPartAdded, StreamEventTypeReasoningSummaryPartDone,
+		StreamEventTypeReasoningSummaryTextDone:
+		if err := decoder.rememberProtocolFrame(wire); err != nil {
+			return nil, err
+		}
+	case StreamEventType("keepalive"):
+		// Transport keepalives do not belong to the model lifecycle.
 	default:
 		return nil, fmt.Errorf("unsupported Responses stream event type %q", wire.Type)
 	}
@@ -489,6 +518,71 @@ func (decoder *canonicalStreamDecoder) storageKey(ref llm.ItemRef) string {
 	return "call:" + ref.CallID
 }
 
+func (decoder *canonicalStreamDecoder) rememberProtocolFrame(wire *StreamEvent) error {
+	ref, err := decoder.refForWire(wire)
+	if err != nil {
+		return err
+	}
+	hint := llm.ProtocolFrameHint{
+		SourceType:     string(wire.Type),
+		SourceResidual: cloneRaw(wire.Residual),
+	}
+	if wire.Part != nil {
+		hint.PayloadResidual = cloneRaw(wire.Part.Residual)
+	}
+	key := decoder.storageKey(ref)
+	if len(decoder.protocolFrames[key]) >= maxPendingProtocolFramesPerItem {
+		return fmt.Errorf("Responses protocol framing for %s exceeded %d pending events", key, maxPendingProtocolFramesPerItem)
+	}
+	decoder.protocolFrames[key] = append(decoder.protocolFrames[key], hint)
+	return nil
+}
+
+func (decoder *canonicalStreamDecoder) takeProtocolFrames(key string, types ...StreamEventType) []llm.ProtocolFrameHint {
+	frames := decoder.protocolFrames[key]
+	if len(frames) == 0 {
+		return nil
+	}
+	if len(types) == 0 {
+		delete(decoder.protocolFrames, key)
+		return cloneProtocolFrameHints(frames)
+	}
+	wanted := make(map[string]bool, len(types))
+	for _, eventType := range types {
+		wanted[string(eventType)] = false
+	}
+	selected := make([]llm.ProtocolFrameHint, 0, len(frames))
+	remaining := make([]llm.ProtocolFrameHint, 0, len(frames))
+	for index := range frames {
+		frame := frames[index]
+		if consumed, ok := wanted[frame.SourceType]; ok && !consumed {
+			selected = append(selected, frame)
+			wanted[frame.SourceType] = true
+			continue
+		}
+		remaining = append(remaining, frame)
+	}
+	if len(remaining) == 0 {
+		delete(decoder.protocolFrames, key)
+	} else {
+		decoder.protocolFrames[key] = remaining
+	}
+	return cloneProtocolFrameHints(selected)
+}
+
+func cloneProtocolFrameHints(frames []llm.ProtocolFrameHint) []llm.ProtocolFrameHint {
+	if len(frames) == 0 {
+		return nil
+	}
+	clone := make([]llm.ProtocolFrameHint, len(frames))
+	copy(clone, frames)
+	for index := range clone {
+		clone[index].SourceResidual = cloneRaw(frames[index].SourceResidual)
+		clone[index].PayloadResidual = cloneRaw(frames[index].PayloadResidual)
+	}
+	return clone
+}
+
 func (decoder *canonicalStreamDecoder) appendText(itemID, delta string) {
 	item := decoder.items[itemID]
 	if item == nil || len(item.Content) == 0 {
@@ -630,7 +724,9 @@ func (decoder *canonicalStreamDecoder) closeOpenItems(status llm.ItemStatus, add
 		}
 
 		markItemTerminal(item, status)
-		if err := add(llm.Event{Kind: llm.EventKindItemDone, ItemRef: ref, Snapshot: cloneCanonicalItem(item)}); err != nil {
+		doneEvent := llm.Event{Kind: llm.EventKindItemDone, ItemRef: ref, Snapshot: cloneCanonicalItem(item)}
+		doneEvent.ProtocolFrames = decoder.takeProtocolFrames(key)
+		if err := add(doneEvent); err != nil {
 			return err
 		}
 		decoder.itemDone[key] = true
@@ -699,12 +795,13 @@ func cloneCanonicalItem(item *llm.Item) *llm.Item {
 		return nil
 	}
 	clone := *item
+	clone.ProtocolHints.SourceResidual = cloneRaw(item.ProtocolHints.SourceResidual)
 	clone.Content = cloneCanonicalContent(item.Content)
 	if item.ToolCall != nil {
 		call := *item.ToolCall
 		call.ArgumentsJSON = append(json.RawMessage(nil), item.ToolCall.ArgumentsJSON...)
 		call.ProviderData = append(json.RawMessage(nil), item.ToolCall.ProviderData...)
-		call.PendingSafetyChecks = append([]llm.ToolSafetyCheck(nil), item.ToolCall.PendingSafetyChecks...)
+		call.PendingSafetyChecks = cloneCanonicalSafetyChecks(item.ToolCall.PendingSafetyChecks)
 		clone.ToolCall = &call
 	}
 	if item.ToolResult != nil {
@@ -715,7 +812,7 @@ func cloneCanonicalItem(item *llm.Item) *llm.Item {
 		hosted := *item.HostedCall
 		hosted.Invocation.ArgumentsJSON = append(json.RawMessage(nil), item.HostedCall.Invocation.ArgumentsJSON...)
 		hosted.Invocation.ProviderData = append(json.RawMessage(nil), item.HostedCall.Invocation.ProviderData...)
-		hosted.Invocation.PendingSafetyChecks = append([]llm.ToolSafetyCheck(nil), item.HostedCall.Invocation.PendingSafetyChecks...)
+		hosted.Invocation.PendingSafetyChecks = cloneCanonicalSafetyChecks(item.HostedCall.Invocation.PendingSafetyChecks)
 		hosted.Result = cloneCanonicalToolResult(item.HostedCall.Result)
 		clone.HostedCall = &hosted
 	}
@@ -727,6 +824,7 @@ func cloneCanonicalItem(item *llm.Item) *llm.Item {
 			list.Tools[index].OutputSchema = append(json.RawMessage(nil), item.MCPListTools.Tools[index].OutputSchema...)
 			list.Tools[index].Annotations = append(json.RawMessage(nil), item.MCPListTools.Tools[index].Annotations...)
 			list.Tools[index].Meta = append(json.RawMessage(nil), item.MCPListTools.Tools[index].Meta...)
+			list.Tools[index].SourceResidual = cloneRaw(item.MCPListTools.Tools[index].SourceResidual)
 		}
 		clone.MCPListTools = &list
 	}
@@ -746,6 +844,8 @@ func cloneCanonicalItem(item *llm.Item) *llm.Item {
 	}
 	if item.Reasoning != nil {
 		reasoning := *item.Reasoning
+		reasoning.SummaryParts = cloneCanonicalReasoningParts(item.Reasoning.SummaryParts)
+		reasoning.ContentParts = cloneCanonicalReasoningParts(item.Reasoning.ContentParts)
 		clone.Reasoning = &reasoning
 	}
 	if item.Compaction != nil {
@@ -768,8 +868,33 @@ func cloneCanonicalToolResult(result *llm.ToolResult) *llm.ToolResult {
 	clone.Content = cloneCanonicalContent(result.Content)
 	clone.StructuredContent = append(json.RawMessage(nil), result.StructuredContent...)
 	clone.ProviderData = append(json.RawMessage(nil), result.ProviderData...)
-	clone.AcknowledgedSafetyChecks = append([]llm.ToolSafetyCheck(nil), result.AcknowledgedSafetyChecks...)
+	if len(result.DiscoveredTools) > 0 {
+		clone.DiscoveredTools = (&llm.Request{ToolDefinitions: result.DiscoveredTools}).Clone().ToolDefinitions
+	}
+	clone.AcknowledgedSafetyChecks = cloneCanonicalSafetyChecks(result.AcknowledgedSafetyChecks)
 	return &clone
+}
+
+func cloneCanonicalSafetyChecks(checks []llm.ToolSafetyCheck) []llm.ToolSafetyCheck {
+	if len(checks) == 0 {
+		return nil
+	}
+	clone := append([]llm.ToolSafetyCheck(nil), checks...)
+	for index := range clone {
+		clone[index].SourceResidual = cloneRaw(checks[index].SourceResidual)
+	}
+	return clone
+}
+
+func cloneCanonicalReasoningParts(parts []llm.ReasoningPart) []llm.ReasoningPart {
+	if len(parts) == 0 {
+		return nil
+	}
+	clone := append([]llm.ReasoningPart(nil), parts...)
+	for index := range clone {
+		clone[index].SourceResidual = cloneRaw(parts[index].SourceResidual)
+	}
+	return clone
 }
 
 func cloneCanonicalContent(content []llm.ContentBlock) []llm.ContentBlock {
@@ -779,6 +904,7 @@ func cloneCanonicalContent(content []llm.ContentBlock) []llm.ContentBlock {
 	clone := append([]llm.ContentBlock(nil), content...)
 	for index := range clone {
 		clone[index].UnknownRaw = append(json.RawMessage(nil), content[index].UnknownRaw...)
+		clone[index].SourceResidual = cloneRaw(content[index].SourceResidual)
 		if content[index].Image != nil {
 			image := *content[index].Image
 			clone[index].Image = &image
@@ -793,6 +919,7 @@ func cloneCanonicalContent(content []llm.ContentBlock) []llm.ContentBlock {
 		}
 		if content[index].Citation != nil {
 			citation := *content[index].Citation
+			citation.SourceResidual = cloneRaw(content[index].Citation.SourceResidual)
 			clone[index].Citation = &citation
 		}
 	}

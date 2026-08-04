@@ -96,11 +96,17 @@ type ToolChoice struct {
 	ToolChoice      *string            `json:"tool_choice,omitempty"`
 	NamedToolChoice *NamedToolChoice   `json:"named_tool_choice,omitempty"`
 	AllowedTools    *AllowedToolChoice `json:"allowed_tools,omitempty"`
+	// SourceResidual follows this choice object through clone/update/delete and
+	// carries only source fields that are not represented by the typed variants.
+	SourceResidual json.RawMessage `json:"-"`
 }
 
 type NamedToolChoice struct {
 	Type     string       `json:"type"`
 	Function ToolFunction `json:"function"`
+	// Options preserves Responses selectors which attach a bounded candidate
+	// list to a named choice object. It is source semantics, not a raw replay.
+	Options []AllowedToolRef `json:"options,omitempty"`
 }
 
 // AllowedToolChoice is the provider-neutral form of Responses' allowed_tools
@@ -112,9 +118,10 @@ type AllowedToolChoice struct {
 }
 
 type AllowedToolRef struct {
-	Type        string `json:"type"`
-	Name        string `json:"name,omitempty"`
-	ServerLabel string `json:"server_label,omitempty"`
+	Type           string          `json:"type"`
+	Name           string          `json:"name,omitempty"`
+	ServerLabel    string          `json:"server_label,omitempty"`
+	SourceResidual json.RawMessage `json:"-"`
 }
 
 func (t ToolChoice) MarshalJSON() ([]byte, error) {

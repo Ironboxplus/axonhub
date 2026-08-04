@@ -478,7 +478,7 @@ func convertToolChoice(src *llm.ToolChoice) *ToolChoice {
 		return nil
 	}
 
-	result := &ToolChoice{}
+	result := &ToolChoice{Residual: cloneRaw(src.SourceResidual)}
 
 	if src.ToolChoice != nil {
 		// String mode like "none", "auto", "required"
@@ -496,6 +496,7 @@ func convertToolChoice(src *llm.ToolChoice) *ToolChoice {
 			tool := src.AllowedTools.Tools[index]
 			result.Tools = append(result.Tools, ToolOption{
 				Type: tool.Type, Name: tool.Name, ServerLabel: tool.ServerLabel,
+				Residual: cloneRaw(tool.SourceResidual),
 			})
 		}
 	} else if src.NamedToolChoice != nil {
@@ -503,6 +504,13 @@ func convertToolChoice(src *llm.ToolChoice) *ToolChoice {
 		result.Type = &src.NamedToolChoice.Type
 		if src.NamedToolChoice.Function.Name != "" {
 			result.Name = &src.NamedToolChoice.Function.Name
+		}
+		for index := range src.NamedToolChoice.Options {
+			tool := src.NamedToolChoice.Options[index]
+			result.Tools = append(result.Tools, ToolOption{
+				Type: tool.Type, Name: tool.Name, ServerLabel: tool.ServerLabel,
+				Residual: cloneRaw(tool.SourceResidual),
+			})
 		}
 	}
 

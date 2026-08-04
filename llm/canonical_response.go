@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 )
@@ -10,17 +11,18 @@ import (
 // request-owned and deliberately contains no locks: one stream iterator is
 // the sole writer.
 type CanonicalResponseAccumulator struct {
-	machine        *StreamStateMachine
-	items          map[string]Item
-	order          map[string]int
-	nextOrder      int
-	usage          *Usage
-	terminal       EventKind
-	terminalReason string
-	id             string
-	model          string
-	created        int64
-	providerSeen   bool
+	machine            *StreamStateMachine
+	items              map[string]Item
+	order              map[string]int
+	nextOrder          int
+	usage              *Usage
+	terminal           EventKind
+	terminalReason     string
+	id                 string
+	model              string
+	created            int64
+	providerSeen       bool
+	providerExtensions *ResponseProviderExtensions
 }
 
 func NewCanonicalResponseAccumulator() *CanonicalResponseAccumulator {
@@ -61,6 +63,9 @@ func (accumulator *CanonicalResponseAccumulator) Observe(response *Response) err
 	if response.TerminalReason != "" {
 		accumulator.terminalReason = response.TerminalReason
 	}
+	if response.ProviderExtensions != nil {
+		accumulator.providerExtensions = CloneResponseProviderExtensions(response.ProviderExtensions)
+	}
 
 	if len(response.Events) == 0 {
 		if len(response.Output) > 0 {
@@ -76,6 +81,13 @@ func (accumulator *CanonicalResponseAccumulator) Observe(response *Response) err
 
 	for index := range response.Events {
 		event := response.Events[index]
+		if len(event.ResponseSourceResidual) > 0 {
+			accumulator.providerExtensions = &ResponseProviderExtensions{
+				OpenAIResponses: &OpenAIResponsesResponseExtensions{
+					ResidualFields: append(json.RawMessage(nil), event.ResponseSourceResidual...),
+				},
+			}
+		}
 		if err := accumulator.machine.Apply(event); err != nil {
 			return fmt.Errorf("accumulate canonical response: %w", err)
 		}
@@ -160,7 +172,8 @@ func (accumulator *CanonicalResponseAccumulator) Snapshot() *Response {
 	response := &Response{
 		ID: accumulator.id, Model: accumulator.model, Created: accumulator.created,
 		Output: output, Usage: cloneCanonicalUsage(accumulator.usage), Status: responseStatusFromTerminal(accumulator.terminal),
-		TerminalReason: accumulator.terminalReason,
+		TerminalReason:     accumulator.terminalReason,
+		ProviderExtensions: CloneResponseProviderExtensions(accumulator.providerExtensions),
 	}
 	return response
 }
@@ -208,8 +221,12 @@ func CanonicalEventsFromResponse(response *Response) ([]Event, error) {
 		sequence++
 		events = append(events, event)
 	}
-	add(Event{Kind: EventKindResponseStarted})
-	add(Event{Kind: EventKindResponseInProgress})
+	var responseResidual json.RawMessage
+	if response.ProviderExtensions != nil && response.ProviderExtensions.OpenAIResponses != nil {
+		responseResidual = append(json.RawMessage(nil), response.ProviderExtensions.OpenAIResponses.ResidualFields...)
+	}
+	add(Event{Kind: EventKindResponseStarted, ResponseSourceResidual: append(json.RawMessage(nil), responseResidual...)})
+	add(Event{Kind: EventKindResponseInProgress, ResponseSourceResidual: append(json.RawMessage(nil), responseResidual...)})
 	for index := range response.Output {
 		item := CloneCanonicalItem(response.Output[index])
 		outputIndex := index
@@ -277,7 +294,10 @@ func CanonicalEventsFromResponse(response *Response) ([]Event, error) {
 	if response.Usage != nil {
 		add(Event{Kind: EventKindUsage, Usage: cloneCanonicalUsage(response.Usage)})
 	}
-	terminal := Event{Kind: EventKindResponseCompleted, TerminalReason: response.TerminalReason}
+	terminal := Event{
+		Kind: EventKindResponseCompleted, TerminalReason: response.TerminalReason,
+		ResponseSourceResidual: append(json.RawMessage(nil), responseResidual...),
+	}
 	switch response.Status {
 	case ResponseStatusIncomplete:
 		terminal.Kind = EventKindResponseIncomplete

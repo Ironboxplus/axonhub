@@ -19,6 +19,8 @@ const (
 	ItemKindMCPCall             ItemKind = "mcp_call"
 	ItemKindReasoning           ItemKind = "reasoning"
 	ItemKindCompaction          ItemKind = "compaction"
+	ItemKindCompactionTrigger   ItemKind = "compaction_trigger"
+	ItemKindToolDeclaration     ItemKind = "tool_declaration"
 	ItemKindUnknown             ItemKind = "unknown"
 )
 
@@ -116,27 +118,39 @@ type Item struct {
 	Role   Role       `json:"role,omitempty"`
 	Status ItemStatus `json:"status,omitempty"`
 
-	Content             []ContentBlock       `json:"content,omitempty"`
-	ToolCall            *ToolInvocation      `json:"tool_call,omitempty"`
-	ToolResult          *ToolResult          `json:"tool_result,omitempty"`
-	HostedCall          *HostedToolCall      `json:"hosted_call,omitempty"`
-	MCPListTools        *MCPListTools        `json:"mcp_list_tools,omitempty"`
-	MCPApprovalRequest  *MCPApprovalRequest  `json:"mcp_approval_request,omitempty"`
-	MCPApprovalResponse *MCPApprovalResponse `json:"mcp_approval_response,omitempty"`
-	MCPCall             *MCPCall             `json:"mcp_call,omitempty"`
-	Reasoning           *ReasoningItem       `json:"reasoning,omitempty"`
-	Compaction          *CompactionItem      `json:"compaction,omitempty"`
-	Unknown             *UnknownItem         `json:"unknown,omitempty"`
-	ProtocolHints       ProtocolHints        `json:"protocol_hints,omitempty"`
+	Content             []ContentBlock         `json:"content,omitempty"`
+	ToolCall            *ToolInvocation        `json:"tool_call,omitempty"`
+	ToolResult          *ToolResult            `json:"tool_result,omitempty"`
+	HostedCall          *HostedToolCall        `json:"hosted_call,omitempty"`
+	MCPListTools        *MCPListTools          `json:"mcp_list_tools,omitempty"`
+	MCPApprovalRequest  *MCPApprovalRequest    `json:"mcp_approval_request,omitempty"`
+	MCPApprovalResponse *MCPApprovalResponse   `json:"mcp_approval_response,omitempty"`
+	MCPCall             *MCPCall               `json:"mcp_call,omitempty"`
+	Reasoning           *ReasoningItem         `json:"reasoning,omitempty"`
+	Compaction          *CompactionItem        `json:"compaction,omitempty"`
+	CompactionTrigger   *CompactionTriggerItem `json:"compaction_trigger,omitempty"`
+	ToolDeclaration     *ToolDeclarationItem   `json:"tool_declaration,omitempty"`
+	Unknown             *UnknownItem           `json:"unknown,omitempty"`
+	ProtocolHints       ProtocolHints          `json:"protocol_hints,omitempty"`
 }
 
-// ProtocolHints may preserve non-behavioral source layout hints. Any field
-// that changes model or tool behavior belongs in a typed canonical field.
+// ProtocolHints preserves source identity needed to project a canonical node
+// back to its source protocol. Ordinal is diagnostic only after inbound; it
+// must never override the current canonical slice order. SourceResidual holds
+// only source fields not owned by the typed canonical node and is excluded
+// from canonical JSON, logs, and persistence.
 type ProtocolHints struct {
 	SourceFormat APIFormat `json:"source_format,omitempty"`
 	SourceType   string    `json:"source_type,omitempty"`
 	SourceRole   Role      `json:"source_role,omitempty"`
+	SourceGroup  string    `json:"source_group,omitempty"`
 	Ordinal      int       `json:"ordinal,omitempty"`
+	// ResidualOwnerType is the source object type that owns SourceResidual.
+	// SourceType may describe a containing protocol construct such as
+	// additional_tools, so using it alone can attach old private fields after a
+	// canonical object changes type.
+	ResidualOwnerType string          `json:"-"`
+	SourceResidual    json.RawMessage `json:"-"`
 }
 
 type ContentBlock struct {
@@ -150,6 +164,13 @@ type ContentBlock struct {
 	Document   *DocumentURL    `json:"document,omitempty"`
 	Citation   *URLCitation    `json:"citation,omitempty"`
 	UnknownRaw json.RawMessage `json:"unknown_raw,omitempty"`
+	// SourceResidual contains source-protocol fields not owned by this typed
+	// content block. It follows the block through canonical reorder/delete and
+	// never enters logs or provider-neutral serialization.
+	// ResidualOwnerType prevents fields from an old wire union member from being
+	// replayed after middleware changes Kind to a different content type.
+	ResidualOwnerType string          `json:"-"`
+	SourceResidual    json.RawMessage `json:"-"`
 }
 
 type ToolDefinition struct {
@@ -191,6 +212,7 @@ type HostedToolDefinition struct {
 	WebSearch     *WebSearch      `json:"web_search,omitempty"`
 	WebFetch      *WebFetch       `json:"web_fetch,omitempty"`
 	Configuration json.RawMessage `json:"configuration,omitempty"`
+	Namespace     string          `json:"namespace,omitempty"`
 }
 
 // WebFetch is the provider-neutral subset of Anthropic's versioned web-fetch
@@ -295,9 +317,10 @@ type ToolResult struct {
 // computer actions. Keeping it canonical prevents protocol conversion from
 // hiding a required safety decision inside opaque provider data.
 type ToolSafetyCheck struct {
-	ID      string `json:"id,omitempty"`
-	Code    string `json:"code,omitempty"`
-	Message string `json:"message,omitempty"`
+	ID             string          `json:"id,omitempty"`
+	Code           string          `json:"code,omitempty"`
+	Message        string          `json:"message,omitempty"`
+	SourceResidual json.RawMessage `json:"-"`
 }
 
 type HostedToolCall struct {
@@ -310,13 +333,14 @@ type HostedToolCall struct {
 // Name, Description, InputSchema, and Annotations; the remaining MCP-native
 // fields prevent the gateway execution path from needing a second model.
 type MCPDiscoveredTool struct {
-	Name         string          `json:"name"`
-	Title        string          `json:"title,omitempty"`
-	Description  string          `json:"description,omitempty"`
-	InputSchema  json.RawMessage `json:"input_schema"`
-	OutputSchema json.RawMessage `json:"output_schema,omitempty"`
-	Annotations  json.RawMessage `json:"annotations,omitempty"`
-	Meta         json.RawMessage `json:"meta,omitempty"`
+	Name           string          `json:"name"`
+	Title          string          `json:"title,omitempty"`
+	Description    string          `json:"description,omitempty"`
+	InputSchema    json.RawMessage `json:"input_schema"`
+	OutputSchema   json.RawMessage `json:"output_schema,omitempty"`
+	Annotations    json.RawMessage `json:"annotations,omitempty"`
+	Meta           json.RawMessage `json:"meta,omitempty"`
+	SourceResidual json.RawMessage `json:"-"`
 }
 
 type MCPListTools struct {
@@ -365,6 +389,31 @@ type MCPCall struct {
 type CompactionItem struct {
 	EncryptedContent string `json:"encrypted_content,omitempty"`
 	CreatedBy        string `json:"created_by,omitempty"`
+}
+
+// CompactionTrigger is a Responses request control. The upstream contract
+// requires exactly one trigger and requires it to be the final input item.
+// Keeping it typed prevents request-local canonical enrichments from moving an
+// opaque raw fragment away from the end of the wire input array.
+type CompactionTriggerItem struct{}
+
+// ToolDeclarationItem occupies the original position of a Responses
+// additional_tools declaration. Tool definitions remain in Request's typed
+// registry; SourceGroup links the declaration to the current definitions
+// without using an obsolete source-array index as identity.
+type ToolDeclarationItem struct {
+	SourceGroup string                     `json:"source_group"`
+	Namespaces  []ToolNamespaceDeclaration `json:"namespaces,omitempty"`
+}
+
+// ToolNamespaceDeclaration owns the Responses namespace container separately
+// from the function/custom definitions nested inside it. The child definitions
+// remain executable canonical tools; this record preserves the container's
+// description and future source fields without tying them to an array index.
+type ToolNamespaceDeclaration struct {
+	Name           string          `json:"name"`
+	Description    string          `json:"description,omitempty"`
+	SourceResidual json.RawMessage `json:"-"`
 }
 
 type UnknownItem struct {
@@ -448,6 +497,8 @@ func (item *Item) Validate() error {
 		item.MCPCall != nil,
 		item.Reasoning != nil,
 		item.Compaction != nil,
+		item.CompactionTrigger != nil,
+		item.ToolDeclaration != nil,
 		item.Unknown != nil,
 	} {
 		if present {
@@ -537,6 +588,25 @@ func (item *Item) Validate() error {
 	case ItemKindCompaction:
 		if item.Compaction == nil {
 			return errors.New("compaction payload is missing")
+		}
+	case ItemKindCompactionTrigger:
+		if item.CompactionTrigger == nil {
+			return errors.New("compaction_trigger payload is missing")
+		}
+	case ItemKindToolDeclaration:
+		if item.ToolDeclaration == nil || item.ToolDeclaration.SourceGroup == "" {
+			return errors.New("tool_declaration requires a source group")
+		}
+		namespaces := make(map[string]struct{}, len(item.ToolDeclaration.Namespaces))
+		for index := range item.ToolDeclaration.Namespaces {
+			namespace := &item.ToolDeclaration.Namespaces[index]
+			if namespace.Name == "" {
+				return fmt.Errorf("tool_declaration namespace %d requires a name", index)
+			}
+			if _, duplicate := namespaces[namespace.Name]; duplicate {
+				return fmt.Errorf("tool_declaration namespace %q is duplicated", namespace.Name)
+			}
+			namespaces[namespace.Name] = struct{}{}
 		}
 	case ItemKindUnknown:
 		if item.Unknown == nil || item.Unknown.Type == "" || !json.Valid(item.Unknown.Raw) {

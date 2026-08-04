@@ -237,3 +237,390 @@ func TestCanonicalStreamDecoderRejectsUnknownAndOutOfOrderEvents(t *testing.T) {
 	_, err = decoder.decode(&StreamEvent{Type: StreamEventTypeResponseInProgress, SequenceNumber: lo.ToPtr(8)})
 	require.ErrorContains(t, err, "sequence_number 8 is not after 9")
 }
+
+func TestCanonicalResponsesStreamPreservesFutureFieldsOnKnownOutputObjects(t *testing.T) {
+	t.Parallel()
+
+	var wire StreamEvent
+	require.NoError(t, json.Unmarshal([]byte(`{
+		"type":"response.output_item.added",
+		"output_index":0,
+		"future_event":{"checkpoint":"added"},
+		"item":{
+			"id":"msg_future_1",
+			"type":"message",
+			"role":"assistant",
+			"status":"in_progress",
+			"future_item":{"routing":"blue"},
+			"content":[{
+				"type":"output_text",
+				"text":"hello",
+				"annotations":[],
+				"future_content":{"confidence":0.75}
+			}]
+		}
+	}`), &wire))
+
+	decoder := newCanonicalStreamDecoder()
+	events, err := decoder.decode(&StreamEvent{Type: StreamEventTypeResponseCreated})
+	require.NoError(t, err)
+	itemEvents, err := decoder.decode(&wire)
+	require.NoError(t, err)
+	events = append(events, itemEvents...)
+	var doneWire StreamEvent
+	require.NoError(t, json.Unmarshal([]byte(`{
+		"type":"response.output_item.done",
+		"output_index":0,
+		"future_event":{"checkpoint":"done"},
+		"item":{
+			"id":"msg_future_1",
+			"type":"message",
+			"role":"assistant",
+			"status":"completed",
+			"future_item":{"routing":"blue"},
+			"content":[{
+				"type":"output_text",
+				"text":"hello",
+				"annotations":[],
+				"future_content":{"confidence":0.75}
+			}]
+		}
+	}`), &doneWire))
+	doneEvents, err := decoder.decode(&doneWire)
+	require.NoError(t, err)
+	events = append(events, doneEvents...)
+	require.Len(t, events, 3)
+	added := events[1]
+	require.Equal(t, llm.EventKindItemAdded, added.Kind)
+	require.JSONEq(t, `{"future_item":{"routing":"blue"}}`, string(added.Snapshot.ProtocolHints.SourceResidual))
+	require.Len(t, added.Snapshot.Content, 1)
+	require.JSONEq(t, `{"future_content":{"confidence":0.75}}`, string(added.Snapshot.Content[0].SourceResidual))
+
+	encoder := newCanonicalStreamEncoder()
+	source := &responsesInboundStream{ctx: context.Background(), transformerMetadata: make(map[string]any), aggregator: newStreamAggregator()}
+	for _, event := range events {
+		require.NoError(t, encoder.encode(source, event), "canonical event %s", event.Kind)
+	}
+
+	var encoded map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(source.eventQueue[len(source.eventQueue)-1].Data, &encoded))
+	require.JSONEq(t, `{"checkpoint":"done"}`, string(encoded["future_event"]))
+	var item map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(encoded["item"], &item))
+	require.JSONEq(t, `{"routing":"blue"}`, string(item["future_item"]))
+	var content []map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(item["content"], &content))
+	require.Len(t, content, 1)
+	require.JSONEq(t, `{"confidence":0.75}`, string(content[0]["future_content"]))
+}
+
+func TestCanonicalResponsesStreamAttachesEventResidualOnlyToMatchingWireEvent(t *testing.T) {
+	t.Parallel()
+	decoder := newCanonicalStreamDecoder()
+	var events []llm.Event
+	for _, raw := range []string{
+		`{"type":"response.created"}`,
+		`{"type":"response.output_item.added","output_index":0,"item":{"id":"msg_1","type":"message","role":"assistant","status":"in_progress","content":[]}}`,
+		`{"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"hello","future_delta":{"trace":7}}`,
+	} {
+		var wire StreamEvent
+		require.NoError(t, json.Unmarshal([]byte(raw), &wire))
+		decoded, err := decoder.decode(&wire)
+		require.NoError(t, err)
+		events = append(events, decoded...)
+	}
+
+	encoder := newCanonicalStreamEncoder()
+	source := &responsesInboundStream{ctx: context.Background(), transformerMetadata: make(map[string]any), aggregator: newStreamAggregator()}
+	for _, event := range events {
+		require.NoError(t, encoder.encode(source, event), "canonical event %s", event.Kind)
+	}
+
+	foundDelta := false
+	for _, queued := range source.eventQueue {
+		var envelope map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(queued.Data, &envelope))
+		var eventType StreamEventType
+		require.NoError(t, json.Unmarshal(envelope["type"], &eventType))
+		if eventType == StreamEventTypeOutputTextDelta {
+			foundDelta = true
+			require.JSONEq(t, `{"trace":7}`, string(envelope["future_delta"]))
+			continue
+		}
+		require.NotContains(t, envelope, "future_delta", "source event residual leaked onto %s", eventType)
+	}
+	require.True(t, foundDelta)
+}
+
+func TestCanonicalResponsesStreamPreservesNestedResponseResidualPerLifecycleEvent(t *testing.T) {
+	t.Parallel()
+
+	decoder := newCanonicalStreamDecoder()
+	var created StreamEvent
+	require.NoError(t, json.Unmarshal([]byte(`{
+		"type":"response.created",
+		"future_event":{"checkpoint":"created"},
+		"response":{
+			"id":"resp_stream_nested","object":"response","created_at":1,"model":"fixture-model","status":"in_progress","output":[],
+			"conversation":{"id":"conv_stream","future_conversation":{"shard":"sg"}},
+			"future_response":{"trace":"keep"}
+		}
+	}`), &created))
+	events, err := decoder.decode(&created)
+	require.NoError(t, err)
+	require.Len(t, events, 1)
+
+	encoder := newCanonicalStreamEncoder()
+	source := &responsesInboundStream{ctx: context.Background(), transformerMetadata: make(map[string]any), aggregator: newStreamAggregator()}
+	require.NoError(t, encoder.encode(source, events[0]))
+	require.Len(t, source.eventQueue, 1)
+
+	var encoded map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(source.eventQueue[0].Data, &encoded))
+	require.JSONEq(t, `{"checkpoint":"created"}`, string(encoded["future_event"]))
+	var response map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(encoded["response"], &response))
+	require.JSONEq(t, `{"trace":"keep"}`, string(response["future_response"]))
+	var conversation map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(response["conversation"], &conversation))
+	require.JSONEq(t, `{"shard":"sg"}`, string(conversation["future_conversation"]))
+}
+
+func TestCanonicalResponsesStreamPreservesFramingEventAndPartResiduals(t *testing.T) {
+	t.Parallel()
+
+	decoder := newCanonicalStreamDecoder()
+	var canonicalEvents []llm.Event
+	for _, raw := range []string{
+		`{"type":"response.created","response":{"id":"resp_frames","object":"response","created_at":1,"model":"fixture-model","status":"in_progress","output":[]}}`,
+		`{"type":"response.output_item.added","output_index":0,"item":{"id":"msg_frames","type":"message","role":"assistant","status":"in_progress","content":[]}}`,
+		`{"type":"response.content_part.added","item_id":"msg_frames","output_index":0,"content_index":0,"future_added_event":{"trace":1},"part":{"type":"output_text","text":"","annotations":[],"future_added_part":{"owner":"part"}}}`,
+		`{"type":"response.output_text.delta","item_id":"msg_frames","output_index":0,"content_index":0,"delta":"hello","future_delta_event":{"trace":2}}`,
+		`{"type":"response.output_text.done","item_id":"msg_frames","output_index":0,"content_index":0,"text":"hello","future_text_done":{"trace":3}}`,
+		`{"type":"response.content_part.done","item_id":"msg_frames","output_index":0,"content_index":0,"future_done_event":{"trace":4},"part":{"type":"output_text","text":"hello","annotations":[],"future_done_part":{"owner":"part"}}}`,
+		`{"type":"response.output_item.done","output_index":0,"future_item_done":{"trace":5},"item":{"id":"msg_frames","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello","annotations":[]}]}}`,
+		`{"type":"response.completed","response":{"id":"resp_frames","object":"response","created_at":1,"model":"fixture-model","status":"completed","output":[{"id":"msg_frames","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello","annotations":[]}]}]}}`,
+	} {
+		var wire StreamEvent
+		require.NoError(t, json.Unmarshal([]byte(raw), &wire))
+		events, err := decoder.decode(&wire)
+		require.NoError(t, err, "decode %s", wire.Type)
+		canonicalEvents = append(canonicalEvents, events...)
+	}
+
+	encoder := newCanonicalStreamEncoder()
+	source := &responsesInboundStream{ctx: context.Background(), transformerMetadata: make(map[string]any), aggregator: newStreamAggregator()}
+	for index := range canonicalEvents {
+		require.NoError(t, encoder.encode(source, canonicalEvents[index]), "encode canonical event %s", canonicalEvents[index].Kind)
+	}
+
+	encodedByType := make(map[StreamEventType]map[string]json.RawMessage)
+	for index := range source.eventQueue {
+		var envelope map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(source.eventQueue[index].Data, &envelope))
+		var eventType StreamEventType
+		require.NoError(t, json.Unmarshal(envelope["type"], &eventType))
+		encodedByType[eventType] = envelope
+	}
+
+	added := encodedByType[StreamEventTypeContentPartAdded]
+	require.JSONEq(t, `{"trace":1}`, string(added["future_added_event"]))
+	var addedPart map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(added["part"], &addedPart))
+	require.JSONEq(t, `{"owner":"part"}`, string(addedPart["future_added_part"]))
+	delta := encodedByType[StreamEventTypeOutputTextDelta]
+	require.JSONEq(t, `{"trace":2}`, string(delta["future_delta_event"]))
+	textDone := encodedByType[StreamEventTypeOutputTextDone]
+	require.JSONEq(t, `{"trace":3}`, string(textDone["future_text_done"]))
+	done := encodedByType[StreamEventTypeContentPartDone]
+	require.JSONEq(t, `{"trace":4}`, string(done["future_done_event"]))
+	var donePart map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(done["part"], &donePart))
+	require.JSONEq(t, `{"owner":"part"}`, string(donePart["future_done_part"]))
+	itemDone := encodedByType[StreamEventTypeOutputItemDone]
+	require.JSONEq(t, `{"trace":5}`, string(itemDone["future_item_done"]))
+}
+
+func TestCanonicalResponsesStreamBoundsPendingProtocolFrames(t *testing.T) {
+	t.Parallel()
+	decoder := newCanonicalStreamDecoder()
+	_, err := decoder.decode(&StreamEvent{Type: StreamEventTypeResponseCreated})
+	require.NoError(t, err)
+	itemID := "msg_frame_bound"
+	_, err = decoder.decode(&StreamEvent{
+		Type: StreamEventTypeOutputItemAdded, OutputIndex: 0,
+		Item: &Item{ID: itemID, Type: "message", Role: "assistant", Content: &Input{Items: []Item{}}, Status: lo.ToPtr("in_progress")},
+	})
+	require.NoError(t, err)
+	frame := &StreamEvent{
+		Type: StreamEventTypeContentPartDone, ItemID: &itemID, OutputIndex: 0,
+		Part: &StreamEventContentPart{Type: "output_text"},
+	}
+	for index := 0; index < maxPendingProtocolFramesPerItem; index++ {
+		_, err = decoder.decode(frame)
+		require.NoError(t, err, "frame %d", index)
+	}
+	_, err = decoder.decode(frame)
+	require.ErrorContains(t, err, "exceeded 128 pending events")
+}
+
+func TestCanonicalProtocolFrameHelperBranches(t *testing.T) {
+	t.Parallel()
+	if hasProtocolFrame(nil, StreamEventTypeContentPartAdded) {
+		t.Fatal("empty frame list reported a match")
+	}
+	frames := []llm.ProtocolFrameHint{
+		{SourceType: string(StreamEventTypeContentPartAdded), SourceResidual: json.RawMessage(`{"a":1}`)},
+		{SourceType: string(StreamEventTypeContentPartDone), SourceResidual: json.RawMessage(`{"b":2}`)},
+	}
+	if !hasProtocolFrame(frames, StreamEventTypeContentPartDone) || hasProtocolFrame(frames, StreamEventTypeOutputTextDone) {
+		t.Fatal("protocol frame lookup returned the wrong result")
+	}
+
+	decoder := newCanonicalStreamDecoder()
+	if got := decoder.takeProtocolFrames("missing"); got != nil {
+		t.Fatalf("missing frames = %#v", got)
+	}
+	decoder.protocolFrames["item:msg"] = cloneProtocolFrameHints(frames)
+	if got := decoder.takeProtocolFrames("item:msg", StreamEventTypeOutputTextDone); got != nil {
+		t.Fatalf("unmatched frames = %#v", got)
+	}
+	selected := decoder.takeProtocolFrames("item:msg", StreamEventTypeContentPartAdded)
+	require.Len(t, selected, 1)
+	selected[0].SourceResidual[0] = '['
+	require.JSONEq(t, `{"a":1}`, string(frames[0].SourceResidual), "selected frame shared residual bytes")
+	remaining := decoder.takeProtocolFrames("item:msg")
+	require.Len(t, remaining, 1)
+	require.Equal(t, string(StreamEventTypeContentPartDone), remaining[0].SourceType)
+	if got := decoder.takeProtocolFrames("item:msg"); got != nil {
+		t.Fatalf("drained frames = %#v", got)
+	}
+
+	unknownItem := "unknown"
+	err := decoder.rememberProtocolFrame(&StreamEvent{
+		Type: StreamEventTypeContentPartDone, ItemID: &unknownItem,
+		Part: &StreamEventContentPart{Type: "output_text"},
+	})
+	require.ErrorContains(t, err, "unknown item_id")
+}
+
+func TestCanonicalStreamItemCloneIsolatesResidualOwnership(t *testing.T) {
+	t.Parallel()
+
+	item := &llm.Item{
+		ProtocolHints: llm.ProtocolHints{SourceResidual: json.RawMessage(`{"item":1}`)},
+		Content: []llm.ContentBlock{{
+			Kind: llm.ContentKindCitation, SourceResidual: json.RawMessage(`{"block":1}`),
+			Citation: &llm.URLCitation{URL: "https://example.invalid", SourceResidual: json.RawMessage(`{"citation":1}`)},
+		}},
+		ToolCall:     &llm.ToolInvocation{PendingSafetyChecks: []llm.ToolSafetyCheck{{SourceResidual: json.RawMessage(`{"pending":1}`)}}},
+		ToolResult:   &llm.ToolResult{AcknowledgedSafetyChecks: []llm.ToolSafetyCheck{{SourceResidual: json.RawMessage(`{"ack":1}`)}}},
+		MCPListTools: &llm.MCPListTools{Tools: []llm.MCPDiscoveredTool{{Name: "lookup", SourceResidual: json.RawMessage(`{"mcp":1}`)}}},
+		Reasoning: &llm.ReasoningItem{
+			SummaryParts: []llm.ReasoningPart{{Type: "summary_text", SourceResidual: json.RawMessage(`{"summary":1}`)}},
+			ContentParts: []llm.ReasoningPart{{Type: "reasoning_text", SourceResidual: json.RawMessage(`{"reasoning":1}`)}},
+		},
+	}
+	clone := cloneCanonicalItem(item)
+	require.NotNil(t, clone)
+
+	clone.ProtocolHints.SourceResidual[0] = '['
+	clone.Content[0].SourceResidual[0] = '['
+	clone.Content[0].Citation.SourceResidual[0] = '['
+	clone.ToolCall.PendingSafetyChecks[0].SourceResidual[0] = '['
+	clone.ToolResult.AcknowledgedSafetyChecks[0].SourceResidual[0] = '['
+	clone.MCPListTools.Tools[0].SourceResidual[0] = '['
+	clone.Reasoning.SummaryParts[0].SourceResidual[0] = '['
+	clone.Reasoning.ContentParts[0].SourceResidual[0] = '['
+
+	require.JSONEq(t, `{"item":1}`, string(item.ProtocolHints.SourceResidual))
+	require.JSONEq(t, `{"block":1}`, string(item.Content[0].SourceResidual))
+	require.JSONEq(t, `{"citation":1}`, string(item.Content[0].Citation.SourceResidual))
+	require.JSONEq(t, `{"pending":1}`, string(item.ToolCall.PendingSafetyChecks[0].SourceResidual))
+	require.JSONEq(t, `{"ack":1}`, string(item.ToolResult.AcknowledgedSafetyChecks[0].SourceResidual))
+	require.JSONEq(t, `{"mcp":1}`, string(item.MCPListTools.Tools[0].SourceResidual))
+	require.JSONEq(t, `{"summary":1}`, string(item.Reasoning.SummaryParts[0].SourceResidual))
+	require.JSONEq(t, `{"reasoning":1}`, string(item.Reasoning.ContentParts[0].SourceResidual))
+}
+
+func TestCanonicalStreamItemCloneCoversOptionalLifecycleBranches(t *testing.T) {
+	t.Parallel()
+
+	require.Nil(t, cloneCanonicalItem(nil))
+	require.Nil(t, cloneCanonicalToolResult(nil))
+	require.Nil(t, cloneCanonicalContent(nil))
+
+	item := &llm.Item{
+		Content: []llm.ContentBlock{
+			{Kind: llm.ContentKindImage, Image: &llm.ImageURL{URL: "https://example.invalid/image.png"}},
+			{Kind: llm.ContentKindAudio, Audio: &llm.InputAudio{Data: "audio", Format: "wav"}},
+			{Kind: llm.ContentKindDocument, Document: &llm.DocumentURL{Filename: "fixture.txt", Data: "document"}},
+		},
+		HostedCall: &llm.HostedToolCall{
+			Invocation: llm.ToolInvocation{ArgumentsJSON: json.RawMessage(`{"x":1}`), ProviderData: json.RawMessage(`{"p":1}`)},
+			Result: &llm.ToolResult{
+				StructuredContent: json.RawMessage(`{"result":1}`), ProviderData: json.RawMessage(`{"provider":1}`),
+				DiscoveredTools: []llm.ToolDefinition{{
+					Kind: llm.ToolKindFunction, LogicalName: "lookup",
+					Function:      &llm.FunctionDefinition{Parameters: json.RawMessage(`{"type":"object"}`)},
+					ProtocolHints: llm.ProtocolHints{SourceResidual: json.RawMessage(`{"future":1}`)},
+				}},
+			},
+		},
+		MCPApprovalRequest:  &llm.MCPApprovalRequest{ArgumentsJSON: json.RawMessage(`{"approve":1}`)},
+		MCPApprovalResponse: &llm.MCPApprovalResponse{Reason: "approved"},
+		MCPCall:             &llm.MCPCall{ArgumentsJSON: json.RawMessage(`{"call":1}`)},
+		Compaction:          &llm.CompactionItem{EncryptedContent: "encrypted"},
+		Unknown:             &llm.UnknownItem{Raw: json.RawMessage(`{"unknown":1}`)},
+	}
+	clone := cloneCanonicalItem(item)
+	require.NotNil(t, clone)
+	require.NotSame(t, item.Content[0].Image, clone.Content[0].Image)
+	require.NotSame(t, item.Content[1].Audio, clone.Content[1].Audio)
+	require.NotSame(t, item.Content[2].Document, clone.Content[2].Document)
+
+	clone.HostedCall.Invocation.ArgumentsJSON[0] = '['
+	clone.HostedCall.Invocation.ProviderData[0] = '['
+	clone.HostedCall.Result.StructuredContent[0] = '['
+	clone.HostedCall.Result.ProviderData[0] = '['
+	clone.HostedCall.Result.DiscoveredTools[0].Function.Parameters[0] = '['
+	clone.HostedCall.Result.DiscoveredTools[0].ProtocolHints.SourceResidual[0] = '['
+	clone.MCPApprovalRequest.ArgumentsJSON[0] = '['
+	clone.MCPCall.ArgumentsJSON[0] = '['
+	clone.Unknown.Raw[0] = '['
+
+	require.JSONEq(t, `{"x":1}`, string(item.HostedCall.Invocation.ArgumentsJSON))
+	require.JSONEq(t, `{"p":1}`, string(item.HostedCall.Invocation.ProviderData))
+	require.JSONEq(t, `{"result":1}`, string(item.HostedCall.Result.StructuredContent))
+	require.JSONEq(t, `{"provider":1}`, string(item.HostedCall.Result.ProviderData))
+	require.JSONEq(t, `{"type":"object"}`, string(item.HostedCall.Result.DiscoveredTools[0].Function.Parameters))
+	require.JSONEq(t, `{"future":1}`, string(item.HostedCall.Result.DiscoveredTools[0].ProtocolHints.SourceResidual))
+	require.JSONEq(t, `{"approve":1}`, string(item.MCPApprovalRequest.ArgumentsJSON))
+	require.JSONEq(t, `{"call":1}`, string(item.MCPCall.ArgumentsJSON))
+	require.JSONEq(t, `{"unknown":1}`, string(item.Unknown.Raw))
+}
+
+func TestCanonicalResidualOwnerHelpers(t *testing.T) {
+	t.Parallel()
+
+	require.Nil(t, contentResidualForWire(nil, "input_text"))
+	require.Nil(t, contentResidualForWire(&llm.ContentBlock{}, "input_text"))
+	require.JSONEq(t, `{"future":1}`, string(contentResidualForWire(&llm.ContentBlock{
+		SourceResidual: json.RawMessage(`{"future":1}`),
+	}, "input_image")))
+	require.JSONEq(t, `{"future":1}`, string(contentResidualForWire(&llm.ContentBlock{
+		ResidualOwnerType: "text", SourceResidual: json.RawMessage(`{"future":1}`),
+	}, "input_text")))
+	require.Nil(t, contentResidualForWire(&llm.ContentBlock{
+		ResidualOwnerType: "input_text", SourceResidual: json.RawMessage(`{"future":1}`),
+	}, "input_image"))
+
+	require.Nil(t, reasoningPartResidualForWire(nil, "summary_text"))
+	require.Nil(t, reasoningPartResidualForWire(&llm.ReasoningPart{}, "summary_text"))
+	require.JSONEq(t, `{"future":1}`, string(reasoningPartResidualForWire(&llm.ReasoningPart{
+		SourceResidual: json.RawMessage(`{"future":1}`),
+	}, "summary_text")))
+	require.Nil(t, reasoningPartResidualForWire(&llm.ReasoningPart{
+		ResidualOwnerType: "summary_text", SourceResidual: json.RawMessage(`{"future":1}`),
+	}, "reasoning_text"))
+}

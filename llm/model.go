@@ -378,6 +378,10 @@ func (s *Stop) UnmarshalJSON(data []byte) error {
 
 // Message represents a message in the conversation.
 type Message struct {
+	// SourceResidual owns source-protocol fields attached to this exact message
+	// that are not represented by the common Message model.
+	SourceResidual json.RawMessage `json:"-"`
+
 	// ID is the upstream message/item identifier when the provider exposes one.
 	ID string `json:"id,omitempty"`
 
@@ -454,9 +458,25 @@ type Message struct {
 // ReasoningItem is an ordered, provider-neutral reasoning item.
 // Signature is opaque provider data and must not be concatenated or modified.
 type ReasoningItem struct {
-	ID        string `json:"id,omitempty"`
-	Content   string `json:"content,omitempty"`
-	Signature string `json:"signature,omitempty"`
+	SourceResidual json.RawMessage `json:"-"`
+	ID             string          `json:"id,omitempty"`
+	Content        string          `json:"content,omitempty"`
+	Signature      string          `json:"signature,omitempty"`
+	// SummaryParts and ContentParts retain the distinct ordered Responses
+	// reasoning structures. Content remains the provider-neutral aggregate used
+	// by Chat/Anthropic and by existing reasoning caches.
+	SummaryParts []ReasoningPart `json:"summary_parts,omitempty"`
+	ContentParts []ReasoningPart `json:"content_parts,omitempty"`
+	// ContentField records whether the source used "content" or the older
+	// "reasoning_content" spelling. It is source projection state, not text.
+	ContentField string `json:"content_field,omitempty"`
+}
+
+type ReasoningPart struct {
+	Type              string          `json:"type"`
+	Text              string          `json:"text"`
+	ResidualOwnerType string          `json:"-"`
+	SourceResidual    json.RawMessage `json:"-"`
 }
 
 // InlineToolResult represents a tool result that is emitted inline within the
@@ -499,6 +519,7 @@ type Annotation struct {
 
 // URLCitation represents a URL-based citation.
 type URLCitation struct {
+	SourceResidual json.RawMessage `json:"-"`
 	// Type preserves the provider citation semantic when more than one native
 	// citation shape shares the same URL fields.
 	Type string `json:"type,omitempty"`
@@ -558,6 +579,9 @@ func (c *MessageContent) UnmarshalJSON(data []byte) error {
 
 // MessageContentPart represents different types of content (text, image, video, etc.)
 type MessageContentPart struct {
+	// SourceResidual follows this exact content part through identity routes.
+	SourceResidual json.RawMessage `json:"-"`
+
 	// ID is the upstream content/item identifier when the provider exposes one.
 	ID string `json:"id,omitempty"`
 
@@ -819,6 +843,11 @@ type Response struct {
 	// TransformerMetadata stores metadata from transformers that process the response.
 	// This field is ignored when serializing to JSON and is only used internally by transformers.
 	TransformerMetadata map[string]any `json:"transformer_metadata,omitempty"`
+
+	// ProviderExtensions owns response-protocol residual state. It is excluded
+	// from provider-neutral JSON and follows the canonical response only while
+	// an identity projection still owns it.
+	ProviderExtensions *ResponseProviderExtensions `json:"-"`
 }
 
 // Choice represents a choice in the response.

@@ -50,6 +50,13 @@ func (encoder *canonicalStreamEncoder) encode(source *responsesInboundStream, ev
 		return fmt.Errorf("encode canonical %s as Responses: %w", event.Kind, err)
 	}
 	emit := func(wire *StreamEvent) error {
+		if event.SourceType == string(wire.Type) {
+			wire.Residual = cloneRaw(event.SourceResidual)
+			if wire.Response != nil {
+				wire.Response.Residual = cloneRaw(event.ResponseSourceResidual)
+			}
+		}
+		applyProtocolFrameHints(wire, event.ProtocolFrames)
 		if err := source.enqueueEvent(wire); err != nil {
 			return fmt.Errorf("emit Responses %s: %w", wire.Type, err)
 		}
@@ -109,6 +116,32 @@ func (encoder *canonicalStreamEncoder) encode(source *responsesInboundStream, ev
 	default:
 		return fmt.Errorf("canonical event %q has no Responses stream encoding", event.Kind)
 	}
+}
+
+func applyProtocolFrameHints(wire *StreamEvent, frames []llm.ProtocolFrameHint) {
+	if wire == nil || len(frames) == 0 {
+		return
+	}
+	for index := range frames {
+		frame := &frames[index]
+		if frame.SourceType != string(wire.Type) {
+			continue
+		}
+		wire.Residual = cloneRaw(frame.SourceResidual)
+		if wire.Part != nil {
+			wire.Part.Residual = cloneRaw(frame.PayloadResidual)
+		}
+		return
+	}
+}
+
+func hasProtocolFrame(frames []llm.ProtocolFrameHint, eventType StreamEventType) bool {
+	for index := range frames {
+		if frames[index].SourceType == string(eventType) {
+			return true
+		}
+	}
+	return false
 }
 
 func (encoder *canonicalStreamEncoder) addItem(source *responsesInboundStream, event llm.Event, emit func(*StreamEvent) error) error {
@@ -338,6 +371,31 @@ func (encoder *canonicalStreamEncoder) doneItem(event llm.Event, emit func(*Stre
 			return err
 		}
 		delete(encoder.deferredAdded, key)
+	}
+	if !encoder.contentStarted[key] && hasProtocolFrame(event.ProtocolFrames, StreamEventTypeContentPartAdded) {
+		encoder.contentStarted[key] = true
+		contentIndex := intValue(event.ContentIndex)
+		partType := "output_text"
+		if len(event.Snapshot.Content) > 0 && event.Snapshot.Content[0].Kind == llm.ContentKindRefusal {
+			partType = "refusal"
+		}
+		if err := emit(&StreamEvent{
+			Type: StreamEventTypeContentPartAdded, ItemID: &itemID, OutputIndex: outputIndex,
+			ContentIndex: &contentIndex, Part: &StreamEventContentPart{Type: partType},
+		}); err != nil {
+			return err
+		}
+	}
+	if !encoder.reasonStarted[key] && hasProtocolFrame(event.ProtocolFrames, StreamEventTypeReasoningSummaryPartAdded) {
+		encoder.reasonStarted[key] = true
+		summaryIndex := intValue(event.ContentIndex)
+		if err := emit(&StreamEvent{
+			Type: StreamEventTypeReasoningSummaryPartAdded, ItemID: &itemID,
+			OutputIndex: outputIndex, SummaryIndex: &summaryIndex,
+			Part: &StreamEventContentPart{Type: "summary_text"},
+		}); err != nil {
+			return err
+		}
 	}
 	if encoder.contentStarted[key] {
 		contentIndex := intValue(event.ContentIndex)

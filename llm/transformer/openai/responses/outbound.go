@@ -306,8 +306,10 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 	// Responses Lite requires an explicit false value, even when no top-level tools are sent.
 	if llmReq.RawRequest != nil && strings.EqualFold(strings.TrimSpace(llmReq.RawRequest.Headers.Get(ResponsesLiteHeader)), "true") {
 		payload.ParallelToolCalls = lo.ToPtr(false)
-	} else if len(payload.Tools) == 0 {
-		// Other Responses providers may reject parallel_tool_calls when tools are absent.
+	} else if len(payload.Tools) == 0 && !hasResponsesToolDeclaration(llmReq) {
+		// Some Responses providers reject parallel_tool_calls when the request has
+		// no effective tools. additional_tools declarations are effective tools
+		// even though they do not occupy the top-level tools array.
 		payload.ParallelToolCalls = nil
 	}
 
@@ -319,6 +321,9 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 	body, err := marshalRequestPayload(payload, llmReq)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal responses api request: %w", err)
+	}
+	if err := ValidateCompactionTriggerPlacement(body); err != nil {
+		return nil, fmt.Errorf("%w: %v", transformer.ErrInvalidRequest, err)
 	}
 
 	headers := make(http.Header)
@@ -350,6 +355,18 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 	}
 
 	return httpReq, nil
+}
+
+func hasResponsesToolDeclaration(request *llm.Request) bool {
+	if request == nil {
+		return false
+	}
+	for index := range request.Input {
+		if request.Input[index].Kind == llm.ItemKindToolDeclaration {
+			return true
+		}
+	}
+	return false
 }
 
 func lifecycleBackground(request *llm.Request) *bool {
@@ -475,6 +492,11 @@ func (t *OutboundTransformer) transformStandardResponse(
 		Choices:             make([]llm.Choice, 0),
 		TransformerMetadata: map[string]any{},
 	}
+	if len(resp.Residual) > 0 {
+		llmResp.ProviderExtensions = &llm.ResponseProviderExtensions{
+			OpenAIResponses: &llm.OpenAIResponsesResponseExtensions{ResidualFields: cloneRaw(resp.Residual)},
+		}
+	}
 	llmResp.Lifecycle.Background = resp.Background
 	if resp.Status != nil {
 		switch *resp.Status {
@@ -503,10 +525,15 @@ func (t *OutboundTransformer) transformStandardResponse(
 	}
 
 	llmResp.Output = make([]llm.Item, 0, len(resp.Output))
+	rawOutput := rawItemArrayField(httpResp.Body, "output")
 	for index := range resp.Output {
-		raw, err := json.Marshal(resp.Output[index])
-		if err != nil {
-			return nil, fmt.Errorf("marshal Responses output item %d: %w", index, err)
+		raw := rawInputAt(rawOutput, index)
+		if len(raw) == 0 {
+			var err error
+			raw, err = json.Marshal(resp.Output[index])
+			if err != nil {
+				return nil, fmt.Errorf("marshal Responses output item %d: %w", index, err)
+			}
 		}
 		item, err := responseItemToCanonical(&resp.Output[index], raw, index)
 		if err != nil {

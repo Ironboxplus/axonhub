@@ -24,12 +24,38 @@ type OpenAIResponsesProviderExtensions struct {
 	Request *OpenAIResponsesRequestExtensions `json:"-"`
 }
 
+type ResponseProviderExtensions struct {
+	OpenAIResponses *OpenAIResponsesResponseExtensions `json:"-"`
+}
+
+type OpenAIResponsesResponseExtensions struct {
+	ResidualFields json.RawMessage `json:"-"`
+}
+
+func CloneResponseProviderExtensions(src *ResponseProviderExtensions) *ResponseProviderExtensions {
+	if src == nil {
+		return nil
+	}
+	clone := &ResponseProviderExtensions{}
+	if src.OpenAIResponses != nil {
+		clone.OpenAIResponses = &OpenAIResponsesResponseExtensions{
+			ResidualFields: cloneRawMessage(src.OpenAIResponses.ResidualFields),
+		}
+	}
+	return clone
+}
+
 type OpenAIResponsesRequestExtensions struct {
-	ReasoningContext string                       `json:"-"`
-	RawTools         []OpenAIResponsesRawFragment `json:"-"`
-	ToolSignatures   []string                     `json:"-"`
-	RawToolChoice    json.RawMessage              `json:"-"`
-	RawInputItems    []OpenAIResponsesRawFragment `json:"-"`
+	ReasoningContext string                     `json:"-"`
+	ResidualFields   json.RawMessage            `json:"-"`
+	ToolNamespaces   []ToolNamespaceDeclaration `json:"-"`
+	// Deprecated raw-index fields are retained only for source compatibility
+	// while callers migrate. The Responses encoder and planner never consume
+	// them; canonical objects own tool, choice, and input identity.
+	RawTools       []OpenAIResponsesRawFragment `json:"-"`
+	ToolSignatures []string                     `json:"-"`
+	RawToolChoice  json.RawMessage              `json:"-"`
+	RawInputItems  []OpenAIResponsesRawFragment `json:"-"`
 }
 
 type OpenAIResponsesRawFragment struct {
@@ -100,6 +126,8 @@ func CloneProviderExtensions(src *ProviderExtensions) *ProviderExtensions {
 		if src.OpenAIResponses.Request != nil {
 			cloned.OpenAIResponses.Request = &OpenAIResponsesRequestExtensions{
 				ReasoningContext: src.OpenAIResponses.Request.ReasoningContext,
+				ResidualFields:   cloneRawMessage(src.OpenAIResponses.Request.ResidualFields),
+				ToolNamespaces:   cloneToolNamespaceDeclarations(src.OpenAIResponses.Request.ToolNamespaces),
 				RawTools:         cloneOpenAIResponsesRawFragments(src.OpenAIResponses.Request.RawTools),
 				ToolSignatures:   append([]string(nil), src.OpenAIResponses.Request.ToolSignatures...),
 				RawToolChoice:    cloneRawMessage(src.OpenAIResponses.Request.RawToolChoice),
@@ -109,6 +137,18 @@ func CloneProviderExtensions(src *ProviderExtensions) *ProviderExtensions {
 	}
 
 	return cloned
+}
+
+func cloneToolNamespaceDeclarations(src []ToolNamespaceDeclaration) []ToolNamespaceDeclaration {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make([]ToolNamespaceDeclaration, len(src))
+	copy(out, src)
+	for index := range out {
+		out[index].SourceResidual = cloneRawMessage(src[index].SourceResidual)
+	}
+	return out
 }
 
 func cloneOpenAIResponsesRawFragments(src []OpenAIResponsesRawFragment) []OpenAIResponsesRawFragment {

@@ -1,0 +1,270 @@
+// Command criticalcoverage runs real package tests and rejects any
+// uncovered statement in the identity/control functions declared below.
+package main
+
+import (
+	"bufio"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+)
+
+type target struct {
+	File     string `json:"file"`
+	Receiver string `json:"receiver,omitempty"`
+	Function string `json:"function,omitempty"`
+}
+
+type result struct {
+	target
+	Statements int     `json:"statements"`
+	Covered    int     `json:"covered"`
+	Percent    float64 `json:"percent"`
+}
+
+type coverBlock struct {
+	File               string
+	StartLine, EndLine int
+	Statements, Count  int
+}
+
+var targets = []target{
+	{File: "conversion_trace.go"},
+	{File: "request_controls.go"},
+	{File: "event_state.go"},
+	{File: "event.go", Receiver: "Event", Function: "Validate"},
+	{File: "provider_extensions.go", Function: "CloneResponseProviderExtensions"},
+	{File: "conversion/debug_trace.go"},
+	{File: "conversion/outbound.go", Function: "WithCapabilityProfile"},
+	{File: "conversion/outbound.go", Receiver: "Outbound", Function: "Preflight"},
+	{File: "conversion/outbound.go", Function: "appendRequestControlActions"},
+	{File: "conversion/ledger.go", Receiver: "Session", Function: "recordDebug"},
+	{File: "transformer/openai/responses/residual.go"},
+	{File: "transformer/openai/responses/request_validation.go"},
+	{File: "transformer/openai/responses/stream_event.go", Receiver: "StreamEvent", Function: "UnmarshalJSON"},
+	{File: "transformer/openai/responses/stream_event.go", Receiver: "StreamEvent", Function: "MarshalJSON"},
+	{File: "transformer/openai/responses/stream_event.go", Receiver: "StreamEventContentPart", Function: "UnmarshalJSON"},
+	{File: "transformer/openai/responses/stream_event.go", Receiver: "StreamEventContentPart", Function: "MarshalJSON"},
+	{File: "transformer/openai/responses/canonical_stream.go", Receiver: "canonicalStreamDecoder", Function: "rememberProtocolFrame"},
+	{File: "transformer/openai/responses/canonical_stream.go", Receiver: "canonicalStreamDecoder", Function: "takeProtocolFrames"},
+	{File: "transformer/openai/responses/canonical_stream.go", Function: "cloneCanonicalItem"},
+	{File: "transformer/openai/responses/canonical_stream.go", Function: "cloneCanonicalToolResult"},
+	{File: "transformer/openai/responses/canonical_stream.go", Function: "cloneCanonicalSafetyChecks"},
+	{File: "transformer/openai/responses/canonical_stream.go", Function: "cloneCanonicalReasoningParts"},
+	{File: "transformer/openai/responses/canonical_stream.go", Function: "cloneCanonicalContent"},
+	{File: "transformer/openai/responses/canonical_stream_encoder.go", Function: "applyProtocolFrameHints"},
+	{File: "transformer/openai/responses/canonical_stream_encoder.go", Function: "hasProtocolFrame"},
+	{File: "transformer/openai/responses/canonical_outbound.go", Function: "contentResidualForWire"},
+	{File: "transformer/openai/responses/canonical_outbound.go", Function: "reasoningPartResidualForWire"},
+	{File: "transformer/openai/responses/model.go", Receiver: "Tool", Function: "UnmarshalJSON"},
+	{File: "transformer/openai/responses/model.go", Receiver: "Tool", Function: "MarshalJSON"},
+	{File: "transformer/openai/responses/model.go", Receiver: "ToolChoice", Function: "UnmarshalJSON"},
+	{File: "transformer/openai/responses/model.go", Receiver: "ToolChoice", Function: "MarshalJSON"},
+	{File: "transformer/openai/responses/model.go", Receiver: "ResponseToolChoice", Function: "UnmarshalJSON"},
+	{File: "transformer/openai/responses/model.go", Receiver: "ResponseToolChoice", Function: "MarshalJSON"},
+	{File: "transformer/openai/responses/model.go", Receiver: "Annotation", Function: "UnmarshalJSON"},
+	{File: "transformer/openai/responses/model.go", Receiver: "Annotation", Function: "MarshalJSON"},
+	{File: "transformer/openai/responses/model.go", Receiver: "URLCitation", Function: "UnmarshalJSON"},
+	{File: "transformer/openai/responses/model.go", Receiver: "URLCitation", Function: "MarshalJSON"},
+	{File: "transformer/openai/responses/model.go", Receiver: "ToolOption", Function: "UnmarshalJSON"},
+	{File: "transformer/openai/responses/model.go", Receiver: "ToolOption", Function: "MarshalJSON"},
+	{File: "transformer/openai/responses/model.go", Receiver: "WebSearchSource", Function: "UnmarshalJSON"},
+	{File: "transformer/openai/responses/model.go", Receiver: "WebSearchSource", Function: "MarshalJSON"},
+	{File: "transformer/openai/responses/model.go", Receiver: "ComputerSafetyCheck", Function: "UnmarshalJSON"},
+	{File: "transformer/openai/responses/model.go", Receiver: "ComputerSafetyCheck", Function: "MarshalJSON"},
+	{File: "transformer/openai/responses/model.go", Receiver: "ComputerScreenshot", Function: "UnmarshalJSON"},
+	{File: "transformer/openai/responses/model.go", Receiver: "ComputerScreenshot", Function: "MarshalJSON"},
+	{File: "transformer/openai/responses/model.go", Receiver: "MCPListedTool", Function: "UnmarshalJSON"},
+	{File: "transformer/openai/responses/model.go", Receiver: "MCPListedTool", Function: "MarshalJSON"},
+	{File: "transformer/openai/responses/model.go", Receiver: "ItemAction", Function: "UnmarshalJSON"},
+	{File: "transformer/openai/responses/model.go", Receiver: "ItemAction", Function: "MarshalJSON"},
+	{File: "transformer/openai/responses/model.go", Receiver: "Item", Function: "UnmarshalJSON"},
+	{File: "transformer/openai/responses/model.go", Receiver: "Item", Function: "MarshalJSON"},
+	{File: "transformer/openai/responses/model.go", Receiver: "Item", Function: "marshalTypedJSON"},
+	{File: "transformer/openai/responses/model.go", Receiver: "ReasoningSummary", Function: "UnmarshalJSON"},
+	{File: "transformer/openai/responses/model.go", Receiver: "ReasoningSummary", Function: "MarshalJSON"},
+	{File: "transformer/openai/responses/model.go", Receiver: "ReasoningContent", Function: "UnmarshalJSON"},
+	{File: "transformer/openai/responses/model.go", Receiver: "ReasoningContent", Function: "MarshalJSON"},
+	{File: "transformer/openai/responses/model.go", Receiver: "Response", Function: "UnmarshalJSON"},
+	{File: "transformer/openai/responses/model.go", Receiver: "Response", Function: "MarshalJSON"},
+}
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, "critical coverage:", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	if err := os.MkdirAll(".coverage", 0o755); err != nil {
+		return err
+	}
+	profiles := []struct {
+		pkg, path string
+	}{
+		{pkg: ".", path: ".coverage/critical_llm.out"},
+		{pkg: "./conversion", path: ".coverage/critical_conversion.out"},
+		{pkg: "./transformer/openai/responses", path: ".coverage/critical_responses.out"},
+	}
+	var blocks []coverBlock
+	for _, profile := range profiles {
+		command := exec.Command("go", "test", profile.pkg, "-count=1", "-coverprofile="+profile.path)
+		command.Stdout = os.Stdout
+		command.Stderr = os.Stderr
+		if err := command.Run(); err != nil {
+			return fmt.Errorf("%s tests: %w", profile.pkg, err)
+		}
+		parsed, err := parseProfile(profile.path)
+		if err != nil {
+			return err
+		}
+		blocks = append(blocks, parsed...)
+	}
+
+	results := make([]result, 0, len(targets))
+	for _, item := range targets {
+		start, end, err := targetLines(item)
+		if err != nil {
+			return err
+		}
+		measured := result{target: item}
+		for _, block := range blocks {
+			if !strings.HasSuffix(filepath.ToSlash(block.File), item.File) {
+				continue
+			}
+			if item.Function != "" && (block.EndLine < start || block.StartLine > end) {
+				continue
+			}
+			measured.Statements += block.Statements
+			if block.Count > 0 {
+				measured.Covered += block.Statements
+			}
+		}
+		if measured.Statements == 0 {
+			return fmt.Errorf("no coverage blocks found for %+v", item)
+		}
+		measured.Percent = 100 * float64(measured.Covered) / float64(measured.Statements)
+		results = append(results, measured)
+	}
+
+	report, err := json.MarshalIndent(struct {
+		Results []result `json:"results"`
+	}{Results: results}, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(".coverage/critical-coverage.json", append(report, '\n'), 0o644); err != nil {
+		return err
+	}
+
+	failed := false
+	for _, measured := range results {
+		name := measured.File
+		if measured.Function != "" {
+			name += ":" + measured.Receiver + "." + measured.Function
+		}
+		fmt.Printf("%-95s %6.2f%% (%d/%d)\n", name, measured.Percent, measured.Covered, measured.Statements)
+		if measured.Covered != measured.Statements {
+			failed = true
+		}
+	}
+	if failed {
+		return errors.New("one or more critical targets are below 100% statement coverage")
+	}
+	return nil
+}
+
+func parseProfile(path string) ([]coverBlock, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var blocks []coverBlock
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "mode:") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) != 3 {
+			return nil, fmt.Errorf("invalid coverage line %q", line)
+		}
+		location := fields[0]
+		colon := strings.LastIndexByte(location, ':')
+		comma := strings.LastIndexByte(location, ',')
+		if colon < 0 || comma < colon {
+			return nil, fmt.Errorf("invalid coverage location %q", location)
+		}
+		start := strings.Split(location[colon+1:comma], ".")
+		end := strings.Split(location[comma+1:], ".")
+		if len(start) != 2 || len(end) != 2 {
+			return nil, fmt.Errorf("invalid coverage span %q", location)
+		}
+		startLine, err := strconv.Atoi(start[0])
+		if err != nil {
+			return nil, err
+		}
+		endLine, err := strconv.Atoi(end[0])
+		if err != nil {
+			return nil, err
+		}
+		statements, err := strconv.Atoi(fields[1])
+		if err != nil {
+			return nil, err
+		}
+		count, err := strconv.Atoi(fields[2])
+		if err != nil {
+			return nil, err
+		}
+		blocks = append(blocks, coverBlock{
+			File: location[:colon], StartLine: startLine, EndLine: endLine,
+			Statements: statements, Count: count,
+		})
+	}
+	return blocks, scanner.Err()
+}
+
+func targetLines(item target) (int, int, error) {
+	if item.Function == "" {
+		return 0, int(^uint(0) >> 1), nil
+	}
+	set := token.NewFileSet()
+	parsed, err := parser.ParseFile(set, filepath.FromSlash(item.File), nil, 0)
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, declaration := range parsed.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Name.Name != item.Function || receiverName(function) != item.Receiver {
+			continue
+		}
+		return set.Position(function.Pos()).Line, set.Position(function.End()).Line, nil
+	}
+	return 0, 0, fmt.Errorf("target function not found: %+v", item)
+}
+
+func receiverName(function *ast.FuncDecl) string {
+	if function.Recv == nil || len(function.Recv.List) != 1 {
+		return ""
+	}
+	typ := function.Recv.List[0].Type
+	if pointer, ok := typ.(*ast.StarExpr); ok {
+		typ = pointer.X
+	}
+	if identifier, ok := typ.(*ast.Ident); ok {
+		return identifier.Name
+	}
+	return ""
+}

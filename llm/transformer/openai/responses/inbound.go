@@ -366,7 +366,7 @@ func convertToolChoiceToLLM(src *ToolChoice) *llm.ToolChoice {
 		return nil
 	}
 
-	result := &llm.ToolChoice{}
+	result := &llm.ToolChoice{SourceResidual: cloneRaw(src.Residual)}
 
 	if src.Type != nil && *src.Type == "allowed_tools" {
 		mode := "auto"
@@ -378,6 +378,7 @@ func convertToolChoiceToLLM(src *ToolChoice) *llm.ToolChoice {
 			tool := src.Tools[index]
 			allowed.Tools = append(allowed.Tools, llm.AllowedToolRef{
 				Type: tool.Type, Name: tool.Name, ServerLabel: tool.ServerLabel,
+				SourceResidual: cloneRaw(tool.Residual),
 			})
 		}
 		result.AllowedTools = allowed
@@ -389,6 +390,13 @@ func convertToolChoiceToLLM(src *ToolChoice) *llm.ToolChoice {
 		}
 		if src.Name != nil {
 			result.NamedToolChoice.Function.Name = *src.Name
+		}
+		for index := range src.Tools {
+			tool := src.Tools[index]
+			result.NamedToolChoice.Options = append(result.NamedToolChoice.Options, llm.AllowedToolRef{
+				Type: tool.Type, Name: tool.Name, ServerLabel: tool.ServerLabel,
+				SourceResidual: cloneRaw(tool.Residual),
+			})
 		}
 	}
 
@@ -475,9 +483,10 @@ func convertReasoningWithFollowing(items []Item, startIdx int) (*llm.Message, in
 		}
 
 		msg.ReasoningItems = append(msg.ReasoningItems, llm.ReasoningItem{
-			ID:        reasoningItem.ID,
-			Content:   reasoningText.String(),
-			Signature: lo.FromPtr(reasoningItem.EncryptedContent),
+			ID:             reasoningItem.ID,
+			Content:        reasoningText.String(),
+			Signature:      lo.FromPtr(reasoningItem.EncryptedContent),
+			SourceResidual: cloneRaw(reasoningItem.Residual),
 		})
 		consumed++
 	}
@@ -567,14 +576,13 @@ func convertItemToMessage(item *Item) (*llm.Message, error) {
 	switch item.Type {
 	case "message", "input_text", "":
 		msg := &llm.Message{
-			ID:   item.ID,
-			Role: item.Role,
+			ID:             item.ID,
+			Role:           item.Role,
+			SourceResidual: cloneRaw(item.Residual),
 		}
 
 		// Handle content - check Content.Items first (output message format from JSON)
-		if item.Content != nil && len(item.Content.Items) > 0 && item.isOutputMessageContent() {
-			msg.Content = convertContentItemsToMessageContent(item.GetContentItems())
-		} else if item.Content != nil {
+		if item.Content != nil {
 			msg.Content = convertToMessageContent(*item.Content)
 		} else if item.Text != nil {
 			msg.Content = llm.MessageContent{Content: item.Text}
@@ -690,7 +698,7 @@ func convertItemToMessage(item *Item) (*llm.Message, error) {
 func convertToMessageContent(content Input) llm.MessageContent {
 	items := convertToMessageContentParts(content)
 	// If only one text item, return simple Content
-	if len(items) == 1 && (items[0].Type == "text" || items[0].Type == "input_text") && items[0].Text != nil {
+	if len(items) == 1 && (items[0].Type == "text" || items[0].Type == "input_text") && items[0].Text != nil && len(items[0].SourceResidual) == 0 {
 		return llm.MessageContent{
 			Content: items[0].Text,
 		}
@@ -762,9 +770,10 @@ func convertContentItemToPart(item *Item) (*llm.MessageContentPart, error) {
 	case "input_text", "text", "output_text":
 		if item.Text != nil {
 			return &llm.MessageContentPart{
-				ID:   item.ID,
-				Type: "text",
-				Text: item.Text,
+				ID:             item.ID,
+				Type:           "text",
+				Text:           item.Text,
+				SourceResidual: cloneRaw(item.Residual),
 			}, nil
 		}
 
@@ -773,8 +782,9 @@ func convertContentItemToPart(item *Item) (*llm.MessageContentPart, error) {
 	case "input_image":
 		if item.ImageURL != nil {
 			return &llm.MessageContentPart{
-				ID:   item.ID,
-				Type: "image_url",
+				ID:             item.ID,
+				Type:           "image_url",
+				SourceResidual: cloneRaw(item.Residual),
 				ImageURL: &llm.ImageURL{
 					URL:    *item.ImageURL,
 					Detail: item.Detail,
@@ -1014,6 +1024,9 @@ func convertToResponsesAPIResponse(chatResp *llm.Response) (*Response, error) {
 		Status:             lo.ToPtr("completed"),
 		PreviousResponseID: chatResp.PreviousResponseID,
 		Background:         chatResp.Lifecycle.Background,
+	}
+	if chatResp.ProviderExtensions != nil && chatResp.ProviderExtensions.OpenAIResponses != nil {
+		resp.Residual = cloneRaw(chatResp.ProviderExtensions.OpenAIResponses.ResidualFields)
 	}
 
 	// Convert usage
@@ -1262,10 +1275,11 @@ func buildReasoningItems(msg llm.Message) []Item {
 		}
 
 		item := Item{
-			ID:      itemID,
-			Type:    "reasoning",
-			Status:  lo.ToPtr("completed"),
-			Summary: summary,
+			ID:       itemID,
+			Type:     "reasoning",
+			Status:   lo.ToPtr("completed"),
+			Summary:  summary,
+			Residual: cloneRaw(reasoningItem.SourceResidual),
 		}
 		if reasoningItem.Signature != "" {
 			item.EncryptedContent = lo.ToPtr(reasoningItem.Signature)

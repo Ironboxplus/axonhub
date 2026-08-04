@@ -54,7 +54,7 @@ func validateCanonicalAnthropicRequest(request *llm.Request) error {
 	for index := range request.Input {
 		item := &request.Input[index]
 		switch item.Kind {
-		case llm.ItemKindMessage, llm.ItemKindReasoning:
+		case llm.ItemKindMessage, llm.ItemKindReasoning, llm.ItemKindToolDeclaration:
 		case llm.ItemKindToolCall:
 			if item.ToolCall == nil || item.ToolCall.Kind != llm.ToolKindFunction {
 				return fmt.Errorf("canonical item %d tool call has no Anthropic encoding", index)

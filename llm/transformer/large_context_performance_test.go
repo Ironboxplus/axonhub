@@ -1,3 +1,5 @@
+//go:build !race
+
 package transformer_test
 
 import (

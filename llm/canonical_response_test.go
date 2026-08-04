@@ -1,6 +1,9 @@
 package llm
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestCanonicalResponseAccumulatorMaterializesInterleavedParallelTools(t *testing.T) {
 	accumulator := NewCanonicalResponseAccumulator()
@@ -93,5 +96,46 @@ func TestCanonicalTerminalReasonSurvivesMaterializeAndAggregate(t *testing.T) {
 	invalid := Event{Kind: EventKindTextDelta, ItemRef: ItemRef{ItemID: "msg"}, Delta: Delta{Text: "x"}, TerminalReason: "pause_turn"}
 	if err := invalid.Validate(); err == nil {
 		t.Fatal("non-terminal event accepted a terminal reason")
+	}
+}
+
+func TestCanonicalResponseResidualSurvivesEventMaterializationAndIsIsolated(t *testing.T) {
+	response := &Response{
+		ID: "resp_residual", Status: ResponseStatusCompleted,
+		ProviderExtensions: &ResponseProviderExtensions{
+			OpenAIResponses: &OpenAIResponsesResponseExtensions{
+				ResidualFields: json.RawMessage(`{"conversation":{"future":1}}`),
+			},
+		},
+	}
+	events, err := CanonicalEventsFromResponse(response)
+	if err != nil {
+		t.Fatalf("render response residual: %v", err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("events = %d", len(events))
+	}
+	for index := range events {
+		if string(events[index].ResponseSourceResidual) != `{"conversation":{"future":1}}` {
+			t.Fatalf("event %d response residual = %s", index, events[index].ResponseSourceResidual)
+		}
+	}
+
+	accumulator := NewCanonicalResponseAccumulator()
+	for index := range events {
+		if err := accumulator.Observe(&Response{Events: []Event{events[index]}}); err != nil {
+			t.Fatalf("observe residual event %d: %v", index, err)
+		}
+	}
+	snapshot := accumulator.Snapshot()
+	if snapshot.ProviderExtensions == nil || snapshot.ProviderExtensions.OpenAIResponses == nil {
+		t.Fatal("response residual extensions were lost")
+	}
+	if got := string(snapshot.ProviderExtensions.OpenAIResponses.ResidualFields); got != `{"conversation":{"future":1}}` {
+		t.Fatalf("snapshot response residual = %s", got)
+	}
+	snapshot.ProviderExtensions.OpenAIResponses.ResidualFields[0] = '['
+	if got := string(accumulator.Snapshot().ProviderExtensions.OpenAIResponses.ResidualFields); got != `{"conversation":{"future":1}}` {
+		t.Fatalf("snapshot mutation leaked into accumulator: %s", got)
 	}
 }

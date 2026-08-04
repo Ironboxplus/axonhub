@@ -20,13 +20,11 @@ func attachOpenAIResponsesRequestExtensions(chatReq *llm.Request, req *Request, 
 	}
 	requestExt := &llm.OpenAIResponsesRequestExtensions{
 		ReasoningContext: reasoningContext,
-		RawTools:         buildRawOnlyToolFragments(req.Tools, raw.Tools),
-		ToolSignatures:   buildRepresentedToolSignatures(chatReq),
-		RawToolChoice:    rawUnsupportedToolChoice(req.ToolChoice, raw.ToolChoice),
-		RawInputItems:    buildRawOnlyInputFragments(req.Input, raw.InputItems),
+		ResidualFields:   raw.ResidualFields,
+		ToolNamespaces:   responseToolNamespaces(req.Tools),
 	}
 
-	if requestExt.ReasoningContext == "" && len(requestExt.RawTools) == 0 && len(requestExt.RawToolChoice) == 0 && len(requestExt.RawInputItems) == 0 {
+	if requestExt.ReasoningContext == "" && len(requestExt.ResidualFields) == 0 && len(requestExt.ToolNamespaces) == 0 {
 		return
 	}
 
@@ -38,9 +36,8 @@ func attachOpenAIResponsesRequestExtensions(chatReq *llm.Request, req *Request, 
 }
 
 type rawRequestFragments struct {
-	Tools      []json.RawMessage
-	ToolChoice json.RawMessage
-	InputItems []json.RawMessage
+	InputItems     []json.RawMessage
+	ResidualFields json.RawMessage
 }
 
 func parseRawRequestFragments(rawBody []byte) rawRequestFragments {
@@ -49,9 +46,7 @@ func parseRawRequestFragments(rawBody []byte) rawRequestFragments {
 	}
 
 	var raw struct {
-		Tools      []json.RawMessage `json:"tools"`
-		ToolChoice json.RawMessage   `json:"tool_choice"`
-		Input      json.RawMessage   `json:"input"`
+		Input json.RawMessage `json:"input"`
 	}
 	if err := json.Unmarshal(rawBody, &raw); err != nil {
 		return rawRequestFragments{}
@@ -63,9 +58,8 @@ func parseRawRequestFragments(rawBody []byte) rawRequestFragments {
 	}
 
 	return rawRequestFragments{
-		Tools:      raw.Tools,
-		ToolChoice: raw.ToolChoice,
-		InputItems: inputItems,
+		InputItems:     inputItems,
+		ResidualFields: responseRequestResidual(rawBody),
 	}
 }
 
@@ -209,17 +203,9 @@ func buildRawOnlyInputFragments(input Input, rawItems []json.RawMessage) []llm.O
 			})
 			continue
 		}
-		if isStructurallyRepresentedInputItemValue(item) {
-			continue
-		}
-
-		fragments = append(fragments, llm.OpenAIResponsesRawFragment{
-			Type:          item.Type,
-			Name:          item.Name,
-			CallID:        item.CallID,
-			OriginalIndex: i,
-			Raw:           cloneRaw(rawItems[i]),
-		})
+		// Every non-declaration input item now owns its raw/unknown state on the
+		// canonical node itself. Keeping another absolute-index fragment here
+		// would allow a deleted or moved node to be replayed at its old position.
 	}
 
 	return fragments
@@ -262,7 +248,7 @@ func isStructurallyRepresentedInputItem(itemType string) bool {
 		"local_shell_call_output", "computer_call", "computer_call_output", "file_search_call", "code_interpreter_call",
 		"shell_call", "shell_call_output", "apply_patch_call", "apply_patch_call_output",
 		"tool_search_call", "tool_search_output", "reasoning",
-		"compaction", "compaction_summary", "additional_tools":
+		"compaction", "compaction_summary", "compaction_trigger", "additional_tools":
 		return true
 	default:
 		return false
@@ -300,29 +286,14 @@ func marshalRequestPayload(payload Request, llmReq *llm.Request) ([]byte, error)
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return nil, err
 	}
-
-	if tools, ok, err := mergeRawOnlyTools(obj["tools"], requestExt); err != nil {
-		return nil, err
-	} else if ok {
-		toolsRaw, err := json.Marshal(tools)
+	if len(requestExt.ResidualFields) > 0 {
+		merged, err := mergeResidualObject(body, requestExt.ResidualFields)
 		if err != nil {
+			return nil, fmt.Errorf("merge Responses request residual: %w", err)
+		}
+		if err := json.Unmarshal(merged, &obj); err != nil {
 			return nil, err
 		}
-		obj["tools"] = toolsRaw
-	}
-
-	if len(requestExt.RawToolChoice) > 0 && rawToolChoiceMatchesCurrentTools(requestExt.RawToolChoice, payload.ToolChoice) {
-		obj["tool_choice"] = cloneRaw(requestExt.RawToolChoice)
-	}
-
-	if input, ok, err := mergeRawOnlyInputItems(obj["input"], requestExt); err != nil {
-		return nil, err
-	} else if ok {
-		inputRaw, err := json.Marshal(input)
-		if err != nil {
-			return nil, err
-		}
-		obj["input"] = inputRaw
 	}
 
 	return json.Marshal(obj)
@@ -528,9 +499,35 @@ func mergeRawObject(currentRaw, originalRaw json.RawMessage) (json.RawMessage, e
 		return nil, err
 	}
 	for key, value := range current {
+		originalValue, exists := original[key]
+		if !exists {
+			original[key] = cloneRaw(value)
+			continue
+		}
+		merged, ok, err := mergeNestedRawObject(value, originalValue)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			original[key] = merged
+			continue
+		}
 		original[key] = cloneRaw(value)
 	}
 	return json.Marshal(original)
+}
+
+func mergeNestedRawObject(currentRaw, originalRaw json.RawMessage) (json.RawMessage, bool, error) {
+	var current map[string]json.RawMessage
+	if json.Unmarshal(currentRaw, &current) != nil {
+		return nil, false, nil
+	}
+	var original map[string]json.RawMessage
+	if json.Unmarshal(originalRaw, &original) != nil {
+		return nil, false, nil
+	}
+	merged, err := mergeRawObject(currentRaw, originalRaw)
+	return merged, true, err
 }
 
 func rawInputItemType(object map[string]json.RawMessage) (string, error) {

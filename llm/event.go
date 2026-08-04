@@ -56,19 +56,35 @@ type Delta struct {
 	ProviderData  json.RawMessage `json:"provider_data,omitempty"`
 }
 
+// ProtocolFrameHint preserves bounded source-only metadata from wire framing
+// events that do not represent an independent canonical semantic transition.
+// It never carries model text, tool arguments, or other payload bytes.
+type ProtocolFrameHint struct {
+	SourceType      string          `json:"-"`
+	SourceResidual  json.RawMessage `json:"-"`
+	PayloadResidual json.RawMessage `json:"-"`
+}
+
 // Event is the ordered canonical stream unit shared by Chat Completions,
 // Responses and Anthropic Messages.
 type Event struct {
-	Kind           EventKind      `json:"kind"`
-	Sequence       uint64         `json:"sequence"`
-	TerminalReason string         `json:"terminal_reason,omitempty"`
-	SourceSequence *uint64        `json:"source_sequence,omitempty"`
-	ItemRef        ItemRef        `json:"item_ref,omitempty"`
-	ContentIndex   *int           `json:"content_index,omitempty"`
-	Delta          Delta          `json:"delta,omitempty"`
-	Snapshot       *Item          `json:"snapshot,omitempty"`
-	Usage          *Usage         `json:"usage,omitempty"`
-	Error          *ResponseError `json:"error,omitempty"`
+	Kind           EventKind       `json:"kind"`
+	Sequence       uint64          `json:"sequence"`
+	SourceType     string          `json:"-"`
+	SourceResidual json.RawMessage `json:"-"`
+	// ResponseSourceResidual owns fields nested under a Responses lifecycle
+	// event's response object. It is separate from SourceResidual, which belongs
+	// to the stream-event envelope itself.
+	ResponseSourceResidual json.RawMessage     `json:"-"`
+	ProtocolFrames         []ProtocolFrameHint `json:"-"`
+	TerminalReason         string              `json:"terminal_reason,omitempty"`
+	SourceSequence         *uint64             `json:"source_sequence,omitempty"`
+	ItemRef                ItemRef             `json:"item_ref,omitempty"`
+	ContentIndex           *int                `json:"content_index,omitempty"`
+	Delta                  Delta               `json:"delta,omitempty"`
+	Snapshot               *Item               `json:"snapshot,omitempty"`
+	Usage                  *Usage              `json:"usage,omitempty"`
+	Error                  *ResponseError      `json:"error,omitempty"`
 }
 
 func (event *Event) Validate() error {
@@ -139,6 +155,24 @@ func (event *Event) Validate() error {
 
 	if len(event.Delta.ProviderData) > 0 && !json.Valid(event.Delta.ProviderData) {
 		return errors.New("event provider_data is invalid JSON")
+	}
+	if len(event.SourceResidual) > 0 && !json.Valid(event.SourceResidual) {
+		return errors.New("event source residual is invalid JSON")
+	}
+	if len(event.ResponseSourceResidual) > 0 && !json.Valid(event.ResponseSourceResidual) {
+		return errors.New("event response source residual is invalid JSON")
+	}
+	for index := range event.ProtocolFrames {
+		frame := &event.ProtocolFrames[index]
+		if frame.SourceType == "" {
+			return fmt.Errorf("event protocol frame %d has no source type", index)
+		}
+		if len(frame.SourceResidual) > 0 && !json.Valid(frame.SourceResidual) {
+			return fmt.Errorf("event protocol frame %d source residual is invalid JSON", index)
+		}
+		if len(frame.PayloadResidual) > 0 && !json.Valid(frame.PayloadResidual) {
+			return fmt.Errorf("event protocol frame %d payload residual is invalid JSON", index)
+		}
 	}
 	if event.TerminalReason != "" {
 		switch event.Kind {

@@ -58,6 +58,7 @@ type Session struct {
 	lastStreamEvent       atomic.Value
 	terminalEvent         atomic.Value
 	traceEnabled          bool
+	debugMu               sync.Mutex
 	compactEmulation      *compactEmulationState
 }
 
@@ -245,7 +246,7 @@ func (s *Session) recordCustomInputRepair(callID string, direction llm.Conversio
 	s.recordDebug(direction, ref, "repair", StrategyCustomAsFunction, ReasonSemanticProjection, true)
 }
 
-func (s *Session) recordCustomInputRawFallback(callID string) {
+func (s *Session) recordCustomInputRawFallback(callID string, direction llm.ConversionDirection, ref ObjectRef) {
 	if s == nil {
 		return
 	}
@@ -255,13 +256,17 @@ func (s *Session) recordCustomInputRawFallback(callID string) {
 		}
 	}
 	s.addRestoreMiss()
+	s.recordDebug(direction, ref, "restore_miss", StrategyCustomAsFunction, ReasonNoStrategy, false)
 }
 
 func (s *Session) DebugTrace() *llm.ConversionDebugTrace {
 	if s == nil || s.plan == nil {
 		return nil
 	}
-	return s.plan.Debug.Clone()
+	s.debugMu.Lock()
+	trace := s.plan.Debug
+	s.debugMu.Unlock()
+	return trace.Clone()
 }
 
 func (s *Session) recordDebug(
@@ -272,10 +277,18 @@ func (s *Session) recordDebug(
 	reason ReasonCode,
 	reversible bool,
 ) {
-	if s == nil || s.plan == nil || s.plan.Debug == nil {
+	if s == nil || s.plan == nil {
 		return
 	}
-	s.plan.Debug.Append(
-		direction, string(ref.Kind), action, string(strategy), string(reason), reversible, objectRefBytes(ref),
-	)
+	evidence := runtimeActionEvidence(direction, ref, action, strategy, reason, reversible)
+	s.debugMu.Lock()
+	trace := s.plan.Debug
+	if trace == nil && requiredRuntimeEvidence(evidence) {
+		trace = llm.NewRequiredConversionDebugTrace(1)
+		s.plan.Debug = trace
+	}
+	s.debugMu.Unlock()
+	if trace != nil {
+		trace.Append(evidence, objectRefBytes(ref))
+	}
 }
