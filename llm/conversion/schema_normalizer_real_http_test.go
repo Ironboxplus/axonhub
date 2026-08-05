@@ -235,6 +235,73 @@ func TestInvalidNestedIdentitySchemaStopsBeforeProviderDispatchOverRealHTTP(t *t
 	}
 }
 
+func TestInvalidJSONPointerSchemaStopsBeforeProviderDispatchOverRealHTTP(t *testing.T) {
+	t.Parallel()
+	var providerRequests atomic.Int32
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		providerRequests.Add(1)
+		http.Error(writer, "provider must not receive invalid JSON Pointer", http.StatusBadRequest)
+	}))
+	t.Cleanup(provider.Close)
+	target, err := responses.NewOutboundTransformer(provider.URL, "fixture-key")
+	if err != nil {
+		t.Fatalf("create Responses outbound: %v", err)
+	}
+	executor := httpclient.NewHttpClientWithClient(provider.Client())
+	t.Cleanup(executor.CloseIdleConnections)
+	result, err := pipeline.NewFactory(executor).
+		Pipeline(responses.NewInboundTransformer(), conversion.NewOutbound(target)).
+		Process(context.Background(), &httpclient.Request{
+			Method: http.MethodPost, URL: "/v1/responses",
+			Headers: http.Header{"Content-Type": []string{"application/json"}},
+			Body:    []byte(`{"model":"fixture-model","input":"hi","tools":[{"type":"function","name":"lookup","parameters":{"type":"object","allOf":[true,true],"$ref":"#/allOf/01"}}]}`),
+		})
+	if !errors.Is(err, conversion.ErrIncompletePlan) {
+		t.Fatalf("pipeline error = %v, want ErrIncompletePlan; result=%#v", err, result)
+	}
+	if got := providerRequests.Load(); got != 0 {
+		t.Fatalf("provider received %d invalid JSON Pointer requests, want zero", got)
+	}
+}
+
+func TestInvalidResourceScopedSchemasStopBeforeProviderDispatchOverRealHTTP(t *testing.T) {
+	t.Parallel()
+	invalidSchemas := []string{
+		`{"$anchor":"shared","$defs":{"sub":{"$id":"sub","$ref":"#shared"}}}`,
+		`{"$id":"https://schemas.example.invalid/root#fragment"}`,
+		`{"$anchor":"a:b"}`,
+		`{"$defs":{"first":{"$id":"same"},"second":{"$id":"same"}}}`,
+	}
+	var providerRequests atomic.Int32
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		providerRequests.Add(1)
+		http.Error(writer, "provider must not receive invalid resource-scoped schema", http.StatusBadRequest)
+	}))
+	t.Cleanup(provider.Close)
+	target, err := responses.NewOutboundTransformer(provider.URL, "fixture-key")
+	if err != nil {
+		t.Fatalf("create Responses outbound: %v", err)
+	}
+	executor := httpclient.NewHttpClientWithClient(provider.Client())
+	t.Cleanup(executor.CloseIdleConnections)
+	for index, schema := range invalidSchemas {
+		body := fmt.Sprintf(`{"model":"fixture-model","input":"hi","tools":[{"type":"function","name":"lookup","parameters":%s}]}`, schema)
+		result, processErr := pipeline.NewFactory(executor).
+			Pipeline(responses.NewInboundTransformer(), conversion.NewOutbound(target)).
+			Process(context.Background(), &httpclient.Request{
+				Method: http.MethodPost, URL: "/v1/responses",
+				Headers: http.Header{"Content-Type": []string{"application/json"}},
+				Body:    []byte(body),
+			})
+		if !errors.Is(processErr, conversion.ErrIncompletePlan) {
+			t.Fatalf("schema %d pipeline error = %v, want ErrIncompletePlan; result=%#v", index, processErr, result)
+		}
+	}
+	if got := providerRequests.Load(); got != 0 {
+		t.Fatalf("provider received %d invalid resource-scoped schema requests, want zero", got)
+	}
+}
+
 func TestResponsesIdentityNamespacedFunctionRestoresChildNameOverRealHTTP(t *testing.T) {
 	t.Parallel()
 	historyCallID := "history call:" + strings.Repeat("x", 80)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/url"
 	"testing"
 
 	"github.com/looplj/axonhub/llm"
@@ -463,10 +464,15 @@ func TestFunctionSchemaStructuralValidatorCoversStandardKeywordShapesAndReferenc
 	invalid := []json.RawMessage{
 		json.RawMessage(`{"title":42}`),
 		json.RawMessage(`{"pattern":"["}`),
+		json.RawMessage(`{"$schema":"draft/2020-12"}`),
+		json.RawMessage(`{"$schema":"https://schemas.example.invalid/bad path"}`),
 		json.RawMessage(`{"$recursiveRef":"https://example.invalid/schema"}`),
 		json.RawMessage(`{"$recursiveAnchor":"yes"}`),
 		json.RawMessage(`{"examples":"example"}`),
 		json.RawMessage(`{"$anchor":""}`),
+		json.RawMessage(`{"$anchor":"with space"}`),
+		json.RawMessage(`{"$anchor":"with:colon"}`),
+		json.RawMessage(`{"$dynamicAnchor":"9starts-with-digit"}`),
 		json.RawMessage(`{"$anchor":"duplicate","allOf":[{"$anchor":"duplicate"}]}`),
 		json.RawMessage(`{"$ref":"https://schemas.example.invalid/tool"}`),
 		json.RawMessage(`{"deprecated":"false"}`),
@@ -527,22 +533,35 @@ func TestFunctionSchemaStructuralValidatorHonorsDraft04ExclusiveBounds(t *testin
 func TestLocalSchemaReferenceResolutionCoversPointersAnchorsAndInvalidTargets(t *testing.T) {
 	t.Parallel()
 	root := map[string]any{
-		"defs":   []any{map[string]any{"type": "object"}},
+		"defs":   []any{map[string]any{"type": "object"}, true},
 		"a/b":    map[string]any{"~key": true},
 		"a b":    map[string]any{"type": "string"},
+		"~2":     true,
+		"tail~":  true,
 		"value":  "not-a-schema",
 		"scalar": float64(1),
 	}
-	anchors := map[string]struct{}{"known": {}, "known anchor": {}}
+	base, ok := parseSchemaURIReference(functionSchemaBaseURL.String())
+	if !ok {
+		t.Fatal("parse fixture base URI")
+	}
+	index := &schemaReferenceIndex{resources: map[string]*schemaResource{
+		schemaResourceKey(base): {root: root, anchors: map[string]any{"known": true, "known-anchor": true}},
+	}}
 	tests := []struct {
 		ref  string
 		want bool
 	}{
 		{ref: "#", want: true},
 		{ref: "#known", want: true},
-		{ref: "#known%20anchor", want: true},
+		{ref: "#known%2Danchor", want: true},
 		{ref: "#missing", want: false},
 		{ref: "#/defs/0", want: true},
+		{ref: "#/defs/1", want: true},
+		{ref: "#/defs/01", want: false},
+		{ref: "#/defs/+0", want: false},
+		{ref: "#/defs/1x", want: false},
+		{ref: "#/defs/999999999999999999999999999999", want: false},
 		{ref: "#/defs/not-an-index", want: false},
 		{ref: "#/defs/-1", want: false},
 		{ref: "#/defs/2", want: false},
@@ -550,12 +569,111 @@ func TestLocalSchemaReferenceResolutionCoversPointersAnchorsAndInvalidTargets(t 
 		{ref: "#/scalar/child", want: false},
 		{ref: "#/value", want: false},
 		{ref: "#/a~1b/~0key", want: true},
+		{ref: "#/~2", want: false},
+		{ref: "#/tail~", want: false},
 		{ref: "#/a%20b", want: true},
 		{ref: "#/a%ZZb", want: false},
 	}
 	for _, test := range tests {
-		if got := localSchemaReferenceExists(root, test.ref, anchors); got != test.want {
+		ref, validURI := parseSchemaURIReference(test.ref)
+		got := validURI && localSchemaReferenceExists(index, schemaReference{base: base, ref: ref})
+		if got != test.want {
 			t.Fatalf("reference %q resolved=%v, want %v", test.ref, got, test.want)
+		}
+	}
+}
+
+func TestFunctionSchemaReferencesHonorResourceScopeAndLocalIDs(t *testing.T) {
+	t.Parallel()
+	valid := []json.RawMessage{
+		json.RawMessage(`{
+			"$id":"https://schemas.example.invalid/root",
+			"$defs":{
+				"first":{"$id":"first","$anchor":"shared","type":"string"},
+				"second":{"$id":"second","$anchor":"shared","type":"number"}
+			},
+			"allOf":[{"$ref":"first#shared"},{"$ref":"second#shared"}]
+		}`),
+		json.RawMessage(`{
+			"$id":"https://schemas.example.invalid/root/",
+			"$defs":{"sub":{"$id":"sub","$defs":{"value":true}}},
+			"$ref":"sub#/$defs/value"
+		}`),
+		json.RawMessage(`{"$id":"https://schemas.example.invalid/root?dialect=tool","$ref":"#"}`),
+	}
+	for index, raw := range valid {
+		if _, ok := parseValidFunctionSchema(raw); !ok {
+			t.Fatalf("valid resource-scoped schema %d rejected: %s", index, raw)
+		}
+	}
+
+	invalid := []json.RawMessage{
+		json.RawMessage(`{
+			"$anchor":"shared",
+			"$defs":{"sub":{"$id":"sub","$ref":"#shared"}}
+		}`),
+		json.RawMessage(`{"$defs":{"first":{"$id":"same"},"second":{"$id":"same"}}}`),
+		json.RawMessage(`{"$id":"https://schemas.example.invalid/root#fragment"}`),
+		json.RawMessage(`{"$id":"not a uri"}`),
+		json.RawMessage(`{"$id":"bad\\path"}`),
+		json.RawMessage(`{"$id":"bad{path"}`),
+		json.RawMessage(`{"$id":"bad%ZZpath"}`),
+		json.RawMessage(`{"$ref":"#bad%ZZanchor"}`),
+		json.RawMessage(`{"$ref":"missing#anchor"}`),
+	}
+	for index, raw := range invalid {
+		if parsed, ok := parseValidFunctionSchema(raw); ok || parsed != nil {
+			t.Fatalf("invalid resource-scoped schema %d accepted: %s", index, raw)
+		}
+	}
+}
+
+func TestSchemaResourceIndexerFailsClosedOnInvalidInternalInputs(t *testing.T) {
+	t.Parallel()
+	absoluteBase, ok := parseSchemaURIReference(functionSchemaBaseURL.String())
+	if !ok {
+		t.Fatal("parse absolute fixture base URI")
+	}
+	relativeBase, ok := parseSchemaURIReference("")
+	if !ok {
+		t.Fatal("parse relative fixture base URI")
+	}
+	booleanIndex := &schemaReferenceIndex{resources: map[string]*schemaResource{}}
+	if !indexFunctionSchemaResources(true, absoluteBase, booleanIndex) || len(booleanIndex.resources) != 1 {
+		t.Fatal("boolean root schema was not indexed as its own resource")
+	}
+	tests := []struct {
+		name   string
+		schema any
+		base   *url.URL
+		index  *schemaReferenceIndex
+	}{
+		{name: "non schema", schema: []any{}, base: absoluteBase, index: &schemaReferenceIndex{resources: map[string]*schemaResource{}}},
+		{name: "non string id", schema: map[string]any{"$id": true}, base: absoluteBase, index: &schemaReferenceIndex{resources: map[string]*schemaResource{}}},
+		{name: "relative resolved id", schema: map[string]any{"$id": "child"}, base: relativeBase, index: &schemaReferenceIndex{resources: map[string]*schemaResource{}}},
+		{name: "missing inherited resource", schema: map[string]any{}, base: absoluteBase, index: &schemaReferenceIndex{resources: map[string]*schemaResource{"https://other.invalid/schema": {root: true}}}},
+		{name: "malformed ref", schema: map[string]any{"$ref": "#bad%ZZanchor"}, base: absoluteBase, index: &schemaReferenceIndex{resources: map[string]*schemaResource{}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if indexFunctionSchemaResources(test.schema, test.base, test.index) {
+				t.Fatal("invalid internal schema indexing input was accepted")
+			}
+		})
+	}
+}
+
+func TestForEachFunctionSubschemaStopsAtRejectedChild(t *testing.T) {
+	t.Parallel()
+	tests := []map[string]any{
+		{"additionalItems": "stop"},
+		{"items": []any{"stop"}},
+		{"items": "stop"},
+		{"dependencies": map[string]any{"property": "stop"}},
+	}
+	for index, object := range tests {
+		if forEachFunctionSubschema(object, func(child any) bool { return child != "stop" }) {
+			t.Fatalf("subschema container %d ignored a rejected child", index)
 		}
 	}
 }

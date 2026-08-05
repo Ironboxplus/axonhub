@@ -15,7 +15,16 @@ import (
 	"github.com/looplj/axonhub/llm"
 )
 
-var emptyFunctionParameters = json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`)
+var (
+	emptyFunctionParameters         = json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`)
+	functionSchemaBaseURL           = url.URL{Scheme: "https", Host: "axon.invalid", Path: "/function-schema"}
+	singleFunctionSubschemaKeywords = []string{
+		"additionalItems", "contains", "unevaluatedItems", "additionalProperties", "propertyNames",
+		"unevaluatedProperties", "not", "if", "then", "else", "contentSchema",
+	}
+	arrayFunctionSubschemaKeywords = []string{"prefixItems", "allOf", "anyOf", "oneOf"}
+	mapFunctionSubschemaKeywords   = []string{"$defs", "definitions", "properties", "patternProperties", "dependentSchemas"}
+)
 
 type schemaNormalization struct {
 	schema         json.RawMessage
@@ -192,9 +201,23 @@ func normalizeIdentityFunctionSchema(raw json.RawMessage, root map[string]any) s
 }
 
 type schemaValidationState struct {
-	anchors map[string]struct{}
-	refs    []string
-	draft04 bool
+	draft04             bool
+	hasReferenceKeyword bool
+}
+
+type schemaResource struct {
+	root    any
+	anchors map[string]any
+}
+
+type schemaReference struct {
+	base *url.URL
+	ref  *url.URL
+}
+
+type schemaReferenceIndex struct {
+	resources map[string]*schemaResource
+	refs      []schemaReference
 }
 
 func parseValidFunctionSchema(raw []byte) (any, bool) {
@@ -206,10 +229,8 @@ func parseValidFunctionSchema(raw []byte) (any, bool) {
 	if !validFunctionSchemaNode(schema, state) {
 		return nil, false
 	}
-	for _, ref := range state.refs {
-		if !localSchemaReferenceExists(schema, ref, state.anchors) {
-			return nil, false
-		}
+	if state.hasReferenceKeyword && !validateFunctionSchemaReferences(schema) {
+		return nil, false
 	}
 	return schema, true
 }
@@ -242,31 +263,26 @@ func validFunctionSchemaNode(schema any, state *schemaValidationState) bool {
 		if !ok {
 			return false
 		}
+		if state != nil {
+			switch keyword {
+			case "$id", "$anchor", "$dynamicAnchor", "$ref", "$dynamicRef", "$recursiveRef":
+				state.hasReferenceKeyword = true
+			}
+		}
 		if keyword == "pattern" {
 			if !validJSONSchemaPattern(text) {
 				return false
 			}
 		}
-		if keyword == "$anchor" || keyword == "$dynamicAnchor" {
-			if text == "" {
+		if keyword == "$schema" {
+			identifier, validURI := parseSchemaURIReference(text)
+			if !validURI || !identifier.IsAbs() {
 				return false
-			}
-			if state != nil {
-				if state.anchors == nil {
-					state.anchors = make(map[string]struct{})
-				}
-				if _, duplicate := state.anchors[text]; duplicate {
-					return false
-				}
-				state.anchors[text] = struct{}{}
 			}
 		}
-		if keyword == "$ref" || keyword == "$dynamicRef" || keyword == "$recursiveRef" {
-			if !strings.HasPrefix(text, "#") {
+		if keyword == "$anchor" || keyword == "$dynamicAnchor" {
+			if !validSchemaAnchor(text) {
 				return false
-			}
-			if state != nil {
-				state.refs = append(state.refs, text)
 			}
 		}
 	}
@@ -339,10 +355,7 @@ func validFunctionSchemaNode(schema any, state *schemaValidationState) bool {
 			}
 		}
 	}
-	for _, keyword := range []string{
-		"additionalItems", "contains", "unevaluatedItems", "additionalProperties", "propertyNames",
-		"unevaluatedProperties", "not", "if", "then", "else", "contentSchema",
-	} {
+	for _, keyword := range singleFunctionSubschemaKeywords {
 		if child, exists := object[keyword]; exists && !validFunctionSchemaNode(child, state) {
 			return false
 		}
@@ -361,7 +374,7 @@ func validFunctionSchemaNode(schema any, state *schemaValidationState) bool {
 			return false
 		}
 	}
-	for _, keyword := range []string{"prefixItems", "allOf", "anyOf", "oneOf"} {
+	for _, keyword := range arrayFunctionSubschemaKeywords {
 		value, exists := object[keyword]
 		if !exists {
 			continue
@@ -376,7 +389,7 @@ func validFunctionSchemaNode(schema any, state *schemaValidationState) bool {
 			}
 		}
 	}
-	for _, keyword := range []string{"$defs", "definitions", "properties", "patternProperties", "dependentSchemas"} {
+	for _, keyword := range mapFunctionSubschemaKeywords {
 		value, exists := object[keyword]
 		if !exists {
 			continue
@@ -515,39 +528,270 @@ func validJSONSchemaPattern(pattern string) bool {
 	return err == nil
 }
 
-func localSchemaReferenceExists(root any, ref string, anchors map[string]struct{}) bool {
-	fragment, err := url.PathUnescape(strings.TrimPrefix(ref, "#"))
-	if err != nil {
+func validSchemaAnchor(anchor string) bool {
+	if anchor == "" || (!isASCIILetter(anchor[0]) && anchor[0] != '_') {
 		return false
 	}
-	if fragment == "" {
-		return true
-	}
-	if !strings.HasPrefix(fragment, "/") {
-		_, ok := anchors[fragment]
-		return ok
-	}
-	current := root
-	for _, rawSegment := range strings.Split(strings.TrimPrefix(fragment, "/"), "/") {
-		segment := strings.ReplaceAll(strings.ReplaceAll(rawSegment, "~1", "/"), "~0", "~")
-		switch value := current.(type) {
-		case map[string]any:
-			var ok bool
-			current, ok = value[segment]
-			if !ok {
-				return false
-			}
-		case []any:
-			index, err := strconv.Atoi(segment)
-			if err != nil || index < 0 || index >= len(value) {
-				return false
-			}
-			current = value[index]
-		default:
+	for index := 1; index < len(anchor); index++ {
+		char := anchor[index]
+		if !isASCIILetter(char) && (char < '0' || char > '9') && char != '-' && char != '.' && char != '_' {
 			return false
 		}
 	}
-	return validFunctionSchemaNode(current, &schemaValidationState{draft04: isDraft04Schema(root)})
+	return true
+}
+
+func isASCIILetter(char byte) bool {
+	return char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z'
+}
+
+func validateFunctionSchemaReferences(root any) bool {
+	base := functionSchemaBaseURL
+	index := &schemaReferenceIndex{resources: make(map[string]*schemaResource)}
+	if !indexFunctionSchemaResources(root, &base, index) {
+		return false
+	}
+	for _, ref := range index.refs {
+		if !localSchemaReferenceExists(index, ref) {
+			return false
+		}
+	}
+	return true
+}
+
+func indexFunctionSchemaResources(schema any, inheritedBase *url.URL, index *schemaReferenceIndex) bool {
+	if _, ok := schema.(bool); ok {
+		if len(index.resources) == 0 {
+			index.resources[schemaResourceKey(inheritedBase)] = &schemaResource{root: schema}
+		}
+		return true
+	}
+	object, ok := schema.(map[string]any)
+	if !ok {
+		return false
+	}
+	base := inheritedBase
+	establishesResource := len(index.resources) == 0
+	if rawID, exists := object["$id"]; exists {
+		identifier, ok := rawID.(string)
+		if !ok {
+			return false
+		}
+		parsedID, ok := parseSchemaURIReference(identifier)
+		if !ok || parsedID.Fragment != "" {
+			return false
+		}
+		resolved := inheritedBase.ResolveReference(parsedID)
+		if !resolved.IsAbs() {
+			return false
+		}
+		base = resolved
+		establishesResource = true
+	}
+	resourceKey := schemaResourceKey(base)
+	resource := index.resources[resourceKey]
+	if establishesResource {
+		if resource != nil {
+			return false
+		}
+		resource = &schemaResource{root: schema}
+		index.resources[resourceKey] = resource
+	} else if resource == nil {
+		return false
+	}
+	for _, keyword := range []string{"$anchor", "$dynamicAnchor"} {
+		anchor, exists := object[keyword].(string)
+		if !exists {
+			continue
+		}
+		if resource.anchors == nil {
+			resource.anchors = make(map[string]any)
+		}
+		if _, duplicate := resource.anchors[anchor]; duplicate {
+			return false
+		}
+		resource.anchors[anchor] = schema
+	}
+	for _, keyword := range []string{"$ref", "$dynamicRef", "$recursiveRef"} {
+		rawRef, exists := object[keyword].(string)
+		if !exists {
+			continue
+		}
+		parsedRef, ok := parseSchemaURIReference(rawRef)
+		if !ok {
+			return false
+		}
+		index.refs = append(index.refs, schemaReference{base: base, ref: parsedRef})
+	}
+	return forEachFunctionSubschema(object, func(child any) bool {
+		return indexFunctionSchemaResources(child, base, index)
+	})
+}
+
+func forEachFunctionSubschema(object map[string]any, visit func(any) bool) bool {
+	for _, keyword := range singleFunctionSubschemaKeywords {
+		if child, exists := object[keyword]; exists && !visit(child) {
+			return false
+		}
+	}
+	if items, exists := object["items"]; exists {
+		if children, ok := items.([]any); ok {
+			for _, child := range children {
+				if !visit(child) {
+					return false
+				}
+			}
+		} else if !visit(items) {
+			return false
+		}
+	}
+	for _, keyword := range arrayFunctionSubschemaKeywords {
+		children, exists := object[keyword].([]any)
+		if !exists {
+			continue
+		}
+		for _, child := range children {
+			if !visit(child) {
+				return false
+			}
+		}
+	}
+	for _, keyword := range mapFunctionSubschemaKeywords {
+		children, exists := object[keyword].(map[string]any)
+		if !exists {
+			continue
+		}
+		for _, child := range children {
+			if !visit(child) {
+				return false
+			}
+		}
+	}
+	if dependencies, exists := object["dependencies"].(map[string]any); exists {
+		for _, dependency := range dependencies {
+			if _, requiredNames := stringArray(dependency); requiredNames {
+				continue
+			}
+			if !visit(dependency) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func parseSchemaURIReference(raw string) (*url.URL, bool) {
+	for index := 0; index < len(raw); index++ {
+		char := raw[index]
+		alphaNumeric := (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9')
+		if !alphaNumeric && !strings.ContainsRune("-._~:/?#[]@!$&'()*+,;=%", rune(char)) {
+			return nil, false
+		}
+	}
+	parsed, err := url.Parse(raw)
+	return parsed, err == nil
+}
+
+func schemaResourceKey(uri *url.URL) string {
+	resourceURI := *uri
+	resourceURI.Fragment = ""
+	resourceURI.RawFragment = ""
+	return resourceURI.String()
+}
+
+func localSchemaReferenceExists(index *schemaReferenceIndex, reference schemaReference) bool {
+	resolved := reference.base.ResolveReference(reference.ref)
+	resource := index.resources[schemaResourceKey(resolved)]
+	if resource == nil {
+		return false
+	}
+	fragment := resolved.Fragment
+	var target any
+	if fragment == "" {
+		target = resource.root
+	} else if !strings.HasPrefix(fragment, "/") {
+		var ok bool
+		target, ok = resource.anchors[fragment]
+		if !ok {
+			return false
+		}
+	} else {
+		var ok bool
+		target, ok = dereferenceSchemaJSONPointer(resource.root, fragment)
+		if !ok {
+			return false
+		}
+	}
+	return validFunctionSchemaTree(target)
+}
+
+func dereferenceSchemaJSONPointer(root any, fragment string) (any, bool) {
+	current := root
+	for _, rawSegment := range strings.Split(strings.TrimPrefix(fragment, "/"), "/") {
+		segment, ok := decodeJSONPointerToken(rawSegment)
+		if !ok {
+			return nil, false
+		}
+		switch value := current.(type) {
+		case map[string]any:
+			current, ok = value[segment]
+			if !ok {
+				return nil, false
+			}
+		case []any:
+			arrayIndex, ok := parseJSONPointerArrayIndex(segment)
+			if !ok || arrayIndex >= len(value) {
+				return nil, false
+			}
+			current = value[arrayIndex]
+		default:
+			return nil, false
+		}
+	}
+	return current, true
+}
+
+func decodeJSONPointerToken(raw string) (string, bool) {
+	if !strings.Contains(raw, "~") {
+		return raw, true
+	}
+	var decoded strings.Builder
+	decoded.Grow(len(raw))
+	for index := 0; index < len(raw); index++ {
+		if raw[index] != '~' {
+			decoded.WriteByte(raw[index])
+			continue
+		}
+		if index+1 >= len(raw) {
+			return "", false
+		}
+		index++
+		switch raw[index] {
+		case '0':
+			decoded.WriteByte('~')
+		case '1':
+			decoded.WriteByte('/')
+		default:
+			return "", false
+		}
+	}
+	return decoded.String(), true
+}
+
+func parseJSONPointerArrayIndex(token string) (int, bool) {
+	if token == "0" {
+		return 0, true
+	}
+	if token == "" || token[0] < '1' || token[0] > '9' {
+		return 0, false
+	}
+	for index := 1; index < len(token); index++ {
+		if token[index] < '0' || token[index] > '9' {
+			return 0, false
+		}
+	}
+	value, err := strconv.Atoi(token)
+	return value, err == nil
 }
 
 func normalizeEmptyFunctionSchema(strict *bool, source, target llm.APIFormat, reversible bool) schemaNormalization {
