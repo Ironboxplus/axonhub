@@ -3,8 +3,13 @@ package conversion
 import (
 	"bytes"
 	"encoding/json"
+	"math"
+	"reflect"
+	"regexp"
 	"slices"
 	"sort"
+	"strconv"
+	"strings"
 
 	"github.com/looplj/axonhub/llm"
 )
@@ -17,6 +22,7 @@ type schemaNormalization struct {
 	optionalPaths  []schemaOptionalPath
 	changed        bool
 	reversible     bool
+	invalid        bool
 }
 
 type schemaPathStep struct {
@@ -26,9 +32,10 @@ type schemaPathStep struct {
 
 type schemaOptionalPath []schemaPathStep
 
-// normalizeFunctionSchema applies only wire-compatibility rules shared by the
-// three supported function-tool protocols. It is deliberately not a general
-// JSON Schema validator: keywords it does not need to change remain intact.
+// normalizeFunctionSchema validates supported JSON Schema keyword structures
+// before applying wire-compatibility rules shared by the three function-tool
+// protocols. Unknown extension keywords remain intact, but malformed standard
+// keywords fail closed instead of being widened or forwarded to a provider.
 func normalizeFunctionSchema(raw json.RawMessage, target llm.APIFormat) (json.RawMessage, bool) {
 	result := normalizeFunctionSchemaDetailed(raw, nil, target, target)
 	return result.schema, result.changed
@@ -42,16 +49,20 @@ func normalizeFunctionSchemaDetailed(raw json.RawMessage, strict *bool, source, 
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return normalizeEmptyFunctionSchema(strict, source, target, true)
 	}
-
-	var value any
-	if json.Unmarshal(trimmed, &value) != nil {
-		// Canonical validation normally makes this unreachable. Keeping a valid,
-		// closed empty argument object here prevents a legacy projection from
-		// emitting malformed JSON if it bypassed canonical validation.
-		return normalizeEmptyFunctionSchema(strict, source, target, false)
+	value, valid := parseValidFunctionSchema(trimmed)
+	if !valid {
+		return schemaNormalization{schema: raw, reversible: true, invalid: true}
+	}
+	if source == target && !identityFunctionSchemaNeedsNormalization(value) {
+		return schemaNormalization{schema: raw, reversible: true}
 	}
 	root, ok := value.(map[string]any)
 	if !ok {
+		if source == target {
+			if _, booleanSchema := value.(bool); !booleanSchema {
+				return schemaNormalization{schema: raw, reversible: true, invalid: true}
+			}
+		}
 		result := normalizeNonObjectRootSchema(value)
 		var normalizedRoot map[string]any
 		if json.Unmarshal(result.schema, &normalizedRoot) != nil {
@@ -77,11 +88,14 @@ func normalizeFunctionSchemaDetailed(raw json.RawMessage, strict *bool, source, 
 		}
 		return result
 	}
+	if source == target {
+		return normalizeIdentityFunctionSchema(raw, root)
+	}
 
 	changed := false
 	normalizeSchemaNode(root, &changed)
 	reversible := true
-	if target == llm.APIFormatAnthropicMessage && flattenRootSchemaUnions(root) {
+	if source != target && target == llm.APIFormatAnthropicMessage && flattenRootSchemaUnions(root) {
 		changed = true
 		reversible = false
 	}
@@ -93,6 +107,9 @@ func normalizeFunctionSchemaDetailed(raw json.RawMessage, strict *bool, source, 
 		}
 	}
 	if ensureObjectProperties(root) {
+		changed = true
+	}
+	if normalizeRootObjectUnionBranches(root) {
 		changed = true
 	}
 	strictOverride := (*bool)(nil)
@@ -124,6 +141,403 @@ func normalizeFunctionSchemaDetailed(raw json.RawMessage, strict *bool, source, 
 		schema: normalized, strictOverride: strictOverride, optionalPaths: optionalPaths,
 		changed: true, reversible: reversible,
 	}
+}
+
+func identityFunctionSchemaNeedsNormalization(value any) bool {
+	root, ok := value.(map[string]any)
+	if !ok {
+		return true
+	}
+	schemaType, ok := root["type"].(string)
+	return !ok || schemaType != "object" || root["anyOf"] != nil || root["oneOf"] != nil
+}
+
+func normalizeIdentityFunctionSchema(raw json.RawMessage, root map[string]any) schemaNormalization {
+	typeValue := root["type"]
+	changed := false
+	reversible := true
+	switch value := typeValue.(type) {
+	case string:
+		if value != "object" {
+			root = map[string]any{"type": "object", "allOf": []any{root}}
+			changed = true
+			reversible = false
+		}
+	case []any:
+		if slices.Contains(value, any("object")) {
+			root["type"] = "object"
+		} else {
+			root = map[string]any{"type": "object", "allOf": []any{root}}
+			reversible = false
+		}
+		changed = true
+	default:
+		// parseValidFunctionSchema already rejected every explicit non-string
+		// and non-array type, so this is the implicit-object case only.
+		root["type"] = "object"
+		changed = true
+	}
+	if normalizeRootObjectUnionBranches(root) {
+		changed = true
+	}
+	if !changed {
+		return schemaNormalization{schema: raw, reversible: true}
+	}
+	normalized, err := json.Marshal(root)
+	if err != nil {
+		return schemaNormalization{schema: raw, reversible: true, invalid: true}
+	}
+	return schemaNormalization{schema: normalized, changed: true, reversible: reversible}
+}
+
+type schemaValidationState struct {
+	anchors map[string]struct{}
+	refs    []string
+	draft04 bool
+}
+
+func parseValidFunctionSchema(raw []byte) (any, bool) {
+	var schema any
+	if json.Unmarshal(raw, &schema) != nil {
+		return nil, false
+	}
+	state := &schemaValidationState{draft04: isDraft04Schema(schema)}
+	if !validFunctionSchemaNode(schema, state) {
+		return nil, false
+	}
+	for _, ref := range state.refs {
+		if !localSchemaReferenceExists(schema, ref, state.anchors) {
+			return nil, false
+		}
+	}
+	return schema, true
+}
+
+func validFunctionSchemaTree(schema any) bool {
+	return validFunctionSchemaNode(schema, nil)
+}
+
+func validFunctionSchemaNode(schema any, state *schemaValidationState) bool {
+	if _, ok := schema.(bool); ok {
+		return true
+	}
+	object, ok := schema.(map[string]any)
+	if !ok {
+		return false
+	}
+	typeValue, hasType := object["type"]
+	if !validSchemaTypeValue(typeValue, hasType) {
+		return false
+	}
+	for _, keyword := range []string{
+		"$schema", "$id", "$anchor", "$dynamicAnchor", "$ref", "$dynamicRef", "$recursiveRef", "$comment",
+		"title", "description", "pattern", "contentEncoding", "contentMediaType", "format",
+	} {
+		value, exists := object[keyword]
+		if !exists {
+			continue
+		}
+		text, ok := value.(string)
+		if !ok {
+			return false
+		}
+		if keyword == "pattern" {
+			if _, err := regexp.Compile(text); err != nil {
+				return false
+			}
+		}
+		if keyword == "$anchor" || keyword == "$dynamicAnchor" {
+			if text == "" {
+				return false
+			}
+			if state != nil {
+				if state.anchors == nil {
+					state.anchors = make(map[string]struct{})
+				}
+				if _, duplicate := state.anchors[text]; duplicate {
+					return false
+				}
+				state.anchors[text] = struct{}{}
+			}
+		}
+		if keyword == "$ref" || keyword == "$dynamicRef" || keyword == "$recursiveRef" {
+			if !strings.HasPrefix(text, "#") {
+				return false
+			}
+			if state != nil {
+				state.refs = append(state.refs, text)
+			}
+		}
+	}
+	for _, keyword := range []string{"deprecated", "readOnly", "writeOnly", "uniqueItems", "$recursiveAnchor"} {
+		if value, exists := object[keyword]; exists {
+			if _, ok := value.(bool); !ok {
+				return false
+			}
+		}
+	}
+	for _, keyword := range []string{"multipleOf", "minimum", "maximum"} {
+		value, exists := object[keyword]
+		if !exists {
+			continue
+		}
+		number, ok := value.(float64)
+		if !ok || math.IsNaN(number) || math.IsInf(number, 0) || keyword == "multipleOf" && number <= 0 {
+			return false
+		}
+	}
+	for _, keyword := range []string{"exclusiveMinimum", "exclusiveMaximum"} {
+		value, exists := object[keyword]
+		if !exists {
+			continue
+		}
+		if state != nil && state.draft04 {
+			if _, ok := value.(bool); !ok {
+				return false
+			}
+			continue
+		}
+		number, ok := value.(float64)
+		if !ok || math.IsNaN(number) || math.IsInf(number, 0) {
+			return false
+		}
+	}
+	for _, keyword := range []string{
+		"minLength", "maxLength", "minItems", "maxItems", "minContains", "maxContains", "minProperties", "maxProperties",
+	} {
+		if value, exists := object[keyword]; exists && !nonNegativeJSONInteger(value) {
+			return false
+		}
+	}
+	if value, exists := object["enum"]; exists {
+		values, ok := value.([]any)
+		if !ok || len(values) == 0 || containsDuplicateJSONValues(values) {
+			return false
+		}
+	}
+	if value, exists := object["examples"]; exists {
+		if _, ok := value.([]any); !ok {
+			return false
+		}
+	}
+	if value, exists := object["required"]; exists {
+		required, ok := stringArray(value)
+		if !ok || hasDuplicateStrings(required) {
+			return false
+		}
+	}
+	if value, exists := object["dependentRequired"]; exists {
+		dependencies, ok := value.(map[string]any)
+		if !ok {
+			return false
+		}
+		for _, raw := range dependencies {
+			required, ok := stringArray(raw)
+			if !ok || hasDuplicateStrings(required) {
+				return false
+			}
+		}
+	}
+	for _, keyword := range []string{
+		"additionalItems", "contains", "unevaluatedItems", "additionalProperties", "propertyNames",
+		"unevaluatedProperties", "not", "if", "then", "else", "contentSchema",
+	} {
+		if child, exists := object[keyword]; exists && !validFunctionSchemaNode(child, state) {
+			return false
+		}
+	}
+	if items, exists := object["items"]; exists {
+		if array, ok := items.([]any); ok {
+			if len(array) == 0 {
+				return false
+			}
+			for _, child := range array {
+				if !validFunctionSchemaNode(child, state) {
+					return false
+				}
+			}
+		} else if !validFunctionSchemaNode(items, state) {
+			return false
+		}
+	}
+	for _, keyword := range []string{"prefixItems", "allOf", "anyOf", "oneOf"} {
+		value, exists := object[keyword]
+		if !exists {
+			continue
+		}
+		children, ok := value.([]any)
+		if !ok || len(children) == 0 {
+			return false
+		}
+		for _, child := range children {
+			if !validFunctionSchemaNode(child, state) {
+				return false
+			}
+		}
+	}
+	for _, keyword := range []string{"$defs", "definitions", "properties", "patternProperties", "dependentSchemas"} {
+		value, exists := object[keyword]
+		if !exists {
+			continue
+		}
+		children, ok := value.(map[string]any)
+		if !ok {
+			return false
+		}
+		for name, child := range children {
+			if keyword == "patternProperties" {
+				if _, err := regexp.Compile(name); err != nil {
+					return false
+				}
+			}
+			if !validFunctionSchemaNode(child, state) {
+				return false
+			}
+		}
+	}
+	if value, exists := object["dependencies"]; exists {
+		dependencies, ok := value.(map[string]any)
+		if !ok {
+			return false
+		}
+		for _, dependency := range dependencies {
+			if required, ok := stringArray(dependency); ok {
+				if len(required) == 0 || hasDuplicateStrings(required) {
+					return false
+				}
+				continue
+			}
+			if !validFunctionSchemaNode(dependency, state) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func isDraft04Schema(schema any) bool {
+	object, ok := schema.(map[string]any)
+	if !ok {
+		return false
+	}
+	identifier, ok := object["$schema"].(string)
+	return ok && strings.Contains(strings.ToLower(identifier), "draft-04")
+}
+
+func validSchemaTypeValue(value any, exists bool) bool {
+	if !exists {
+		return true
+	}
+	if single, ok := value.(string); ok {
+		return validSchemaTypes(single, nil)
+	}
+	values, ok := stringArray(value)
+	return ok && validSchemaTypes("", values)
+}
+
+func validSchemaTypes(single string, multiple []string) bool {
+	valid := func(candidate string) bool {
+		switch candidate {
+		case "null", "boolean", "object", "array", "number", "string", "integer":
+			return true
+		default:
+			return false
+		}
+	}
+	if single != "" {
+		return multiple == nil && valid(single)
+	}
+	if multiple == nil {
+		return true
+	}
+	if len(multiple) == 0 {
+		return false
+	}
+	seen := make(map[string]struct{}, len(multiple))
+	for _, candidate := range multiple {
+		if !valid(candidate) {
+			return false
+		}
+		if _, duplicate := seen[candidate]; duplicate {
+			return false
+		}
+		seen[candidate] = struct{}{}
+	}
+	return true
+}
+
+func hasDuplicateStrings(values []string) bool {
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if _, duplicate := seen[value]; duplicate {
+			return true
+		}
+		seen[value] = struct{}{}
+	}
+	return false
+}
+
+func containsDuplicateJSONValues(values []any) bool {
+	for index := range values {
+		for other := 0; other < index; other++ {
+			if reflect.DeepEqual(values[index], values[other]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func stringArray(value any) ([]string, bool) {
+	items, ok := value.([]any)
+	if !ok {
+		return nil, false
+	}
+	result := make([]string, len(items))
+	for index, item := range items {
+		text, ok := item.(string)
+		if !ok {
+			return nil, false
+		}
+		result[index] = text
+	}
+	return result, true
+}
+
+func nonNegativeJSONInteger(value any) bool {
+	number, ok := value.(float64)
+	return ok && number >= 0 && number == math.Trunc(number)
+}
+
+func localSchemaReferenceExists(root any, ref string, anchors map[string]struct{}) bool {
+	if ref == "#" {
+		return true
+	}
+	if !strings.HasPrefix(ref, "#/") {
+		_, ok := anchors[strings.TrimPrefix(ref, "#")]
+		return ok
+	}
+	current := root
+	for _, rawSegment := range strings.Split(strings.TrimPrefix(ref, "#/"), "/") {
+		segment := strings.ReplaceAll(strings.ReplaceAll(rawSegment, "~1", "/"), "~0", "~")
+		switch value := current.(type) {
+		case map[string]any:
+			var ok bool
+			current, ok = value[segment]
+			if !ok {
+				return false
+			}
+		case []any:
+			index, err := strconv.Atoi(segment)
+			if err != nil || index < 0 || index >= len(value) {
+				return false
+			}
+			current = value[index]
+		default:
+			return false
+		}
+	}
+	return validFunctionSchemaNode(current, &schemaValidationState{draft04: isDraft04Schema(root)})
 }
 
 func normalizeEmptyFunctionSchema(strict *bool, source, target llm.APIFormat, reversible bool) schemaNormalization {
@@ -345,6 +759,59 @@ func ensureObjectProperties(schema map[string]any) bool {
 	return true
 }
 
+// normalizeRootObjectUnionBranches makes the object contract explicit on
+// every root anyOf/oneOf branch. Function arguments are object-valued on all
+// three supported protocols, so intersecting each alternative with object is
+// semantics-preserving while satisfying providers that validate union
+// branches independently instead of inheriting the root type.
+func normalizeRootObjectUnionBranches(root map[string]any) bool {
+	changed := false
+	for _, keyword := range []string{"anyOf", "oneOf"} {
+		branches, ok := root[keyword].([]any)
+		if !ok {
+			continue
+		}
+		for index := range branches {
+			normalized, branchChanged := normalizeRootObjectUnionBranch(branches[index])
+			if !branchChanged {
+				continue
+			}
+			branches[index] = normalized
+			changed = true
+		}
+	}
+	return changed
+}
+
+func normalizeRootObjectUnionBranch(branch any) (any, bool) {
+	schema, ok := branch.(map[string]any)
+	if !ok {
+		if allowed, booleanSchema := branch.(bool); booleanSchema && allowed {
+			return map[string]any{"type": "object"}, true
+		}
+		return map[string]any{"type": "object", "not": map[string]any{}}, true
+	}
+	typeValue, hasType := schema["type"]
+	if !hasType {
+		schema["type"] = "object"
+		return schema, true
+	}
+	switch value := typeValue.(type) {
+	case string:
+		if value == "object" {
+			return schema, false
+		}
+	case []any:
+		if slices.Contains(value, any("object")) {
+			schema["type"] = "object"
+			return schema, true
+		}
+	}
+	return map[string]any{
+		"type": "object", "allOf": []any{schema},
+	}, true
+}
+
 func flattenRootSchemaUnions(root map[string]any) bool {
 	changed := false
 	properties, _ := root["properties"].(map[string]any)
@@ -429,7 +896,7 @@ func mergeSchemaRequired(root map[string]any, candidate any) {
 }
 
 func appendSchemaConstraintActions(plan *Plan, request *llm.Request, target llm.APIFormat) {
-	if plan == nil || request == nil || request.APIFormat == target || !isFunctionSchemaTarget(target) {
+	if plan == nil || request == nil || !isFunctionSchemaTarget(target) {
 		return
 	}
 	appendDefinition := func(definition *llm.ToolDefinition, ref ObjectRef) {
@@ -437,6 +904,13 @@ func appendSchemaConstraintActions(plan *Plan, request *llm.Request, target llm.
 			return
 		}
 		result := normalizeFunctionSchemaDetailed(definition.Function.Parameters, definition.Function.Strict, request.APIFormat, target)
+		if result.invalid {
+			plan.Actions = append(plan.Actions, Action{
+				Ref: ref, Kind: ActionUnknown, Strategy: StrategyUnavailable,
+				Reason: ReasonProtocolConstraint, Reversible: false,
+			})
+			return
+		}
 		if !result.changed {
 			return
 		}
@@ -457,7 +931,12 @@ func appendSchemaConstraintActions(plan *Plan, request *llm.Request, target llm.
 				continue
 			}
 			result := normalizeFunctionSchemaDetailed(tool.Function.Parameters, tool.Function.Strict, request.APIFormat, target)
-			if result.changed {
+			if result.invalid {
+				plan.Actions = append(plan.Actions, Action{
+					Ref:  ObjectRef{Kind: ObjectToolDefinition, ToolIndex: index, ItemIndex: -1, ContentIndex: -1, MessageIndex: -1, ToolCallIndex: -1},
+					Kind: ActionUnknown, Strategy: StrategyUnavailable, Reason: ReasonProtocolConstraint,
+				})
+			} else if result.changed {
 				plan.Actions = append(plan.Actions, Action{
 					Ref:  ObjectRef{Kind: ObjectToolDefinition, ToolIndex: index, ItemIndex: -1, ContentIndex: -1, MessageIndex: -1, ToolCallIndex: -1},
 					Kind: ActionLower, Strategy: StrategySchemaNormalize, Reason: ReasonProtocolConstraint, Reversible: result.reversible,
@@ -479,7 +958,7 @@ func appendSchemaConstraintActions(plan *Plan, request *llm.Request, target llm.
 }
 
 func normalizeRequestSchemas(request *llm.Request, session *Session, target llm.APIFormat) {
-	if request == nil || session == nil || session.plan == nil || session.plan.Source == target || !isFunctionSchemaTarget(target) {
+	if request == nil || session == nil || session.plan == nil || !isFunctionSchemaTarget(target) {
 		return
 	}
 	for index := range request.ToolDefinitions {
@@ -515,7 +994,7 @@ func normalizeRequestSchemas(request *llm.Request, session *Session, target llm.
 				tool.Function.Strict = normalized.strictOverride
 			}
 			if len(request.ToolDefinitions) == 0 {
-				session.registerSchemaRestoration(tool.Function.Name, normalized.optionalPaths, original, normalized.schema)
+				session.registerSchemaRestoration(tool.Function.Name, "", normalized.optionalPaths, original, normalized.schema)
 				session.recordSchemaNormalization(ObjectRef{
 					Kind: ObjectToolDefinition, ToolIndex: index, ItemIndex: -1, ContentIndex: -1, MessageIndex: -1, ToolCallIndex: -1,
 				}, normalized.reversible)
@@ -537,6 +1016,6 @@ func normalizeCanonicalDefinitionSchema(definition *llm.ToolDefinition, session 
 	if normalized.strictOverride != nil {
 		definition.Function.Strict = normalized.strictOverride
 	}
-	session.registerSchemaRestoration(definition.LogicalName, normalized.optionalPaths, original, normalized.schema)
+	session.registerSchemaRestoration(definition.LogicalName, definition.Function.Namespace, normalized.optionalPaths, original, normalized.schema)
 	session.recordSchemaNormalization(ref, normalized.reversible)
 }

@@ -18,6 +18,11 @@ type toolIdentity struct {
 	SourceNamespace string
 }
 
+type toolWireIdentityKey struct {
+	name      string
+	namespace string
+}
+
 type schemaRestoration struct {
 	paths          []schemaOptionalPath
 	originalHash   [sha256.Size]byte
@@ -38,11 +43,12 @@ type Session struct {
 
 	bySourceName          map[string]string
 	bySyntheticName       map[string]toolIdentity
+	byWireIdentity        map[toolWireIdentityKey]toolIdentity
 	occupiedNames         map[string]struct{}
-	targetToolNames       *identifierLedger
+	targetToolNames       map[string]*identifierLedger
 	targetCallIDs         *identifierLedger
 	sourceCallIDs         *identifierLedger
-	schemaRestorations    map[string]schemaRestoration
+	schemaRestorations    map[toolWireIdentityKey]schemaRestoration
 	providerArgumentBytes map[providerArgumentRecordKey]json.RawMessage
 	continuation          ContinuationBinding
 	lowerNanos            atomic.Int64
@@ -67,8 +73,9 @@ func newSession(plan *Plan, request *llm.Request, traceEnabled bool) *Session {
 		plan:                  plan,
 		bySourceName:          make(map[string]string),
 		bySyntheticName:       make(map[string]toolIdentity),
+		byWireIdentity:        make(map[toolWireIdentityKey]toolIdentity),
 		occupiedNames:         make(map[string]struct{}),
-		schemaRestorations:    make(map[string]schemaRestoration),
+		schemaRestorations:    make(map[toolWireIdentityKey]schemaRestoration),
 		providerArgumentBytes: make(map[providerArgumentRecordKey]json.RawMessage),
 		traceEnabled:          traceEnabled,
 	}
@@ -79,9 +86,10 @@ func newSession(plan *Plan, request *llm.Request, traceEnabled bool) *Session {
 				continue
 			}
 			sourceName := strings.TrimPrefix(definition.LogicalName, definition.Function.Namespace+"__")
-			session.bySyntheticName[definition.LogicalName] = toolIdentity{
+			identity := toolIdentity{
 				SourceKind: llm.ToolKindFunction, SourceName: sourceName, SourceNamespace: definition.Function.Namespace,
 			}
+			session.registerToolIdentity(definition.LogicalName, definition.Function.Namespace, identity)
 		}
 		for _, tool := range request.Tools {
 			if tool.Type == llm.ToolTypeFunction && tool.Function.Name != "" {
@@ -92,24 +100,37 @@ func newSession(plan *Plan, request *llm.Request, traceEnabled bool) *Session {
 	return session
 }
 
-func (s *Session) registerSchemaRestoration(targetName string, paths []schemaOptionalPath, original, normalized []byte) {
+func (s *Session) registerSchemaRestoration(targetName, namespace string, paths []schemaOptionalPath, original, normalized []byte) {
 	if s == nil || targetName == "" {
 		return
+	}
+	if s.schemaRestorations == nil {
+		s.schemaRestorations = make(map[toolWireIdentityKey]schemaRestoration)
 	}
 	copied := make([]schemaOptionalPath, len(paths))
 	for index := range paths {
 		copied[index] = append(schemaOptionalPath(nil), paths[index]...)
 	}
-	s.schemaRestorations[targetName] = schemaRestoration{
+	restoration := schemaRestoration{
 		paths: copied, originalHash: sha256.Sum256(original), normalizedHash: sha256.Sum256(normalized),
+	}
+	s.schemaRestorations[toolWireIdentityKey{name: targetName}] = restoration
+	if namespace != "" {
+		wireName := strings.TrimPrefix(targetName, namespace+"__")
+		s.schemaRestorations[toolWireIdentityKey{name: wireName, namespace: namespace}] = restoration
 	}
 }
 
-func (s *Session) schemaRestoration(targetName string) []schemaOptionalPath {
+func (s *Session) schemaRestoration(targetName, namespace string) []schemaOptionalPath {
 	if s == nil || targetName == "" {
 		return nil
 	}
-	return s.schemaRestorations[targetName].paths
+	if namespace != "" {
+		if restoration, ok := s.schemaRestorations[toolWireIdentityKey{name: targetName, namespace: namespace}]; ok {
+			return restoration.paths
+		}
+	}
+	return s.schemaRestorations[toolWireIdentityKey{name: targetName}].paths
 }
 
 func (s *Session) syntheticName(sourceName string) string {
@@ -134,15 +155,37 @@ func (s *Session) syntheticToolName(sourceKind llm.ToolKind, sourceName string) 
 	}
 	s.occupiedNames[name] = struct{}{}
 	s.bySourceName[sourceKey] = name
-	s.bySyntheticName[name] = toolIdentity{SourceKind: sourceKind, SourceName: sourceName}
+	s.registerToolIdentity(name, "", toolIdentity{SourceKind: sourceKind, SourceName: sourceName})
 	return name
 }
 
-func (s *Session) identity(syntheticName string) (toolIdentity, bool) {
+func (s *Session) registerToolIdentity(targetName, namespace string, identity toolIdentity) {
+	if s == nil || targetName == "" {
+		return
+	}
+	if s.bySyntheticName == nil {
+		s.bySyntheticName = make(map[string]toolIdentity)
+	}
+	if s.byWireIdentity == nil {
+		s.byWireIdentity = make(map[toolWireIdentityKey]toolIdentity)
+	}
+	s.bySyntheticName[targetName] = identity
+	if namespace != "" {
+		wireName := strings.TrimPrefix(targetName, namespace+"__")
+		s.byWireIdentity[toolWireIdentityKey{name: wireName, namespace: namespace}] = identity
+	}
+}
+
+func (s *Session) identity(targetName, namespace string) (toolIdentity, bool) {
 	if s == nil {
 		return toolIdentity{}, false
 	}
-	identity, ok := s.bySyntheticName[syntheticName]
+	if namespace != "" {
+		if identity, ok := s.byWireIdentity[toolWireIdentityKey{name: targetName, namespace: namespace}]; ok {
+			return identity, true
+		}
+	}
+	identity, ok := s.bySyntheticName[targetName]
 	return identity, ok
 }
 

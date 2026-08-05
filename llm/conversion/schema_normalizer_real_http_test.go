@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/looplj/axonhub/llm/conversion"
@@ -161,6 +164,254 @@ func TestResponsesRootUnionSchemaReachesChatOverRealHTTP(t *testing.T) {
 	}
 	runSchemaPipeline(t, provider, responses.NewInboundTransformer(), conversion.NewOutbound(target), "/v1/responses",
 		`{"model":"fixture-model","input":"hi","tools":[{"type":"function","name":"lookup","strict":true,"parameters":{"oneOf":[{"type":"object","properties":{"query":{"type":"string"}}},{"type":"object","properties":{"id":{"type":"integer"}}}]}}]}`)
+}
+
+func TestResponsesIdentityImplicitRootUnionReachesStrictProviderOverRealHTTP(t *testing.T) {
+	t.Parallel()
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		var payload struct {
+			Tools []struct {
+				Parameters map[string]any `json:"parameters"`
+			} `json:"tools"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+			http.Error(writer, "decode Responses request", http.StatusBadRequest)
+			return
+		}
+		if len(payload.Tools) != 1 || payload.Tools[0].Parameters["type"] != "object" {
+			http.Error(writer, "root object type missing", http.StatusBadRequest)
+			return
+		}
+		branches, ok := payload.Tools[0].Parameters["anyOf"].([]any)
+		if !ok || len(branches) != 2 {
+			http.Error(writer, "root anyOf missing", http.StatusBadRequest)
+			return
+		}
+		for _, branch := range branches {
+			branchSchema, ok := branch.(map[string]any)
+			if !ok || branchSchema["type"] != "object" {
+				http.Error(writer, "tool parameter root union has a non-object branch", http.StatusBadRequest)
+				return
+			}
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(writer, `{"id":"resp_identity_schema","object":"response","status":"completed","model":"fixture-model","output":[{"id":"msg_identity_schema","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"done","annotations":[]}]}],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}`)
+	}))
+	t.Cleanup(provider.Close)
+	target, err := responses.NewOutboundTransformer(provider.URL, "fixture-key")
+	if err != nil {
+		t.Fatalf("create Responses outbound: %v", err)
+	}
+	runSchemaPipeline(t, provider, responses.NewInboundTransformer(), conversion.NewOutbound(target), "/v1/responses",
+		`{"model":"fixture-model","input":"OpenAI Responses API official documentation","tools":[{"type":"function","name":"search","parameters":{"type":"object","properties":{"query":{"type":"string"},"queries":{"type":"array","items":{"type":"string"}}},"anyOf":[{"required":["query"]},{"required":["queries"]}],"additionalProperties":true}}]}`)
+}
+
+func TestInvalidNestedIdentitySchemaStopsBeforeProviderDispatchOverRealHTTP(t *testing.T) {
+	t.Parallel()
+	var providerRequests atomic.Int32
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		providerRequests.Add(1)
+		http.Error(writer, "provider must not receive invalid schema", http.StatusBadRequest)
+	}))
+	t.Cleanup(provider.Close)
+	target, err := responses.NewOutboundTransformer(provider.URL, "fixture-key")
+	if err != nil {
+		t.Fatalf("create Responses outbound: %v", err)
+	}
+	executor := httpclient.NewHttpClientWithClient(provider.Client())
+	t.Cleanup(executor.CloseIdleConnections)
+	result, err := pipeline.NewFactory(executor).
+		Pipeline(responses.NewInboundTransformer(), conversion.NewOutbound(target)).
+		Process(context.Background(), &httpclient.Request{
+			Method: http.MethodPost, URL: "/v1/responses",
+			Headers: http.Header{"Content-Type": []string{"application/json"}},
+			Body:    []byte(`{"model":"fixture-model","input":"hi","tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"query":[]}}}]}`),
+		})
+	if !errors.Is(err, conversion.ErrIncompletePlan) {
+		t.Fatalf("pipeline error = %v, want ErrIncompletePlan; result=%#v", err, result)
+	}
+	if got := providerRequests.Load(); got != 0 {
+		t.Fatalf("provider received %d invalid requests, want zero", got)
+	}
+}
+
+func TestResponsesIdentityNamespacedFunctionRestoresChildNameOverRealHTTP(t *testing.T) {
+	t.Parallel()
+	historyCallID := "history call:" + strings.Repeat("x", 80)
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		var payload struct {
+			Tools []struct {
+				Type  string `json:"type"`
+				Name  string `json:"name"`
+				Tools []struct {
+					Type string `json:"type"`
+					Name string `json:"name"`
+				} `json:"tools"`
+			} `json:"tools"`
+			Input []struct {
+				Type      string `json:"type"`
+				CallID    string `json:"call_id"`
+				Name      string `json:"name"`
+				Namespace string `json:"namespace"`
+			} `json:"input"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+			http.Error(writer, "decode Responses request", http.StatusBadRequest)
+			return
+		}
+		if len(payload.Tools) != 1 || payload.Tools[0].Type != "namespace" || payload.Tools[0].Name != "project" || len(payload.Tools[0].Tools) != 1 {
+			http.Error(writer, "namespace tool missing", http.StatusBadRequest)
+			return
+		}
+		providerChild := payload.Tools[0].Tools[0].Name
+		if providerChild == "read.file" || !strings.HasPrefix(providerChild, "read_file_") {
+			http.Error(writer, "namespace child was not normalized", http.StatusBadRequest)
+			return
+		}
+		if len(payload.Input) != 2 || payload.Input[0].Type != "function_call" || payload.Input[0].Name != providerChild ||
+			payload.Input[0].Namespace != "project" || payload.Input[0].CallID != historyCallID ||
+			payload.Input[1].Type != "function_call_output" || payload.Input[1].CallID != historyCallID {
+			http.Error(writer, "namespace history lifecycle diverged", http.StatusBadRequest)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(writer, `{"id":"resp_namespace","object":"response","status":"completed","model":"fixture-model","output":[{"id":"fc_namespace","type":"function_call","call_id":"call_provider_new","name":%q,"namespace":"project","arguments":"{}","status":"completed"}],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}`, providerChild)
+	}))
+	t.Cleanup(provider.Close)
+	target, err := responses.NewOutboundTransformer(provider.URL, "fixture-key")
+	if err != nil {
+		t.Fatalf("create Responses outbound: %v", err)
+	}
+	result := runSchemaPipeline(t, provider, responses.NewInboundTransformer(), conversion.NewOutbound(target), "/v1/responses",
+		fmt.Sprintf(`{"model":"fixture-model","input":[{"type":"function_call","call_id":%q,"name":"read.file","namespace":"project","arguments":"{}"},{"type":"function_call_output","call_id":%q,"output":"ok"}],"tools":[{"type":"namespace","name":"project","tools":[{"type":"function","name":"read.file","description":"read","parameters":{"type":"object"}}]}]}`, historyCallID, historyCallID))
+	var response struct {
+		Output []struct {
+			Type      string `json:"type"`
+			CallID    string `json:"call_id"`
+			Name      string `json:"name"`
+			Namespace string `json:"namespace"`
+		} `json:"output"`
+	}
+	if err := json.Unmarshal(result.Response.Body, &response); err != nil {
+		t.Fatalf("decode client Responses body: %v; body=%s", err, result.Response.Body)
+	}
+	if len(response.Output) != 1 || response.Output[0].Name != "read.file" || response.Output[0].Namespace != "project" || response.Output[0].CallID != "call_provider_new" {
+		t.Fatalf("restored client response = %#v", response.Output)
+	}
+}
+
+func TestResponsesNamespacedHistoryUsesOneFlattenedNameAcrossProtocolsOverRealHTTP(t *testing.T) {
+	t.Parallel()
+	const historyCallID = "call_history"
+	requestBody := `{"model":"fixture-model","input":[{"type":"function_call","call_id":"call_history","name":"project__read.file","namespace":"project","arguments":"{}"},{"type":"function_call_output","call_id":"call_history","output":"ok"}],"tools":[{"type":"namespace","name":"project","tools":[{"type":"function","name":"project__read.file","description":"read","parameters":{"type":"object"}}]}]}`
+
+	t.Run("chat", func(t *testing.T) {
+		provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			var payload struct {
+				Tools []struct {
+					Function struct {
+						Name string `json:"name"`
+					} `json:"function"`
+				} `json:"tools"`
+				Messages []struct {
+					Role       string `json:"role"`
+					ToolCallID string `json:"tool_call_id"`
+					ToolCalls  []struct {
+						ID       string `json:"id"`
+						Function struct {
+							Name string `json:"name"`
+						} `json:"function"`
+					} `json:"tool_calls"`
+				} `json:"messages"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				http.Error(writer, "decode Chat request", http.StatusBadRequest)
+				return
+			}
+			definitionName := ""
+			if len(payload.Tools) == 1 {
+				definitionName = payload.Tools[0].Function.Name
+			}
+			callName, resultID := "", ""
+			for _, message := range payload.Messages {
+				if len(message.ToolCalls) > 0 {
+					callName = message.ToolCalls[0].Function.Name
+					if message.ToolCalls[0].ID != historyCallID {
+						http.Error(writer, "Chat call ID changed", http.StatusBadRequest)
+						return
+					}
+				}
+				if message.Role == "tool" {
+					resultID = message.ToolCallID
+				}
+			}
+			if definitionName == "" || definitionName != callName || resultID != historyCallID || strings.Contains(definitionName, ".") {
+				http.Error(writer, "Chat namespace identity diverged", http.StatusBadRequest)
+				return
+			}
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(writer, `{"id":"chat_namespace","object":"chat.completion","model":"fixture-model","choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}`)
+		}))
+		t.Cleanup(provider.Close)
+		target, err := openai.NewOutboundTransformer(provider.URL, "fixture-key")
+		if err != nil {
+			t.Fatalf("create Chat outbound: %v", err)
+		}
+		runSchemaPipeline(t, provider, responses.NewInboundTransformer(), conversion.NewOutbound(target), "/v1/responses", requestBody)
+	})
+
+	t.Run("anthropic", func(t *testing.T) {
+		provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			var payload struct {
+				Tools []struct {
+					Name string `json:"name"`
+				} `json:"tools"`
+				Messages []struct {
+					Content []struct {
+						Type      string `json:"type"`
+						ID        string `json:"id"`
+						Name      string `json:"name"`
+						ToolUseID string `json:"tool_use_id"`
+					} `json:"content"`
+				} `json:"messages"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				http.Error(writer, "decode Anthropic request", http.StatusBadRequest)
+				return
+			}
+			definitionName := ""
+			if len(payload.Tools) == 1 {
+				definitionName = payload.Tools[0].Name
+			}
+			callName, resultID := "", ""
+			for _, message := range payload.Messages {
+				for _, block := range message.Content {
+					switch block.Type {
+					case "tool_use":
+						callName = block.Name
+						if block.ID != historyCallID {
+							http.Error(writer, "Anthropic call ID changed", http.StatusBadRequest)
+							return
+						}
+					case "tool_result":
+						resultID = block.ToolUseID
+					}
+				}
+			}
+			if definitionName == "" || definitionName != callName || resultID != historyCallID || strings.Contains(definitionName, ".") {
+				http.Error(writer, "Anthropic namespace identity diverged", http.StatusBadRequest)
+				return
+			}
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(writer, `{"id":"msg_namespace","type":"message","role":"assistant","model":"fixture-model","content":[{"type":"text","text":"done"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":1}}`)
+		}))
+		t.Cleanup(provider.Close)
+		target, err := anthropic.NewOutboundTransformer(provider.URL, "fixture-key")
+		if err != nil {
+			t.Fatalf("create Anthropic outbound: %v", err)
+		}
+		runSchemaPipeline(t, provider, responses.NewInboundTransformer(), conversion.NewOutbound(target), "/v1/responses", requestBody)
+	})
 }
 
 func TestResponsesStrictOptionalNullIsRemovedFromAnthropicStreamOverRealHTTP(t *testing.T) {

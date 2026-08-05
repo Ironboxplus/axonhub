@@ -107,8 +107,9 @@ func (r *streamRestorer) restoreEvents(response *llm.Response) {
 				continue
 			}
 			providerName := event.Snapshot.ToolCall.LogicalName
-			identity, hasIdentity := r.session.identity(providerName)
-			schemaPaths := r.session.schemaRestoration(providerName)
+			providerNamespace := event.Snapshot.ToolCall.Namespace
+			identity, hasIdentity := r.session.identity(providerName, providerNamespace)
+			schemaPaths := r.session.schemaRestoration(providerName, providerNamespace)
 			if !hasIdentity && len(schemaPaths) == 0 {
 				restored = append(restored, event)
 				continue
@@ -287,8 +288,9 @@ func (r *streamRestorer) restoreMessage(choiceIndex int, message *llm.Message) {
 		}
 		state := r.tools[key]
 		providerName := call.Function.Name
-		identity, hasIdentity := r.session.identity(providerName)
-		schemaPaths := r.session.schemaRestoration(providerName)
+		providerNamespace := call.Function.Namespace
+		identity, hasIdentity := r.session.identity(providerName, providerNamespace)
+		schemaPaths := r.session.schemaRestoration(providerName, providerNamespace)
 		if hasIdentity || len(schemaPaths) > 0 {
 			if state == nil {
 				state = &streamToolState{

@@ -217,13 +217,14 @@ func TestControllerForcesResponsesWebSearchThroughGatewayOverRealHTTP(t *testing
 		}
 		var payload struct {
 			Tools []struct {
-				Type string `json:"type"`
-				Name string `json:"name"`
+				Type       string         `json:"type"`
+				Name       string         `json:"name"`
+				Parameters map[string]any `json:"parameters"`
 			} `json:"tools"`
 			Input json.RawMessage `json:"input"`
 		}
 		if json.Unmarshal(body, &payload) != nil || len(payload.Tools) != 1 || payload.Tools[0].Type != "function" ||
-			bytes.Contains(body, []byte(`"type":"web_search"`)) {
+			bytes.Contains(body, []byte(`"type":"web_search"`)) || !rootUnionBranchesAreExplicitObjects(payload.Tools[0].Parameters) {
 			http.Error(writer, "native hosted tool reached unadmitted provider", http.StatusBadRequest)
 			return
 		}

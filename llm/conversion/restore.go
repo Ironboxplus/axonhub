@@ -110,7 +110,7 @@ func restoreCanonicalOutput(output []llm.Item, session *Session, direction llm.C
 			continue
 		}
 		restoreInvocationSchemaArguments(item.ToolCall, session, direction, canonicalToolRef(index))
-		identity, ok := session.identity(item.ToolCall.LogicalName)
+		identity, ok := session.identity(item.ToolCall.LogicalName, item.ToolCall.Namespace)
 		if !ok {
 			continue
 		}
@@ -154,7 +154,7 @@ func restoreMessage(message *llm.Message, session *Session, direction llm.Conver
 	for callIndex := range message.ToolCalls {
 		call := &message.ToolCalls[callIndex]
 		restoreLegacySchemaArguments(call, session, direction, messageToolRef(choiceIndex, callIndex))
-		identity, ok := session.identity(call.Function.Name)
+		identity, ok := session.identity(call.Function.Name, call.Function.Namespace)
 		if !ok {
 			continue
 		}

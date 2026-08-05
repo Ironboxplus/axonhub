@@ -454,13 +454,15 @@ func TestControllerRunsPortableResponsesMCPThroughForcedGatewayOverRealHTTP(t *t
 		}
 		var payload struct {
 			Tools []struct {
-				Type string `json:"type"`
-				Name string `json:"name"`
+				Type       string         `json:"type"`
+				Name       string         `json:"name"`
+				Parameters map[string]any `json:"parameters"`
 			} `json:"tools"`
 			Input json.RawMessage `json:"input"`
 		}
 		if json.Unmarshal(body, &payload) != nil || len(payload.Tools) != 1 || payload.Tools[0].Type != "function" ||
-			strings.Contains(string(body), `"type":"mcp"`) || strings.Contains(string(body), `"read_only"`) {
+			strings.Contains(string(body), `"type":"mcp"`) || strings.Contains(string(body), `"read_only"`) ||
+			!rootUnionBranchesAreExplicitObjects(payload.Tools[0].Parameters) {
 			providerIssuesMu.Lock()
 			providerIssues = append(providerIssues, fmt.Sprintf("round %d provider body was not a lowered Responses request: %s", round, body))
 			providerIssuesMu.Unlock()
@@ -1868,6 +1870,24 @@ func countString(values []string, wanted string) int {
 	return count
 }
 
+func rootUnionBranchesAreExplicitObjects(parameters map[string]any) bool {
+	found := false
+	for _, keyword := range []string{"anyOf", "oneOf"} {
+		branches, ok := parameters[keyword].([]any)
+		if !ok {
+			continue
+		}
+		found = true
+		for _, branch := range branches {
+			schema, ok := branch.(map[string]any)
+			if !ok || schema["type"] != "object" {
+				return false
+			}
+		}
+	}
+	return found
+}
+
 func newControllerMCPServer(t *testing.T, authorization string, calls *atomic.Int64) *httptest.Server {
 	t.Helper()
 	const sessionID = "controller-mcp-session"
@@ -1902,7 +1922,7 @@ func newControllerMCPServer(t *testing.T, authorization string, calls *atomic.In
 			w.WriteHeader(http.StatusAccepted)
 		case "tools/list":
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"lookup","description":"look up stock","inputSchema":{"type":"object","properties":{"sku":{"type":"string"}},"required":["sku"]},"annotations":{"readOnlyHint":true}}]}}`, envelope.ID)
+			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"lookup","description":"look up stock","inputSchema":{"type":"object","properties":{"sku":{"type":"string"},"skus":{"type":"array","items":{"type":"string"}}},"anyOf":[{"required":["sku"]},{"required":["skus"]}]},"annotations":{"readOnlyHint":true}}]}}`, envelope.ID)
 		case "tools/call":
 			calls.Add(1)
 			w.Header().Set("Content-Type", "application/json")
