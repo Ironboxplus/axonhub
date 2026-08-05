@@ -365,6 +365,23 @@ func TestIdentityFunctionSchemaNeedsNormalization(t *testing.T) {
 	}
 }
 
+func TestFalseIdentitySchemaRemainsValidAndSemanticallyFalse(t *testing.T) {
+	t.Parallel()
+	result := normalizeFunctionSchemaDetailed(
+		json.RawMessage(`false`), nil, llm.APIFormatOpenAIResponse, llm.APIFormatOpenAIResponse,
+	)
+	if result.invalid || !result.changed || !result.reversible {
+		t.Fatalf("false identity schema normalization = %#v", result)
+	}
+	var normalized map[string]any
+	if err := json.Unmarshal(result.schema, &normalized); err != nil {
+		t.Fatalf("decode normalized false schema: %v", err)
+	}
+	if normalized["type"] != "object" || normalized["not"] == nil {
+		t.Fatalf("false schema lost its no-instance semantics: %#v", normalized)
+	}
+}
+
 func TestFunctionSchemaStructuralValidatorRejectsInvalidNestedBranches(t *testing.T) {
 	t.Parallel()
 	invalidType := map[string]any{"type": "invalid"}
@@ -438,6 +455,10 @@ func TestFunctionSchemaStructuralValidatorCoversStandardKeywordShapesAndReferenc
 	if _, ok := parseValidFunctionSchema(valid); !ok {
 		t.Fatal("comprehensive valid JSON Schema was rejected")
 	}
+	ecmaPattern := json.RawMessage(`{"type":"object","pattern":"(?<=prefix)tool","patternProperties":{"^file\\s+name$":true}}`)
+	if _, ok := parseValidFunctionSchema(ecmaPattern); !ok {
+		t.Fatal("valid ECMA-262 JSON Schema pattern was rejected")
+	}
 
 	invalid := []json.RawMessage{
 		json.RawMessage(`{"title":42}`),
@@ -508,16 +529,18 @@ func TestLocalSchemaReferenceResolutionCoversPointersAnchorsAndInvalidTargets(t 
 	root := map[string]any{
 		"defs":   []any{map[string]any{"type": "object"}},
 		"a/b":    map[string]any{"~key": true},
+		"a b":    map[string]any{"type": "string"},
 		"value":  "not-a-schema",
 		"scalar": float64(1),
 	}
-	anchors := map[string]struct{}{"known": {}}
+	anchors := map[string]struct{}{"known": {}, "known anchor": {}}
 	tests := []struct {
 		ref  string
 		want bool
 	}{
 		{ref: "#", want: true},
 		{ref: "#known", want: true},
+		{ref: "#known%20anchor", want: true},
 		{ref: "#missing", want: false},
 		{ref: "#/defs/0", want: true},
 		{ref: "#/defs/not-an-index", want: false},
@@ -527,6 +550,8 @@ func TestLocalSchemaReferenceResolutionCoversPointersAnchorsAndInvalidTargets(t 
 		{ref: "#/scalar/child", want: false},
 		{ref: "#/value", want: false},
 		{ref: "#/a~1b/~0key", want: true},
+		{ref: "#/a%20b", want: true},
+		{ref: "#/a%ZZb", want: false},
 	}
 	for _, test := range tests {
 		if got := localSchemaReferenceExists(root, test.ref, anchors); got != test.want {
@@ -537,6 +562,14 @@ func TestLocalSchemaReferenceResolutionCoversPointersAnchorsAndInvalidTargets(t 
 
 func BenchmarkIdentityCanonicalFunctionSchema(b *testing.B) {
 	raw := json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"required":["query"],"additionalProperties":false}`)
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = normalizeFunctionSchemaDetailed(raw, nil, llm.APIFormatOpenAIResponse, llm.APIFormatOpenAIResponse)
+	}
+}
+
+func BenchmarkIdentityFunctionSchemaWithECMAPattern(b *testing.B) {
+	raw := json.RawMessage(`{"type":"object","properties":{"name":{"type":"string","pattern":"(?<=prefix)tool"}},"patternProperties":{"^file\\s+name$":{"type":"string"}},"additionalProperties":false}`)
 	b.ReportAllocs()
 	for b.Loop() {
 		_ = normalizeFunctionSchemaDetailed(raw, nil, llm.APIFormatOpenAIResponse, llm.APIFormatOpenAIResponse)

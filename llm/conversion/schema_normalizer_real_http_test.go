@@ -300,6 +300,102 @@ func TestResponsesIdentityNamespacedFunctionRestoresChildNameOverRealHTTP(t *tes
 	}
 }
 
+func TestResponsesIdentityNamespacedPrefixedChildRestoresAcrossStreamOverRealHTTP(t *testing.T) {
+	t.Parallel()
+	const sourceChild = "project__read.file"
+	const providerCallID = "call_provider_stream"
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		var payload struct {
+			Tools []struct {
+				Type  string `json:"type"`
+				Name  string `json:"name"`
+				Tools []struct {
+					Name string `json:"name"`
+				} `json:"tools"`
+			} `json:"tools"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+			http.Error(writer, "decode Responses stream request", http.StatusBadRequest)
+			return
+		}
+		if len(payload.Tools) != 1 || payload.Tools[0].Type != "namespace" || payload.Tools[0].Name != "project" || len(payload.Tools[0].Tools) != 1 {
+			http.Error(writer, "namespace stream tool missing", http.StatusBadRequest)
+			return
+		}
+		providerChild := payload.Tools[0].Tools[0].Name
+		if providerChild == sourceChild || strings.Contains(providerChild, ".") {
+			http.Error(writer, "namespace stream child was not normalized", http.StatusBadRequest)
+			return
+		}
+		writer.Header().Set("Content-Type", "text/event-stream")
+		writeNamedSSEJSON(t, writer, "response.created", map[string]any{
+			"type": "response.created", "sequence_number": 0,
+			"response": map[string]any{"id": "resp_namespace_stream", "object": "response", "model": "fixture-model", "status": "in_progress", "output": []any{}},
+		})
+		writeNamedSSEJSON(t, writer, "response.output_item.added", map[string]any{
+			"type": "response.output_item.added", "sequence_number": 1, "output_index": 0,
+			"item": map[string]any{"id": "fc_namespace_stream", "type": "function_call", "status": "in_progress", "call_id": providerCallID, "name": providerChild, "namespace": "project", "arguments": ""},
+		})
+		writeResponsesFunctionDelta(t, writer, 2, 0, "fc_namespace_stream", `{"path":"README.md"}`)
+		writeNamedSSEJSON(t, writer, "response.function_call_arguments.done", map[string]any{
+			"type": "response.function_call_arguments.done", "sequence_number": 3, "output_index": 0,
+			"item_id": "fc_namespace_stream", "call_id": providerCallID, "name": providerChild, "namespace": "project", "arguments": `{"path":"README.md"}`,
+		})
+		writeNamedSSEJSON(t, writer, "response.output_item.done", map[string]any{
+			"type": "response.output_item.done", "sequence_number": 4, "output_index": 0,
+			"item": map[string]any{"id": "fc_namespace_stream", "type": "function_call", "status": "completed", "call_id": providerCallID, "name": providerChild, "namespace": "project", "arguments": `{"path":"README.md"}`},
+		})
+		writeNamedSSEJSON(t, writer, "response.completed", map[string]any{
+			"type": "response.completed", "sequence_number": 5,
+			"response": map[string]any{"id": "resp_namespace_stream", "object": "response", "model": "fixture-model", "status": "completed", "output": []any{}},
+		})
+	}))
+	t.Cleanup(provider.Close)
+	target, err := responses.NewOutboundTransformer(provider.URL, "fixture-key")
+	if err != nil {
+		t.Fatalf("create Responses outbound: %v", err)
+	}
+	result := runSchemaPipeline(t, provider, responses.NewInboundTransformer(), conversion.NewOutbound(target), "/v1/responses",
+		`{"model":"fixture-model","stream":true,"input":"hi","tools":[{"type":"namespace","name":"project","tools":[{"type":"function","name":"project__read.file","parameters":{"type":"object"}}]}]}`)
+	if !result.Stream || result.EventStream == nil {
+		t.Fatalf("unexpected namespace stream result: %#v", result)
+	}
+	defer result.EventStream.Close()
+	namedEvents := 0
+	deltaSeen := false
+	for result.EventStream.Next() {
+		event := result.EventStream.Current()
+		if event == nil || len(event.Data) == 0 || bytes.Equal(event.Data, []byte("[DONE]")) {
+			continue
+		}
+		var wire map[string]any
+		if json.Unmarshal(event.Data, &wire) != nil {
+			continue
+		}
+		if wire["type"] == "response.function_call_arguments.delta" && wire["delta"] == `{"path":"README.md"}` {
+			deltaSeen = true
+		}
+		candidate := wire
+		if item, ok := wire["item"].(map[string]any); ok {
+			candidate = item
+		}
+		name, _ := candidate["name"].(string)
+		if name == "" {
+			continue
+		}
+		namedEvents++
+		if name != sourceChild || candidate["namespace"] != "project" || candidate["call_id"] != providerCallID {
+			t.Fatalf("namespace stream identity was not restored: %#v", candidate)
+		}
+	}
+	if err := result.EventStream.Err(); err != nil {
+		t.Fatalf("consume namespace Responses stream: %v", err)
+	}
+	if namedEvents < 3 || !deltaSeen {
+		t.Fatalf("namespace stream evidence incomplete: named=%d delta=%v", namedEvents, deltaSeen)
+	}
+}
+
 func TestResponsesNamespacedHistoryUsesOneFlattenedNameAcrossProtocolsOverRealHTTP(t *testing.T) {
 	t.Parallel()
 	const historyCallID = "call_history"

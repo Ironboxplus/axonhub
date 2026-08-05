@@ -58,6 +58,7 @@ var targets = []target{
 	{File: "conversion/schema_normalizer.go", Function: "containsDuplicateJSONValues"},
 	{File: "conversion/schema_normalizer.go", Function: "stringArray"},
 	{File: "conversion/schema_normalizer.go", Function: "nonNegativeJSONInteger"},
+	{File: "conversion/schema_normalizer.go", Function: "validJSONSchemaPattern"},
 	{File: "conversion/schema_normalizer.go", Function: "localSchemaReferenceExists"},
 	{File: "conversion/schema_normalizer.go", Function: "isDraft04Schema"},
 	{File: "conversion/schema_normalizer.go", Function: "normalizeRootObjectUnionBranches"},

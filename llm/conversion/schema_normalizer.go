@@ -4,13 +4,14 @@ import (
 	"bytes"
 	"encoding/json"
 	"math"
+	"net/url"
 	"reflect"
-	"regexp"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/dlclark/regexp2/syntax"
 	"github.com/looplj/axonhub/llm"
 )
 
@@ -242,7 +243,7 @@ func validFunctionSchemaNode(schema any, state *schemaValidationState) bool {
 			return false
 		}
 		if keyword == "pattern" {
-			if _, err := regexp.Compile(text); err != nil {
+			if !validJSONSchemaPattern(text) {
 				return false
 			}
 		}
@@ -386,7 +387,7 @@ func validFunctionSchemaNode(schema any, state *schemaValidationState) bool {
 		}
 		for name, child := range children {
 			if keyword == "patternProperties" {
-				if _, err := regexp.Compile(name); err != nil {
+				if !validJSONSchemaPattern(name) {
 					return false
 				}
 			}
@@ -509,16 +510,25 @@ func nonNegativeJSONInteger(value any) bool {
 	return ok && number >= 0 && number == math.Trunc(number)
 }
 
+func validJSONSchemaPattern(pattern string) bool {
+	_, err := syntax.Parse(pattern, syntax.ECMAScript|syntax.Unicode)
+	return err == nil
+}
+
 func localSchemaReferenceExists(root any, ref string, anchors map[string]struct{}) bool {
-	if ref == "#" {
+	fragment, err := url.PathUnescape(strings.TrimPrefix(ref, "#"))
+	if err != nil {
+		return false
+	}
+	if fragment == "" {
 		return true
 	}
-	if !strings.HasPrefix(ref, "#/") {
-		_, ok := anchors[strings.TrimPrefix(ref, "#")]
+	if !strings.HasPrefix(fragment, "/") {
+		_, ok := anchors[fragment]
 		return ok
 	}
 	current := root
-	for _, rawSegment := range strings.Split(strings.TrimPrefix(ref, "#/"), "/") {
+	for _, rawSegment := range strings.Split(strings.TrimPrefix(fragment, "/"), "/") {
 		segment := strings.ReplaceAll(strings.ReplaceAll(rawSegment, "~1", "/"), "~0", "~")
 		switch value := current.(type) {
 		case map[string]any:
