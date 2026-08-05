@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/emulation/hosted"
@@ -29,20 +30,27 @@ type controllerRoundItem struct {
 // to the source protocol encoder. No worker goroutine or unbounded channel is
 // needed: downstream backpressure directly controls provider reads.
 type controllerMCPStream struct {
-	ctx         context.Context
-	cancel      context.CancelFunc
-	controller  *Controller
-	registry    *mcp.Registry
-	hosted      *hosted.Registry
-	constraints *customConstraintRegistry
-	rounds      pipeline.CanonicalRoundTripper
-	prepared    *llm.Request
+	ctx             context.Context
+	cancel          context.CancelFunc
+	gatewayDeadline time.Time
+	controller      *Controller
+	registry        *mcp.Registry
+	hosted          *hosted.Registry
+	hostedLedger    *hostedExecutionLedger
+	constraints     *customConstraintRegistry
+	rounds          pipeline.CanonicalRoundTripper
+	prepared        *llm.Request
 
-	provider    streams.Stream[*llm.Response]
-	accumulator *llm.CanonicalResponseAccumulator
-	roundItems  map[string]*controllerRoundItem
-	roundOrder  []*controllerRoundItem
-	gatewaySeen bool
+	provider              streams.Stream[*llm.Response]
+	providerCtx           context.Context
+	providerCancel        context.CancelFunc
+	providerStarted       time.Time
+	providerRoundIndex    uint32
+	providerRoundRecorded bool
+	accumulator           *llm.CanonicalResponseAccumulator
+	roundItems            map[string]*controllerRoundItem
+	roundOrder            []*controllerRoundItem
+	gatewaySeen           bool
 
 	initial             []llm.Item
 	usage               *llm.Usage
@@ -72,17 +80,20 @@ type controllerMCPStream struct {
 	once    sync.Once
 }
 
-func (controller *Controller) streamMCP(ctx context.Context, request *llm.Request, rounds pipeline.CanonicalRoundTripper) (streams.Stream[*llm.Response], error) {
+func (controller *Controller) streamMCP(ctx context.Context, request *llm.Request, rounds pipeline.CanonicalRoundTripper) (result streams.Stream[*llm.Response], resultErr error) {
 	var loopCtx context.Context
 	var cancel context.CancelFunc
+	var gatewayDeadline time.Time
 	if controller.config.MaxWallTime > 0 {
-		loopCtx, cancel = context.WithTimeout(ctx, controller.config.MaxWallTime)
+		gatewayDeadline = time.Now().Add(controller.config.MaxWallTime)
+		loopCtx, cancel = context.WithDeadlineCause(ctx, gatewayDeadline, ErrGatewayWallTimeExceeded)
 	} else {
 		// A streamed tool loop owns work that may outlive a provider round. It
 		// always needs a cancellable child so client Close can interrupt an MCP
 		// or hosted executor even when no wall-time limit is configured.
 		loopCtx, cancel = context.WithCancel(ctx)
 	}
+	defer func() { resultErr = normalizeGatewayContextError(loopCtx, resultErr) }()
 	gatewayRequest, err := projectGatewayAllowedTools(request, rounds.TargetFormat())
 	if err != nil {
 		cancel()
@@ -129,7 +140,8 @@ func (controller *Controller) streamMCP(ctx context.Context, request *llm.Reques
 		pipeline.RecordEmulationFailure(loopCtx)
 		return nil, err
 	}
-	prepared, err = lowerHostedHistory(prepared, hostedRegistry)
+	hostedLedger := newHostedExecutionLedger(controller.config.MaxHostedCalls)
+	prepared, err = lowerHostedHistory(prepared, hostedRegistry, hostedLedger)
 	if err != nil {
 		closeOnError()
 		pipeline.RecordEmulationFailure(loopCtx)
@@ -143,7 +155,7 @@ func (controller *Controller) streamMCP(ctx context.Context, request *llm.Reques
 	}
 
 	stream := &controllerMCPStream{
-		ctx: loopCtx, cancel: cancel, controller: controller, registry: registry, hosted: hostedRegistry,
+		ctx: loopCtx, cancel: cancel, gatewayDeadline: gatewayDeadline, controller: controller, registry: registry, hosted: hostedRegistry, hostedLedger: hostedLedger,
 		constraints: constraints, rounds: rounds, prepared: prepared,
 		initial:    append(uniqueCurrentListItems(request.Input, registry.ListItems()), resumed...),
 		totalCalls: len(resumed), resumedCalls: len(resumed),
@@ -182,12 +194,15 @@ func (stream *controllerMCPStream) Err() error {
 	if stream == nil {
 		return nil
 	}
-	return stream.err
+	return normalizeGatewayContextError(stream.ctx, stream.err)
 }
 
 func (stream *controllerMCPStream) Close() error {
 	if stream == nil {
 		return nil
+	}
+	if !stream.done && stream.provider != nil {
+		stream.recordProviderRound(providerRoundOutcomeCanceled)
 	}
 	stream.closed = true
 	return stream.closeResources()
@@ -201,9 +216,15 @@ func (stream *controllerMCPStream) drive() {
 		return
 	}
 	if !stream.provider.Next() {
-		err := stream.provider.Err()
+		err := normalizeProviderRoundContextError(stream.providerCtx, stream.provider.Err())
+		if err != nil {
+			stream.recordProviderRound(providerRoundOutcome(err))
+		} else if !stream.accumulator.IsTerminal() {
+			stream.recordProviderRound(providerRoundOutcomeTransportError)
+		}
 		_ = stream.provider.Close()
 		stream.provider = nil
+		stream.cancelProviderRound()
 		if err != nil {
 			stream.fail(err)
 			return
@@ -261,8 +282,10 @@ func (stream *controllerMCPStream) drive() {
 		}
 	}
 	if terminal {
+		stream.recordProviderRound(providerRoundOutcomeCompleted)
 		_ = stream.provider.Close()
 		stream.provider = nil
+		stream.cancelProviderRound()
 		if err := stream.finishRound(); err != nil {
 			stream.fail(err)
 		}
@@ -277,11 +300,29 @@ func (stream *controllerMCPStream) openRound() error {
 		pipeline.RecordEmulationLimit(stream.ctx)
 		return ErrLoopLimit
 	}
-	provider, err := stream.rounds.Stream(stream.ctx, stream.prepared)
+	roundCtx, roundCancel, contextErr := stream.controller.providerRoundContext(
+		stream.ctx, stream.gatewayDeadline, stream.roundsDone > 0,
+	)
+	if contextErr != nil {
+		pipeline.RecordProviderRound(
+			stream.ctx, uint32(stream.roundsDone+1), 0, providerRoundOutcome(contextErr), false,
+		)
+		return contextErr
+	}
+	pipeline.RecordProviderRoundAttempt(stream.ctx)
+	stream.providerStarted = time.Now()
+	stream.providerRoundIndex = uint32(stream.roundsDone + 1)
+	stream.providerRoundRecorded = false
+	provider, err := stream.rounds.Stream(roundCtx, stream.prepared)
+	err = normalizeProviderRoundContextError(roundCtx, err)
 	if err != nil {
+		stream.recordProviderRound(providerRoundOutcome(err))
+		roundCancel()
 		return err
 	}
 	stream.provider = provider
+	stream.providerCtx = roundCtx
+	stream.providerCancel = roundCancel
 	return nil
 }
 
@@ -426,11 +467,13 @@ func (stream *controllerMCPStream) finishRound() error {
 		return errors.New("provider round has no canonical response")
 	}
 	stream.roundsDone++
+	pipeline.RecordProviderRoundCompleted(stream.ctx)
 	stream.usage = addUsage(stream.usage, response.Usage)
 	processed, err := stream.controller.processRound(
-		stream.ctx, stream.registry, stream.hosted, stream.constraints, response,
+		stream.ctx, stream.registry, stream.hosted, stream.hostedLedger, stream.constraints, response,
 		stream.controller.config.MaxToolCalls-stream.totalCalls,
 		stream.constraintRetries < stream.controller.config.MaxCustomConstraintRetries,
+		stream.roundsDone < stream.controller.config.MaxRounds,
 	)
 	if err != nil {
 		if errors.Is(err, ErrLoopLimit) {
@@ -501,7 +544,7 @@ func (stream *controllerMCPStream) finishRound() error {
 	if stream.controller.shouldContinuePauseTurn(stream.prepared, stream.rounds.TargetFormat(), response, processed) {
 		appendProviderRound(stream.prepared, response.Output, processed.results)
 		refreshRegistryDefinitions(stream.prepared, stream.registry)
-		refreshHostedDefinitions(stream.prepared, stream.hosted)
+		refreshHostedDefinitions(stream.prepared, stream.hosted, stream.hostedLedger)
 		if stream.roundsDone >= stream.controller.config.MaxRounds {
 			pipeline.RecordEmulationLimit(stream.ctx)
 			return ErrLoopLimit
@@ -514,7 +557,7 @@ func (stream *controllerMCPStream) finishRound() error {
 	}
 	appendProviderRound(stream.prepared, response.Output, processed.results)
 	refreshRegistryDefinitions(stream.prepared, stream.registry)
-	refreshHostedDefinitions(stream.prepared, stream.hosted)
+	refreshHostedDefinitions(stream.prepared, stream.hosted, stream.hostedLedger)
 	if stream.roundsDone >= stream.controller.config.MaxRounds {
 		pipeline.RecordEmulationLimit(stream.ctx)
 		return ErrLoopLimit
@@ -590,6 +633,9 @@ func (stream *controllerMCPStream) fail(err error) {
 	if err == nil || stream.done || stream.err != nil {
 		return
 	}
+	err = normalizeProviderRoundContextError(stream.providerCtx, err)
+	err = normalizeGatewayContextError(stream.ctx, err)
+	stream.recordProviderRound(providerRoundOutcome(err))
 	pipeline.RecordEmulationFailure(stream.ctx)
 	if !stream.publicStarted {
 		stream.err = err
@@ -609,6 +655,16 @@ func (stream *controllerMCPStream) fail(err error) {
 	}
 	stream.done = true
 	_ = stream.closeResources()
+}
+
+func (stream *controllerMCPStream) recordProviderRound(outcome string) {
+	if stream == nil || stream.providerRoundRecorded || stream.providerRoundIndex == 0 {
+		return
+	}
+	pipeline.RecordProviderRound(
+		stream.ctx, stream.providerRoundIndex, time.Since(stream.providerStarted), outcome, true,
+	)
+	stream.providerRoundRecorded = true
 }
 
 func (stream *controllerMCPStream) emit(event llm.Event) error {
@@ -635,11 +691,21 @@ func (stream *controllerMCPStream) closeResources() error {
 			result = errors.Join(result, stream.provider.Close())
 			stream.provider = nil
 		}
+		stream.cancelProviderRound()
 		result = errors.Join(result, stream.registry.Close(context.WithoutCancel(stream.ctx)))
 		result = errors.Join(result, stream.constraints.Close(context.WithoutCancel(stream.ctx)))
 		stream.cancel()
 	})
 	return result
+}
+
+func (stream *controllerMCPStream) cancelProviderRound() {
+	if stream == nil || stream.providerCancel == nil {
+		return
+	}
+	stream.providerCancel()
+	stream.providerCancel = nil
+	stream.providerCtx = nil
 }
 
 func cloneControllerEvent(event llm.Event) llm.Event {

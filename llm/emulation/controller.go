@@ -43,13 +43,18 @@ type ControllerConfig struct {
 	// concrete upstream has not been admitted to execute natively. Protocol
 	// compatibility alone is insufficient: same-protocol providers may accept
 	// a hosted tool definition while ignoring or rejecting its lifecycle.
-	ForceHostedGateway         conversion.ToolCapabilitySet
-	ContinuePauseTurns         bool
-	DefaultRequireApproval     bool
-	MaxRounds                  int
-	MaxToolCalls               int
-	MaxParallelCalls           int
-	MaxWallTime                time.Duration
+	ForceHostedGateway     conversion.ToolCapabilitySet
+	ContinuePauseTurns     bool
+	DefaultRequireApproval bool
+	MaxRounds              int
+	MaxToolCalls           int
+	MaxParallelCalls       int
+	MaxWallTime            time.Duration
+	MaxProviderRoundTime   time.Duration
+	DeadlineReserve        time.Duration
+	// MaxHostedCalls applies deployment-owned, per-capability hard limits. A
+	// positive source-protocol max_uses is enforced as the lower of the two.
+	MaxHostedCalls             map[llm.ToolKind]int
 	EnableCustomConstraints    bool
 	MaxCustomConstraintRetries int
 }
@@ -110,13 +115,16 @@ func (controller *Controller) Stream(ctx context.Context, request *llm.Request, 
 	return controller.streamMCP(ctx, request, rounds)
 }
 
-func (controller *Controller) completeMCP(ctx context.Context, request *llm.Request, rounds pipeline.CanonicalRoundTripper) (*llm.Response, error) {
+func (controller *Controller) completeMCP(ctx context.Context, request *llm.Request, rounds pipeline.CanonicalRoundTripper) (result *llm.Response, resultErr error) {
 	loopCtx := ctx
 	cancel := func() {}
+	var gatewayDeadline time.Time
 	if controller.config.MaxWallTime > 0 {
-		loopCtx, cancel = context.WithTimeout(ctx, controller.config.MaxWallTime)
+		gatewayDeadline = time.Now().Add(controller.config.MaxWallTime)
+		loopCtx, cancel = context.WithDeadlineCause(ctx, gatewayDeadline, ErrGatewayWallTimeExceeded)
 	}
 	defer cancel()
+	defer func() { resultErr = normalizeGatewayContextError(loopCtx, resultErr) }()
 	gatewayRequest, err := projectGatewayAllowedTools(request, rounds.TargetFormat())
 	if err != nil {
 		pipeline.RecordEmulationFailure(loopCtx)
@@ -145,6 +153,7 @@ func (controller *Controller) completeMCP(ctx context.Context, request *llm.Requ
 		pipeline.RecordEmulationFailure(loopCtx)
 		return nil, err
 	}
+	hostedLedger := newHostedExecutionLedger(controller.config.MaxHostedCalls)
 	prepared := gatewayRequest.Clone()
 	resumed := []llm.Item(nil)
 	if controller.needsMCPEmulation(gatewayRequest, rounds.TargetFormat()) {
@@ -154,7 +163,7 @@ func (controller *Controller) completeMCP(ctx context.Context, request *llm.Requ
 			return nil, err
 		}
 	}
-	prepared, err = lowerHostedHistory(prepared, hostedRegistry)
+	prepared, err = lowerHostedHistory(prepared, hostedRegistry, hostedLedger)
 	if err != nil {
 		pipeline.RecordEmulationFailure(loopCtx)
 		return nil, err
@@ -168,15 +177,29 @@ func (controller *Controller) completeMCP(ctx context.Context, request *llm.Requ
 
 	constraintRetries := 0
 	for round := 0; round < controller.config.MaxRounds; round++ {
-		response, roundErr := rounds.Complete(loopCtx, prepared)
+		roundIndex := uint32(round + 1)
+		roundStarted := time.Now()
+		roundCtx, roundCancel, roundContextErr := controller.providerRoundContext(loopCtx, gatewayDeadline, round > 0)
+		if roundContextErr != nil {
+			pipeline.RecordProviderRound(loopCtx, roundIndex, time.Since(roundStarted), providerRoundOutcome(roundContextErr), false)
+			pipeline.RecordEmulationFailure(loopCtx)
+			return nil, roundContextErr
+		}
+		pipeline.RecordProviderRoundAttempt(loopCtx)
+		response, roundErr := rounds.Complete(roundCtx, prepared)
+		roundErr = normalizeProviderRoundContextError(roundCtx, roundErr)
+		roundCancel()
 		if roundErr != nil {
+			pipeline.RecordProviderRound(loopCtx, roundIndex, time.Since(roundStarted), providerRoundOutcome(roundErr), true)
 			pipeline.RecordEmulationFailure(loopCtx)
 			return nil, roundErr
 		}
+		pipeline.RecordProviderRoundCompleted(loopCtx)
+		pipeline.RecordProviderRound(loopCtx, roundIndex, time.Since(roundStarted), providerRoundOutcomeCompleted, true)
 		billedUsage = addUsage(billedUsage, response.Usage)
 		processed, processErr := controller.processRound(
-			loopCtx, registry, hostedRegistry, constraints, response, controller.config.MaxToolCalls-totalCalls,
-			constraintRetries < controller.config.MaxCustomConstraintRetries,
+			loopCtx, registry, hostedRegistry, hostedLedger, constraints, response, controller.config.MaxToolCalls-totalCalls,
+			constraintRetries < controller.config.MaxCustomConstraintRetries, round+1 < controller.config.MaxRounds,
 		)
 		if processErr != nil {
 			if errors.Is(processErr, ErrLoopLimit) {
@@ -206,7 +229,7 @@ func (controller *Controller) completeMCP(ctx context.Context, request *llm.Requ
 			publicItems = append(publicItems, publicRoundItems(response.Output, processed.replacements, registry, hostedRegistry)...)
 			appendProviderRound(prepared, response.Output, processed.results)
 			refreshRegistryDefinitions(prepared, registry)
-			refreshHostedDefinitions(prepared, hostedRegistry)
+			refreshHostedDefinitions(prepared, hostedRegistry, hostedLedger)
 			continue
 		}
 		if processed.gatewayCalls == 0 {
@@ -223,7 +246,7 @@ func (controller *Controller) completeMCP(ctx context.Context, request *llm.Requ
 
 		appendProviderRound(prepared, response.Output, processed.results)
 		refreshRegistryDefinitions(prepared, registry)
-		refreshHostedDefinitions(prepared, hostedRegistry)
+		refreshHostedDefinitions(prepared, hostedRegistry, hostedLedger)
 	}
 	pipeline.RecordEmulationLimit(loopCtx)
 	return nil, ErrLoopLimit
@@ -326,19 +349,14 @@ func (controller *Controller) processRound(
 	ctx context.Context,
 	registry *mcp.Registry,
 	hostedRegistry *hosted.Registry,
+	hostedLedger *hostedExecutionLedger,
 	constraints *customConstraintRegistry,
 	response *llm.Response,
 	remainingCalls int,
 	allowConstraintRetry bool,
+	allowContinuation bool,
 ) (*processedRound, error) {
 	gatewayCalls, hostedCalls, clientCalls := classifyCalls(response.Output, registry, hostedRegistry)
-	violations, err := validateCustomConstraintCalls(ctx, constraints, response.Output)
-	if err != nil {
-		return nil, err
-	}
-	if len(gatewayCalls)+len(hostedCalls) > remainingCalls {
-		return nil, ErrLoopLimit
-	}
 	processed := &processedRound{
 		gatewayCalls: len(gatewayCalls) + len(hostedCalls),
 		replacements: make(map[string]llm.Item, len(gatewayCalls)+len(hostedCalls)),
@@ -347,19 +365,34 @@ func (controller *Controller) processRound(
 	for index := range hostedCalls {
 		addHostedRequestUsage(&processed.serverToolUsage, hostedCalls[index].binding.Definition.Kind)
 	}
-	if len(gatewayCalls)+len(hostedCalls) == 0 && len(violations) == 0 {
-		return processed, nil
-	}
 	if response.Status != "" && response.Status != llm.ResponseStatusCompleted {
+		if len(gatewayCalls)+len(hostedCalls) == 0 {
+			return processed, nil
+		}
 		for _, call := range gatewayCalls {
 			processed.replacements[call.item.ToolCall.CallID] = interruptedMCPCall(registry, call, response.Status)
 		}
 		for _, call := range hostedCalls {
 			processed.replacements[call.item.ToolCall.CallID] = interruptedHostedCall(call, response.Status)
 		}
-		recordCustomConstraintFallbacks(ctx, violations)
 		processed.boundary = true
 		return processed, nil
+	}
+	violations, err := validateCustomConstraintCalls(ctx, constraints, response.Output)
+	if err != nil {
+		return nil, err
+	}
+	if len(gatewayCalls)+len(hostedCalls) == 0 && len(violations) == 0 {
+		return processed, nil
+	}
+	if len(gatewayCalls)+len(hostedCalls) > remainingCalls {
+		return nil, ErrLoopLimit
+	}
+	if len(gatewayCalls)+len(hostedCalls) > 0 && !allowContinuation {
+		return nil, ErrLoopLimit
+	}
+	if err := hostedLedger.reserve(ctx, hostedCalls); err != nil {
+		return nil, err
 	}
 
 	approvals := make(map[string]llm.Item)
@@ -406,6 +439,41 @@ func (controller *Controller) processRound(
 	}
 	processed.boundary = len(approvals) > 0 || clientCalls > len(violations) || len(violations) > 0 && !canRetryConstraints
 	return processed, nil
+}
+
+func (controller *Controller) providerRoundContext(
+	ctx context.Context, gatewayDeadline time.Time, continuation bool,
+) (context.Context, context.CancelFunc, error) {
+	if ctx == nil {
+		return nil, func() {}, context.Canceled
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		return nil, func() {}, normalizeGatewayContextError(ctx, cause)
+	}
+	if !continuation {
+		return ctx, func() {}, nil
+	}
+	budget := controller.config.MaxProviderRoundTime
+	budgetCause := ErrGatewayProviderRoundTimeExceeded
+	if deadline, ok := ctx.Deadline(); ok {
+		available := time.Until(deadline) - controller.config.DeadlineReserve
+		if available <= 0 {
+			return nil, func() {}, deadlineBudgetFailure(ctx, deadline, gatewayDeadline)
+		}
+		if budget <= 0 || available < budget {
+			budget = available
+			if ownsGatewayDeadline(deadline, gatewayDeadline) {
+				budgetCause = ErrGatewayWallTimeExceeded
+			} else {
+				budgetCause = ErrRequestDeadlineBudgetExhausted
+			}
+		}
+	}
+	if budget <= 0 {
+		return ctx, func() {}, nil
+	}
+	roundCtx, cancel := context.WithTimeoutCause(ctx, budget, budgetCause)
+	return roundCtx, cancel, nil
 }
 
 func validateCustomConstraintCalls(

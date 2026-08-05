@@ -124,6 +124,11 @@ type pipelineTrace struct {
 	outboundAPIFormat         llm.APIFormat
 	stream                    bool
 	emulationRounds           atomic.Uint32
+	providerRoundAttempts     atomic.Uint32
+	providerRoundsCompleted   atomic.Uint32
+	providerRoundsMu          sync.Mutex
+	providerRounds            [6]llm.ProviderRoundTrace
+	providerRoundCount        int
 	emulationCalls            atomic.Uint32
 	emulationApprovals        atomic.Uint32
 	emulationFailures         atomic.Uint32
@@ -137,6 +142,9 @@ type pipelineTrace struct {
 	hostedImageCalls          atomic.Uint32
 	hostedToolSearchCalls     atomic.Uint32
 	hostedOtherCalls          atomic.Uint32
+	hostedBudgetRejections    atomic.Uint32
+	repeatedHostedInvocations atomic.Uint32
+	emulationStopReason       atomic.Pointer[string]
 	constraintCompiles        atomic.Uint32
 	constraintValidations     atomic.Uint32
 	constraintViolations      atomic.Uint32
@@ -296,6 +304,63 @@ func RecordEmulationRound(ctx context.Context, toolCalls, approvals uint32) {
 	trace.emulationApprovals.Add(approvals)
 }
 
+func RecordProviderRoundAttempt(ctx context.Context) {
+	if trace := traceFromContext(ctx); trace != nil {
+		trace.providerRoundAttempts.Add(1)
+	}
+}
+
+func RecordProviderRoundCompleted(ctx context.Context) {
+	if trace := traceFromContext(ctx); trace != nil {
+		trace.providerRoundsCompleted.Add(1)
+	}
+}
+
+// RecordProviderRound stores one bounded, payload-free provider-round result.
+// At most six records are retained because the gateway production policy also
+// caps a loop at six model rounds; additional records are deliberately ignored.
+func RecordProviderRound(
+	ctx context.Context, roundIndex uint32, duration time.Duration, outcome string, providerDispatched bool,
+) {
+	trace := traceFromContext(ctx)
+	if trace == nil || roundIndex == 0 || outcome == "" {
+		return
+	}
+	trace.providerRoundsMu.Lock()
+	defer trace.providerRoundsMu.Unlock()
+	if trace.providerRoundCount >= len(trace.providerRounds) {
+		return
+	}
+	trace.providerRounds[trace.providerRoundCount] = llm.ProviderRoundTrace{
+		RoundIndex:         roundIndex,
+		DurationMillis:     max(duration.Milliseconds(), 0),
+		Outcome:            outcome,
+		ProviderDispatched: providerDispatched,
+	}
+	trace.providerRoundCount++
+}
+
+func RecordHostedBudgetRejection(ctx context.Context) {
+	if trace := traceFromContext(ctx); trace != nil {
+		trace.hostedBudgetRejections.Add(1)
+	}
+}
+
+func RecordRepeatedHostedInvocation(ctx context.Context) {
+	if trace := traceFromContext(ctx); trace != nil {
+		trace.repeatedHostedInvocations.Add(1)
+	}
+}
+
+func RecordEmulationStop(ctx context.Context, reason string) {
+	trace := traceFromContext(ctx)
+	if trace == nil || reason == "" {
+		return
+	}
+	reasonCopy := reason
+	trace.emulationStopReason.CompareAndSwap(nil, &reasonCopy)
+}
+
 func RecordEmulationFailure(ctx context.Context) {
 	if trace := traceFromContext(ctx); trace != nil {
 		trace.emulationFailures.Add(1)
@@ -416,8 +481,10 @@ func emulationSummary(ctx context.Context) *llm.EmulationTraceSummary {
 	if trace == nil {
 		return nil
 	}
-	return &llm.EmulationTraceSummary{
+	summary := &llm.EmulationTraceSummary{
 		InternalRounds:                trace.emulationRounds.Load(),
+		ProviderRoundAttempts:         trace.providerRoundAttempts.Load(),
+		ProviderRoundsCompleted:       trace.providerRoundsCompleted.Load(),
 		ToolCalls:                     trace.emulationCalls.Load(),
 		Approvals:                     trace.emulationApprovals.Load(),
 		Failures:                      trace.emulationFailures.Load(),
@@ -431,6 +498,8 @@ func emulationSummary(ctx context.Context) *llm.EmulationTraceSummary {
 		HostedImageCalls:              trace.hostedImageCalls.Load(),
 		HostedToolSearchCalls:         trace.hostedToolSearchCalls.Load(),
 		HostedOtherCalls:              trace.hostedOtherCalls.Load(),
+		HostedBudgetRejections:        trace.hostedBudgetRejections.Load(),
+		RepeatedHostedInvocations:     trace.repeatedHostedInvocations.Load(),
 		CustomConstraintCompiles:      trace.constraintCompiles.Load(),
 		CustomConstraintValidations:   trace.constraintValidations.Load(),
 		CustomConstraintViolations:    trace.constraintViolations.Load(),
@@ -439,6 +508,13 @@ func emulationSummary(ctx context.Context) *llm.EmulationTraceSummary {
 		CustomConstraintCompileNanos:  trace.constraintCompileNanos.Load(),
 		CustomConstraintValidateNanos: trace.constraintValidateNanos.Load(),
 	}
+	if reason := trace.emulationStopReason.Load(); reason != nil {
+		summary.StopReason = *reason
+	}
+	trace.providerRoundsMu.Lock()
+	summary.ProviderRounds = append(summary.ProviderRounds, trace.providerRounds[:trace.providerRoundCount]...)
+	trace.providerRoundsMu.Unlock()
+	return summary
 }
 
 func safeObserve(ctx context.Context, observer Observer, event Observation) {

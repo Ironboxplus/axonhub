@@ -8,7 +8,7 @@ import (
 	"github.com/looplj/axonhub/llm/emulation/hosted"
 )
 
-func lowerHostedHistory(request *llm.Request, registry *hosted.Registry) (*llm.Request, error) {
+func lowerHostedHistory(request *llm.Request, registry *hosted.Registry, ledger *hostedExecutionLedger) (*llm.Request, error) {
 	if request == nil || registry == nil || registry.Empty() {
 		return request, nil
 	}
@@ -21,7 +21,7 @@ func lowerHostedHistory(request *llm.Request, registry *hosted.Registry) (*llm.R
 		}
 		definitions = append(definitions, definition)
 	}
-	prepared.ToolDefinitions = append(definitions, registry.FunctionDefinitions()...)
+	prepared.ToolDefinitions = append(definitions, availableHostedDefinitions(registry, ledger)...)
 	prepared.Input = prepared.Input[:0]
 	for index := range request.Input {
 		item := request.Input[index]
@@ -68,7 +68,7 @@ func lowerHostedHistory(request *llm.Request, registry *hosted.Registry) (*llm.R
 	return prepared, nil
 }
 
-func refreshHostedDefinitions(request *llm.Request, registry *hosted.Registry) {
+func refreshHostedDefinitions(request *llm.Request, registry *hosted.Registry, ledger *hostedExecutionLedger) {
 	if request == nil || registry == nil || registry.Empty() {
 		return
 	}
@@ -80,5 +80,20 @@ func refreshHostedDefinitions(request *llm.Request, registry *hosted.Registry) {
 		}
 		definitions = append(definitions, definition)
 	}
-	request.ToolDefinitions = append(definitions, registry.FunctionDefinitions()...)
+	request.ToolDefinitions = append(definitions, availableHostedDefinitions(registry, ledger)...)
+}
+
+func availableHostedDefinitions(registry *hosted.Registry, ledger *hostedExecutionLedger) []llm.ToolDefinition {
+	definitions := registry.FunctionDefinitions()
+	if ledger == nil || len(definitions) == 0 {
+		return definitions
+	}
+	available := definitions[:0]
+	for index := range definitions {
+		binding, ok := registry.Binding(definitions[index].LogicalName)
+		if !ok || ledger.allows(binding.Definition) {
+			available = append(available, definitions[index])
+		}
+	}
+	return available
 }

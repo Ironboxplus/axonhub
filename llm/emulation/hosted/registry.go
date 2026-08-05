@@ -135,7 +135,7 @@ func DiscoverRegistry(request *llm.Request, config Config, emulate func(llm.Tool
 		binding := Binding{SyntheticName: name, Definition: definition, Function: function, Executor: executor}
 		registry.bindings[name] = binding
 		registry.definitions = append(registry.definitions, llm.ToolDefinition{
-			Kind: llm.ToolKindFunction, LogicalName: name, Description: definition.Description,
+			Kind: llm.ToolKindFunction, LogicalName: name, Description: hostedFunctionDescription(definition),
 			Function: &llm.FunctionDefinition{
 				Parameters: append([]byte(nil), function.Parameters...), Strict: function.Strict,
 			},
@@ -147,6 +147,32 @@ func DiscoverRegistry(request *llm.Request, config Config, emulate func(llm.Tool
 	})
 	registry.activateFromHistory(request.Input)
 	return registry, nil
+}
+
+func hostedFunctionDescription(definition llm.ToolDefinition) string {
+	if strings.TrimSpace(definition.Description) != "" {
+		return definition.Description
+	}
+	switch definition.Kind {
+	case llm.ToolKindWebSearch:
+		return "Search the web for current information. After a successful result, use it to answer the user and do not repeat an identical query."
+	case llm.ToolKindWebFetch:
+		return "Fetch a web resource once and use the returned content to continue the answer."
+	case llm.ToolKindFileSearch:
+		return "Search the available files and use the returned evidence to answer the user."
+	case llm.ToolKindCodeInterpreter, llm.ToolKindCodeExecution:
+		return "Execute code only when needed and use the returned result to continue the answer."
+	case llm.ToolKindShell, llm.ToolKindLocalShell:
+		return "Run the requested shell operation and use its result to continue the answer."
+	case llm.ToolKindComputer:
+		return "Perform the requested computer action and continue from its recorded result."
+	case llm.ToolKindImageGeneration:
+		return "Generate the requested image and continue from the generated result."
+	case llm.ToolKindToolSearch:
+		return "Find the most relevant deferred tools, then call the discovered tool instead of repeating the same search."
+	default:
+		return "Execute the hosted capability once and continue from its result."
+	}
 }
 
 func (registry *Registry) Binding(name string) (Binding, bool) {

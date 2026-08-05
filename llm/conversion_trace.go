@@ -275,25 +275,41 @@ type ConversionTraceSummary struct {
 // one gateway-owned tool loop. Tool names, IDs, arguments, outputs, endpoints,
 // and credentials are deliberately absent.
 type EmulationTraceSummary struct {
-	InternalRounds                uint32 `json:"internal_rounds"`
-	ToolCalls                     uint32 `json:"tool_calls"`
-	Approvals                     uint32 `json:"approvals"`
-	Failures                      uint32 `json:"failures"`
-	LimitHit                      bool   `json:"limit_hit"`
-	HostedWebSearchCalls          uint32 `json:"hosted_web_search_calls,omitempty"`
-	HostedWebFetchCalls           uint32 `json:"hosted_web_fetch_calls,omitempty"`
-	HostedFileSearchCalls         uint32 `json:"hosted_file_search_calls,omitempty"`
-	HostedCodeCalls               uint32 `json:"hosted_code_calls,omitempty"`
-	HostedShellCalls              uint32 `json:"hosted_shell_calls,omitempty"`
-	HostedComputerCalls           uint32 `json:"hosted_computer_calls,omitempty"`
-	HostedImageCalls              uint32 `json:"hosted_image_calls,omitempty"`
-	HostedToolSearchCalls         uint32 `json:"hosted_tool_search_calls,omitempty"`
-	HostedOtherCalls              uint32 `json:"hosted_other_calls,omitempty"`
-	CustomConstraintCompiles      uint32 `json:"custom_constraint_compiles"`
-	CustomConstraintValidations   uint32 `json:"custom_constraint_validations"`
-	CustomConstraintViolations    uint32 `json:"custom_constraint_violations"`
-	CustomConstraintRetries       uint32 `json:"custom_constraint_retries"`
-	CustomConstraintFallbacks     uint32 `json:"custom_constraint_fallbacks"`
-	CustomConstraintCompileNanos  int64  `json:"custom_constraint_compile_nanos"`
-	CustomConstraintValidateNanos int64  `json:"custom_constraint_validate_nanos"`
+	InternalRounds                uint32               `json:"internal_rounds"`
+	ProviderRoundAttempts         uint32               `json:"provider_round_attempts,omitempty"`
+	ProviderRoundsCompleted       uint32               `json:"provider_rounds_completed,omitempty"`
+	ProviderRounds                []ProviderRoundTrace `json:"provider_rounds,omitempty"`
+	ToolCalls                     uint32               `json:"tool_calls"`
+	Approvals                     uint32               `json:"approvals"`
+	Failures                      uint32               `json:"failures"`
+	LimitHit                      bool                 `json:"limit_hit"`
+	HostedWebSearchCalls          uint32               `json:"hosted_web_search_calls,omitempty"`
+	HostedWebFetchCalls           uint32               `json:"hosted_web_fetch_calls,omitempty"`
+	HostedFileSearchCalls         uint32               `json:"hosted_file_search_calls,omitempty"`
+	HostedCodeCalls               uint32               `json:"hosted_code_calls,omitempty"`
+	HostedShellCalls              uint32               `json:"hosted_shell_calls,omitempty"`
+	HostedComputerCalls           uint32               `json:"hosted_computer_calls,omitempty"`
+	HostedImageCalls              uint32               `json:"hosted_image_calls,omitempty"`
+	HostedToolSearchCalls         uint32               `json:"hosted_tool_search_calls,omitempty"`
+	HostedOtherCalls              uint32               `json:"hosted_other_calls,omitempty"`
+	HostedBudgetRejections        uint32               `json:"hosted_budget_rejections,omitempty"`
+	RepeatedHostedInvocations     uint32               `json:"repeated_hosted_invocations,omitempty"`
+	StopReason                    string               `json:"stop_reason,omitempty"`
+	CustomConstraintCompiles      uint32               `json:"custom_constraint_compiles"`
+	CustomConstraintValidations   uint32               `json:"custom_constraint_validations"`
+	CustomConstraintViolations    uint32               `json:"custom_constraint_violations"`
+	CustomConstraintRetries       uint32               `json:"custom_constraint_retries"`
+	CustomConstraintFallbacks     uint32               `json:"custom_constraint_fallbacks"`
+	CustomConstraintCompileNanos  int64                `json:"custom_constraint_compile_nanos"`
+	CustomConstraintValidateNanos int64                `json:"custom_constraint_validate_nanos"`
+}
+
+// ProviderRoundTrace is a bounded, payload-free record of one provider round
+// inside a gateway-owned tool loop. It intentionally excludes model names,
+// endpoints, request content, tool arguments, results, and credentials.
+type ProviderRoundTrace struct {
+	RoundIndex         uint32 `json:"round_index"`
+	DurationMillis     int64  `json:"duration_ms"`
+	Outcome            string `json:"outcome"`
+	ProviderDispatched bool   `json:"provider_dispatched"`
 }

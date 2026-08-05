@@ -370,8 +370,323 @@ func TestControllerStopsAfterHostedExecutorFailureOverRealHTTP(t *testing.T) {
 	}, llm.ErrorDiagnosticFrom(err))
 }
 
+func TestControllerRejectsRepeatedHostedInvocationBeforeSecondExecutionOverRealHTTP(t *testing.T) {
+	t.Parallel()
+	observer := &controllerObservationRecorder{}
+	var searchCalls atomic.Int64
+	searchServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		searchCalls.Add(1)
+		var input hosted.WebSearchInput
+		require.NoError(t, json.NewDecoder(request.Body).Decode(&input))
+		require.Equal(t, "repeat-safe query", input.Query)
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(writer, `{"text":"one execution only","sources":[{"url":"https://example.test/once","title":"once"}]}`)
+	}))
+	t.Cleanup(searchServer.Close)
+	searchEndpoint, err := url.Parse(searchServer.URL)
+	require.NoError(t, err)
+	webExecutor, err := hosted.NewWebSearchExecutor(hosted.WebSearchExecutorConfig{
+		Endpoint: searchServer.URL, Client: searchServer.Client(),
+		EndpointPolicy: func(candidate *url.URL) error {
+			if candidate.Scheme != searchEndpoint.Scheme || candidate.Host != searchEndpoint.Host {
+				return errors.New("search endpoint is not allowlisted")
+			}
+			return nil
+		},
+	})
+	require.NoError(t, err)
+
+	var providerRounds atomic.Int64
+	var syntheticName string
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		round := providerRounds.Add(1)
+		body, readErr := io.ReadAll(request.Body)
+		require.NoError(t, readErr)
+		var payload struct {
+			Tools []struct {
+				Type string `json:"type"`
+				Name string `json:"name"`
+			} `json:"tools"`
+			Input json.RawMessage `json:"input"`
+		}
+		require.NoError(t, json.Unmarshal(body, &payload))
+		require.Len(t, payload.Tools, 1)
+		if round == 1 {
+			syntheticName = payload.Tools[0].Name
+		} else {
+			require.Equal(t, syntheticName, payload.Tools[0].Name)
+			require.Contains(t, string(payload.Input), "one execution only")
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(writer, `{"id":"resp_repeat_%d","object":"response","created_at":1785382100,"model":"fixture-model","status":"completed","output":[{"id":"item_repeat_%d","type":"function_call","call_id":"repeat_call_%d","name":%q,"arguments":"{\"query\":\"repeat-safe query\"}","status":"completed"}]}`, round, round, round, syntheticName)
+	}))
+	t.Cleanup(provider.Close)
+
+	controller, err := emulation.NewController(emulation.ControllerConfig{
+		Hosted: hosted.Config{
+			SyntheticNameKey: []byte(strings.Repeat("repeat-hosted-controller-key-", 2)),
+			Executors:        map[llm.ToolKind]hosted.Executor{llm.ToolKindWebSearch: webExecutor},
+		},
+		ForceHostedGateway: conversion.CapabilityWebSearchTool,
+		MaxRounds:          6, MaxToolCalls: 12, MaxParallelCalls: 2,
+		MaxHostedCalls: map[llm.ToolKind]int{llm.ToolKindWebSearch: 4},
+	})
+	require.NoError(t, err)
+	outbound, err := responses.NewOutboundTransformer(provider.URL, "provider-key")
+	require.NoError(t, err)
+	executor := httpclient.NewHttpClientWithProxy(&httpclient.ProxyConfig{Type: httpclient.ProxyTypeDisabled})
+	t.Cleanup(executor.CloseIdleConnections)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = pipeline.NewFactory(executor).Pipeline(
+		responses.NewInboundTransformer(), conversion.NewOutbound(outbound),
+		pipeline.WithToolLoopController(controller), pipeline.WithObserver(observer),
+	).Process(ctx, &httpclient.Request{
+		Method: http.MethodPost, URL: "/v1/responses", Headers: http.Header{"Content-Type": []string{"application/json"}},
+		Body: []byte(`{"model":"fixture-model","input":"search once","tools":[{"type":"web_search"}]}`),
+	})
+	require.ErrorIs(t, err, emulation.ErrRepeatedHostedInvocation)
+	require.EqualValues(t, 2, providerRounds.Load())
+	require.EqualValues(t, 1, searchCalls.Load(), "the repeated semantic call must not leave the process twice")
+	summary := observer.emulation()
+	require.EqualValues(t, 1, summary.RepeatedHostedInvocations)
+	require.Equal(t, string(emulation.GatewayStopRepeatedInvocation), summary.StopReason)
+	require.Equal(t, &llm.ErrorDiagnostic{
+		Component: "gateway", Code: "hosted_repeated_invocation", Message: "The provider repeated a hosted tool call without making progress.", StatusCode: http.StatusBadGateway,
+	}, llm.ErrorDiagnosticFrom(err))
+}
+
+func TestControllerEnforcesOperatorHostedCapabilityLimitOverRealHTTP(t *testing.T) {
+	t.Parallel()
+	observer := &controllerObservationRecorder{}
+	var searchCalls atomic.Int64
+	webExecutor, err := hosted.NewWebSearchExecutor(hosted.WebSearchExecutorConfig{
+		Service: hostedSearchServiceFunc(func(_ context.Context, input hosted.WebSearchInput) (hosted.WebSearchOutput, error) {
+			searchCalls.Add(1)
+			return hosted.WebSearchOutput{Text: "result for " + input.Query}, nil
+		}),
+	})
+	require.NoError(t, err)
+	var providerRounds atomic.Int64
+	var syntheticName string
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		round := providerRounds.Add(1)
+		var payload struct {
+			Tools []struct {
+				Name string `json:"name"`
+			} `json:"tools"`
+		}
+		require.NoError(t, json.NewDecoder(request.Body).Decode(&payload))
+		if syntheticName == "" {
+			require.Len(t, payload.Tools, 1)
+			syntheticName = payload.Tools[0].Name
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(writer, `{"id":"resp_quota_%d","object":"response","created_at":1785382200,"model":"fixture-model","status":"completed","output":[{"id":"item_quota_%d","type":"function_call","call_id":"quota_call_%d","name":%q,"arguments":"{\"query\":\"query %d\"}","status":"completed"}]}`, round, round, round, syntheticName, round)
+	}))
+	t.Cleanup(provider.Close)
+	controller, err := emulation.NewController(emulation.ControllerConfig{
+		Hosted: hosted.Config{
+			SyntheticNameKey: []byte(strings.Repeat("quota-hosted-controller-key-", 2)),
+			Executors:        map[llm.ToolKind]hosted.Executor{llm.ToolKindWebSearch: webExecutor},
+		},
+		ForceHostedGateway: conversion.CapabilityWebSearchTool,
+		MaxRounds:          6, MaxToolCalls: 12, MaxParallelCalls: 2,
+		MaxHostedCalls: map[llm.ToolKind]int{llm.ToolKindWebSearch: 2},
+	})
+	require.NoError(t, err)
+	outbound, err := responses.NewOutboundTransformer(provider.URL, "provider-key")
+	require.NoError(t, err)
+	executor := httpclient.NewHttpClientWithProxy(&httpclient.ProxyConfig{Type: httpclient.ProxyTypeDisabled})
+	t.Cleanup(executor.CloseIdleConnections)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = pipeline.NewFactory(executor).Pipeline(
+		responses.NewInboundTransformer(), conversion.NewOutbound(outbound),
+		pipeline.WithToolLoopController(controller), pipeline.WithObserver(observer),
+	).Process(ctx, &httpclient.Request{
+		Method: http.MethodPost, URL: "/v1/responses", Headers: http.Header{"Content-Type": []string{"application/json"}},
+		Body: []byte(`{"model":"fixture-model","input":"bounded search","tools":[{"type":"web_search"}]}`),
+	})
+	require.ErrorIs(t, err, emulation.ErrHostedMaxUses)
+	require.EqualValues(t, 3, providerRounds.Load())
+	require.EqualValues(t, 2, searchCalls.Load())
+	summary := observer.emulation()
+	require.EqualValues(t, 1, summary.HostedBudgetRejections)
+	require.Equal(t, string(emulation.GatewayStopHostedMaxUses), summary.StopReason)
+}
+
+func TestControllerDistinguishesGatewayWallTimeFromParentCancellationOverRealHTTP(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		select {
+		case <-request.Context().Done():
+		case <-release:
+		}
+	}))
+	t.Cleanup(provider.Close)
+	t.Cleanup(func() { close(release) })
+	controller, err := emulation.NewController(emulation.ControllerConfig{
+		Hosted: hosted.Config{
+			SyntheticNameKey: []byte(strings.Repeat("deadline-hosted-controller-key-", 2)),
+			Executors: map[llm.ToolKind]hosted.Executor{
+				llm.ToolKindWebSearch: mustHostedWebSearchExecutor(t),
+			},
+		},
+		ForceHostedGateway: conversion.CapabilityWebSearchTool,
+		MaxWallTime:        30 * time.Millisecond,
+	})
+	require.NoError(t, err)
+	outbound, err := responses.NewOutboundTransformer(provider.URL, "provider-key")
+	require.NoError(t, err)
+	executor := httpclient.NewHttpClientWithProxy(&httpclient.ProxyConfig{Type: httpclient.ProxyTypeDisabled})
+	t.Cleanup(executor.CloseIdleConnections)
+	parent, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err = pipeline.NewFactory(executor).Pipeline(
+		responses.NewInboundTransformer(), conversion.NewOutbound(outbound),
+		pipeline.WithToolLoopController(controller),
+	).Process(parent, &httpclient.Request{
+		Method: http.MethodPost, URL: "/v1/responses", Headers: http.Header{"Content-Type": []string{"application/json"}},
+		Body: []byte(`{"model":"fixture-model","input":"deadline","tools":[{"type":"web_search"}]}`),
+	})
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.ErrorIs(t, err, emulation.ErrGatewayWallTimeExceeded)
+	require.NoError(t, parent.Err(), "the gateway-owned child deadline must not be reported as parent/client cancellation")
+	require.Equal(t, &llm.ErrorDiagnostic{
+		Component: "gateway", Code: "gateway_wall_time_exceeded", Message: "Gateway-hosted tool execution exceeded its total time budget.", StatusCode: http.StatusGatewayTimeout,
+	}, llm.ErrorDiagnosticFrom(err))
+}
+
+func TestControllerPreservesParentCancellationOverRealHTTP(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		select {
+		case <-request.Context().Done():
+		case <-release:
+		}
+	}))
+	t.Cleanup(provider.Close)
+	t.Cleanup(func() { close(release) })
+	controller, err := emulation.NewController(emulation.ControllerConfig{
+		Hosted: hosted.Config{
+			SyntheticNameKey: []byte(strings.Repeat("cancel-hosted-controller-key-", 2)),
+			Executors: map[llm.ToolKind]hosted.Executor{
+				llm.ToolKindWebSearch: mustHostedWebSearchExecutor(t),
+			},
+		},
+		ForceHostedGateway: conversion.CapabilityWebSearchTool,
+		MaxWallTime:        2 * time.Second,
+	})
+	require.NoError(t, err)
+	outbound, err := responses.NewOutboundTransformer(provider.URL, "provider-key")
+	require.NoError(t, err)
+	executor := httpclient.NewHttpClientWithProxy(&httpclient.ProxyConfig{Type: httpclient.ProxyTypeDisabled})
+	t.Cleanup(executor.CloseIdleConnections)
+	parent, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(30*time.Millisecond, cancel)
+	defer cancel()
+	_, err = pipeline.NewFactory(executor).Pipeline(
+		responses.NewInboundTransformer(), conversion.NewOutbound(outbound),
+		pipeline.WithToolLoopController(controller),
+	).Process(parent, &httpclient.Request{
+		Method: http.MethodPost, URL: "/v1/responses", Headers: http.Header{"Content-Type": []string{"application/json"}},
+		Body: []byte(`{"model":"fixture-model","input":"cancel","tools":[{"type":"web_search"}]}`),
+	})
+	require.ErrorIs(t, err, context.Canceled)
+	require.NotErrorIs(t, err, emulation.ErrGatewayWallTimeExceeded)
+}
+
+func TestControllerBoundsEachGatewayProviderRoundOverRealHTTP(t *testing.T) {
+	t.Parallel()
+	observer := &controllerObservationRecorder{}
+	release := make(chan struct{})
+	var providerRounds atomic.Int64
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if providerRounds.Add(1) == 1 {
+			var payload struct {
+				Tools []struct {
+					Name string `json:"name"`
+				} `json:"tools"`
+			}
+			require.NoError(t, json.NewDecoder(request.Body).Decode(&payload))
+			require.Len(t, payload.Tools, 1)
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(writer, `{"id":"resp_round_1","object":"response","created_at":1785382200,"model":"fixture-model","status":"completed","output":[{"id":"item_round_1","type":"function_call","call_id":"round_call_1","name":%q,"arguments":"{\"query\":\"first round\"}","status":"completed"}]}`, payload.Tools[0].Name)
+			return
+		}
+		select {
+		case <-request.Context().Done():
+		case <-release:
+		}
+	}))
+	t.Cleanup(provider.Close)
+	t.Cleanup(func() { close(release) })
+	controller, err := emulation.NewController(emulation.ControllerConfig{
+		Hosted: hosted.Config{
+			SyntheticNameKey: []byte(strings.Repeat("round-time-hosted-controller-key-", 2)),
+			Executors: map[llm.ToolKind]hosted.Executor{
+				llm.ToolKindWebSearch: mustHostedWebSearchExecutor(t),
+			},
+		},
+		ForceHostedGateway:   conversion.CapabilityWebSearchTool,
+		MaxWallTime:          2 * time.Second,
+		MaxProviderRoundTime: 30 * time.Millisecond,
+		DeadlineReserve:      50 * time.Millisecond,
+	})
+	require.NoError(t, err)
+	outbound, err := responses.NewOutboundTransformer(provider.URL, "provider-key")
+	require.NoError(t, err)
+	executor := httpclient.NewHttpClientWithProxy(&httpclient.ProxyConfig{Type: httpclient.ProxyTypeDisabled})
+	t.Cleanup(executor.CloseIdleConnections)
+	parent, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, err = pipeline.NewFactory(executor).Pipeline(
+		responses.NewInboundTransformer(), conversion.NewOutbound(outbound),
+		pipeline.WithToolLoopController(controller), pipeline.WithObserver(observer),
+	).Process(parent, &httpclient.Request{
+		Method: http.MethodPost, URL: "/v1/responses", Headers: http.Header{"Content-Type": []string{"application/json"}},
+		Body: []byte(`{"model":"fixture-model","input":"round timeout","tools":[{"type":"web_search"}]}`),
+	})
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.ErrorIs(t, err, emulation.ErrGatewayProviderRoundTimeExceeded)
+	require.NotErrorIs(t, err, emulation.ErrGatewayWallTimeExceeded)
+	require.NoError(t, parent.Err())
+	require.EqualValues(t, 2, providerRounds.Load())
+	require.Equal(t, &llm.ErrorDiagnostic{
+		Component: "gateway", Code: "gateway_provider_round_timeout", Message: "A gateway continuation round exceeded its provider time budget.", StatusCode: http.StatusGatewayTimeout,
+	}, llm.ErrorDiagnosticFrom(err))
+	summary := observer.emulation()
+	require.Len(t, summary.ProviderRounds, 2)
+	require.Equal(t, []llm.ProviderRoundTrace{
+		{RoundIndex: 1, DurationMillis: summary.ProviderRounds[0].DurationMillis, Outcome: "completed", ProviderDispatched: true},
+		{RoundIndex: 2, DurationMillis: summary.ProviderRounds[1].DurationMillis, Outcome: "provider_timeout", ProviderDispatched: true},
+	}, summary.ProviderRounds)
+	require.GreaterOrEqual(t, summary.ProviderRounds[1].DurationMillis, int64(20))
+}
+
+type hostedSearchServiceFunc func(context.Context, hosted.WebSearchInput) (hosted.WebSearchOutput, error)
+
+func (service hostedSearchServiceFunc) Search(ctx context.Context, input hosted.WebSearchInput) (hosted.WebSearchOutput, error) {
+	return service(ctx, input)
+}
+
+func mustHostedWebSearchExecutor(t *testing.T) hosted.Executor {
+	t.Helper()
+	executor, err := hosted.NewWebSearchExecutor(hosted.WebSearchExecutorConfig{
+		Service: hostedSearchServiceFunc(func(context.Context, hosted.WebSearchInput) (hosted.WebSearchOutput, error) {
+			return hosted.WebSearchOutput{Text: "unused"}, nil
+		}),
+	})
+	require.NoError(t, err)
+	return executor
+}
+
 func TestControllerForcesResponsesWebSearchThroughGatewayStreamOverRealHTTP(t *testing.T) {
 	t.Parallel()
+	observer := &controllerObservationRecorder{}
 	var searchCalls atomic.Int64
 	searchServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		searchCalls.Add(1)
@@ -529,7 +844,8 @@ func TestControllerForcesResponsesWebSearchThroughGatewayStreamOverRealHTTP(t *t
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	result, err := pipeline.NewFactory(executor).Pipeline(
-		responses.NewInboundTransformer(), conversion.NewOutbound(outbound), pipeline.WithToolLoopController(controller),
+		responses.NewInboundTransformer(), conversion.NewOutbound(outbound),
+		pipeline.WithToolLoopController(controller), pipeline.WithObserver(observer),
 	).Process(ctx, &httpclient.Request{
 		Method: http.MethodPost, URL: "/v1/responses", Headers: http.Header{"Content-Type": []string{"application/json"}},
 		Body: []byte(`{"model":"fixture-model","stream":true,"input":"search","tools":[{"type":"web_search"}]}`),
@@ -558,6 +874,10 @@ func TestControllerForcesResponsesWebSearchThroughGatewayStreamOverRealHTTP(t *t
 	require.NotContains(t, encoded, "response.function_call_arguments")
 	require.Equal(t, 1, countString(eventTypes, "response.created"))
 	require.Equal(t, 1, countString(eventTypes, "response.completed"))
+	summary := observer.emulation()
+	require.Len(t, summary.ProviderRounds, 2)
+	require.Equal(t, "completed", summary.ProviderRounds[0].Outcome)
+	require.Equal(t, "completed", summary.ProviderRounds[1].Outcome)
 }
 
 func TestControllerStreamsResponsesWebSearchThroughChatTargetOverRealHTTP(t *testing.T) {

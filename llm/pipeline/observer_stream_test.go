@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -10,6 +11,23 @@ import (
 type advancingCurrentStream struct {
 	values []string
 	index  int
+}
+
+func TestRecordProviderRoundKeepsOnlyBoundedSafeEvidence(t *testing.T) {
+	RecordProviderRound(context.Background(), 1, time.Second, "completed", true)
+	trace := newPipelineTrace(&benchmarkObserver{}, "openai/responses")
+	ctx := withPipelineTrace(context.Background(), trace)
+	RecordProviderRound(ctx, 0, time.Second, "completed", true)
+	RecordProviderRound(ctx, 1, time.Second, "", true)
+	for index := 1; index <= 7; index++ {
+		RecordProviderRound(ctx, uint32(index), time.Duration(index)*time.Millisecond, "completed", index%2 == 0)
+	}
+	summary := emulationSummary(ctx)
+	require.Len(t, summary.ProviderRounds, 6)
+	require.EqualValues(t, 1, summary.ProviderRounds[0].RoundIndex)
+	require.EqualValues(t, 1, summary.ProviderRounds[0].DurationMillis)
+	require.False(t, summary.ProviderRounds[0].ProviderDispatched)
+	require.EqualValues(t, 6, summary.ProviderRounds[5].RoundIndex)
 }
 
 func (s *advancingCurrentStream) Next() bool { return s.index < len(s.values) }
