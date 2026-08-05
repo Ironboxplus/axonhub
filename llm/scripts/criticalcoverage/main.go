@@ -58,6 +58,7 @@ var targets = []target{
 	{File: "emulation/controller.go", Receiver: "hostedExecutionError", Function: "Unwrap"},
 	{File: "emulation/controller.go", Function: "appendMCPExecutions"},
 	{File: "emulation/controller.go", Function: "failedMCPResultExecution"},
+	{File: "emulation/controller.go", Function: "mcpCallResultExecution"},
 	{File: "emulation/controller.go", Receiver: "mcpExecutionError", Function: "Error"},
 	{File: "emulation/controller.go", Receiver: "mcpExecutionError", Function: "Unwrap"},
 	{File: "emulation/preflight.go", Receiver: "Controller", Function: "CapabilityProfile"},

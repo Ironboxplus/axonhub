@@ -322,6 +322,117 @@ func TestControllerStopsAfterMCPInfrastructureFailureOverRealHTTP(t *testing.T) 
 	}
 }
 
+func TestControllerContinuesStructuredMCPFailureOverRealHTTP(t *testing.T) {
+	t.Parallel()
+	const authorization = "Bearer structured-mcp-failure-token"
+	var mcpCalls atomic.Int64
+	mcpServer := newStructuredFailureControllerMCPServer(t, authorization, &mcpCalls)
+	allowedMCP, err := url.Parse(mcpServer.URL)
+	require.NoError(t, err)
+
+	var providerRounds atomic.Int64
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		round := providerRounds.Add(1)
+		body, readErr := io.ReadAll(request.Body)
+		if readErr != nil {
+			http.Error(writer, "read", http.StatusBadRequest)
+			return
+		}
+		var payload struct {
+			Tools []struct {
+				Function struct {
+					Name string `json:"name"`
+				} `json:"function"`
+			} `json:"tools"`
+			Messages []struct {
+				Role       string `json:"role"`
+				ToolCallID string `json:"tool_call_id"`
+				Content    any    `json:"content"`
+			} `json:"messages"`
+		}
+		if json.Unmarshal(body, &payload) != nil || len(payload.Tools) != 1 {
+			http.Error(writer, "decode", http.StatusBadRequest)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		if round == 1 {
+			_, _ = fmt.Fprintf(writer, `{"id":"chatcmpl-mcp-is-error-1","object":"chat.completion","created":1785383100,"model":"fixture-model","choices":[{"index":0,"message":{"role":"assistant","content":"checking inventory","tool_calls":[{"id":"provider_structured_failure","type":"function","function":{"name":%q,"arguments":"{\"sku\":\"A-1\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`, payload.Tools[0].Function.Name)
+			return
+		}
+		foundStructuredFailure := false
+		for _, message := range payload.Messages {
+			if message.Role != "tool" || message.ToolCallID != "provider_structured_failure" {
+				continue
+			}
+			content, ok := message.Content.(string)
+			foundStructuredFailure = ok && strings.Contains(content, `"isError":true`) &&
+				strings.Contains(content, `"code":"out_of_stock"`) &&
+				strings.Contains(content, `"retryable":false`) &&
+				strings.Contains(content, "inventory unavailable")
+		}
+		if !foundStructuredFailure {
+			http.Error(writer, "structured MCP failure missing", http.StatusBadRequest)
+			return
+		}
+		_, _ = io.WriteString(writer, `{"id":"chatcmpl-mcp-is-error-2","object":"chat.completion","created":1785383101,"model":"fixture-model","choices":[{"index":0,"message":{"role":"assistant","content":"inventory lookup failed safely"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}`)
+	}))
+	t.Cleanup(provider.Close)
+
+	controller, err := emulation.NewController(emulation.ControllerConfig{
+		MCP: mcp.RegistryConfig{
+			SyntheticNameKey: []byte(strings.Repeat("structured-failure-key-", 2)),
+			EndpointPolicy: func(candidate *url.URL) error {
+				if candidate.Scheme != allowedMCP.Scheme || candidate.Host != allowedMCP.Host {
+					return fmt.Errorf("MCP endpoint is not allowlisted")
+				}
+				return nil
+			},
+		},
+		MaxRounds: 4, MaxToolCalls: 8, MaxParallelCalls: 2,
+	})
+	require.NoError(t, err)
+	outbound, err := openai.NewOutboundTransformer(provider.URL, "provider-key")
+	require.NoError(t, err)
+	executor := httpclient.NewHttpClientWithProxy(&httpclient.ProxyConfig{Type: httpclient.ProxyTypeDisabled})
+	t.Cleanup(executor.CloseIdleConnections)
+	observer := &controllerObservationRecorder{}
+	result, processErr := pipeline.NewFactory(executor).Pipeline(
+		responses.NewInboundTransformer(), conversion.NewOutbound(outbound),
+		pipeline.WithToolLoopController(controller), pipeline.WithObserver(observer),
+	).Process(context.Background(), &httpclient.Request{
+		Method: http.MethodPost, URL: "/v1/responses", Headers: http.Header{"Content-Type": []string{"application/json"}},
+		Body: []byte(fmt.Sprintf(`{"model":"fixture-model","input":"check stock","tools":[{"type":"mcp","server_label":"inventory","server_url":%q,"authorization":%q,"require_approval":"never"}]}`, mcpServer.URL, authorization)),
+	})
+	require.NoError(t, processErr)
+	require.NotNil(t, result.Response)
+	require.EqualValues(t, 2, providerRounds.Load(), "structured MCP isError must be a deliberate tool continuation")
+	require.EqualValues(t, 1, mcpCalls.Load())
+	wire := string(result.Response.Body)
+	require.NotContains(t, wire, authorization)
+	var responseBody struct {
+		Output []struct {
+			Type   string `json:"type"`
+			Status string `json:"status"`
+			Output string `json:"output"`
+		} `json:"output"`
+	}
+	require.NoError(t, json.Unmarshal(result.Response.Body, &responseBody), wire)
+	foundPublicFailure := false
+	for _, item := range responseBody.Output {
+		if item.Type != "mcp_call" {
+			continue
+		}
+		foundPublicFailure = item.Status == "failed" && strings.Contains(item.Output, `"isError":true`) &&
+			strings.Contains(item.Output, `"code":"out_of_stock"`) && strings.Contains(item.Output, `"retryable":false`)
+	}
+	require.True(t, foundPublicFailure, wire)
+	summary := observer.emulation()
+	require.NotNil(t, summary)
+	require.EqualValues(t, 2, summary.InternalRounds)
+	require.EqualValues(t, 1, summary.ToolCalls)
+	require.EqualValues(t, 1, summary.Failures)
+}
+
 func TestControllerRunsPortableResponsesMCPThroughForcedGatewayOverRealHTTP(t *testing.T) {
 	t.Parallel()
 	const authorization = "Bearer responses-portable-private-token"
@@ -1837,6 +1948,48 @@ func newFailingControllerMCPServer(t *testing.T, authorization string, calls *at
 		case "tools/call":
 			calls.Add(1)
 			http.Error(writer, "private MCP content_policy diagnostic Authorization: Bearer secret", http.StatusServiceUnavailable)
+		default:
+			http.Error(writer, "method", http.StatusBadRequest)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+func newStructuredFailureControllerMCPServer(t *testing.T, authorization string, calls *atomic.Int64) *httptest.Server {
+	t.Helper()
+	const sessionID = "controller-structured-failure-session"
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Authorization") != authorization {
+			http.Error(writer, "authorization", http.StatusUnauthorized)
+			return
+		}
+		if request.Method == http.MethodDelete {
+			writer.WriteHeader(http.StatusNoContent)
+			return
+		}
+		var envelope struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+		}
+		if json.NewDecoder(request.Body).Decode(&envelope) != nil {
+			http.Error(writer, "decode", http.StatusBadRequest)
+			return
+		}
+		switch envelope.Method {
+		case "initialize":
+			writer.Header().Set("Content-Type", "application/json")
+			writer.Header().Set("Mcp-Session-Id", sessionID)
+			_, _ = fmt.Fprintf(writer, `{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"%s","capabilities":{"tools":{}},"serverInfo":{"name":"inventory","version":"1"}}}`, envelope.ID, mcp.ProtocolVersion)
+		case "notifications/initialized":
+			writer.WriteHeader(http.StatusAccepted)
+		case "tools/list":
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(writer, `{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"lookup","description":"look up stock","inputSchema":{"type":"object","properties":{"sku":{"type":"string"}},"required":["sku"]}}]}}`, envelope.ID)
+		case "tools/call":
+			calls.Add(1)
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(writer, `{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"inventory unavailable"}],"structuredContent":{"code":"out_of_stock","retryable":false},"isError":true}}`, envelope.ID)
 		default:
 			http.Error(writer, "method", http.StatusBadRequest)
 		}

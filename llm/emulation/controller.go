@@ -668,6 +668,13 @@ func executeCall(ctx context.Context, registry *mcp.Registry, call gatewayCall) 
 	if err != nil {
 		return callExecution{call: call, err: err}
 	}
+	return mcpCallResultExecution(ctx, registry, call, arguments, result)
+}
+
+// mcpCallResultExecution preserves an MCP server's structured result semantics.
+// A protocol-level isError result is a completed tool invocation that the model
+// may reason about; only a local serialization defect terminates the tool loop.
+func mcpCallResultExecution(ctx context.Context, registry *mcp.Registry, call gatewayCall, arguments json.RawMessage, result mcp.CallToolResult) callExecution {
 	encoded, err := json.Marshal(result)
 	if err != nil {
 		return callExecution{call: call, err: errors.New("encode MCP result")}

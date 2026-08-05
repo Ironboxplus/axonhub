@@ -1,6 +1,8 @@
 package emulation
 
 import (
+	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -35,5 +37,23 @@ func TestInvalidMCPDiscoveryArgumentsUseBoundedFailedResult(t *testing.T) {
 		execution.public.Kind != llm.ItemKindMCPListTools || execution.public.MCPListTools == nil ||
 		execution.public.MCPListTools.Error != "MCP tool arguments are invalid JSON" {
 		t.Fatalf("invalid discovery result = %#v", execution)
+	}
+}
+
+func TestMCPCallResultSerializationFailureTerminates(t *testing.T) {
+	t.Parallel()
+	registry := mcp.NewEmptyRegistry([]byte(strings.Repeat("result-encoding-key-", 2)))
+	call := gatewayCall{
+		item: llm.Item{ToolCall: &llm.ToolInvocation{CallID: "encoding_call", LogicalName: "lookup"}},
+		binding: mcp.Binding{
+			ServerLabel: "inventory",
+			Tool:        llm.MCPDiscoveredTool{Name: "lookup"},
+		},
+	}
+	execution := mcpCallResultExecution(context.Background(), registry, call, json.RawMessage(`{"sku":"A-1"}`), mcp.CallToolResult{
+		StructuredContent: json.RawMessage(`{`),
+	})
+	if execution.err == nil || execution.err.Error() != "encode MCP result" || execution.result.ToolResult != nil || execution.public.MCPCall != nil {
+		t.Fatalf("serialization failure execution = %#v", execution)
 	}
 }
