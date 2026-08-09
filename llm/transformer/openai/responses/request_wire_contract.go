@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/looplj/axonhub/llm"
 )
 
 // ResponsesWireProfile selects the target Responses wire contract. The Lite
@@ -49,6 +51,22 @@ func (err *ResponsesWireValidationError) Error() string {
 		return fmt.Sprintf("Responses wire validation %s at %s (%s): %s", err.Code, err.Path, err.ObjectType, err.message)
 	}
 	return fmt.Sprintf("Responses wire validation %s at %s (%s)", err.Code, err.Path, err.ObjectType)
+}
+
+// SafeDiagnostic exposes a fixed, payload-free classification for a final
+// wire rejection. The code and JSON path stay in WireEvidence; no body value,
+// header, credential, or provider message crosses the processing-error
+// boundary.
+func (err *ResponsesWireValidationError) SafeDiagnostic() llm.ErrorDiagnostic {
+	if err == nil || err.Code == "" {
+		return llm.ErrorDiagnostic{}
+	}
+	return llm.ErrorDiagnostic{
+		Component:  "outbound_wire_validation",
+		Code:       err.Code,
+		Message:    "Outbound Responses wire validation blocked before provider dispatch.",
+		StatusCode: 400,
+	}
 }
 
 // NormalizeAndValidateResponsesRequestBody validates the exact final Responses
@@ -354,6 +372,12 @@ func normalizeResponsesTool(
 	if !ok || strings.TrimSpace(toolType) == "" {
 		return nil, wireValidationError("missing_tool_type", path+".type", "tool", false, "type is required")
 	}
+	if profile == ResponsesWireProfileLite && namespaceChild && toolType != "function" {
+		return nil, wireValidationError(
+			"responses_lite_namespace_child_must_be_function", path+".type", toolType, false,
+			"Responses Lite namespace tools can only contain function tools",
+		)
+	}
 
 	switch toolType {
 	case "function":
@@ -384,12 +408,8 @@ func normalizeResponsesTool(
 		if !present {
 			return nil, wireValidationError("empty_tool_declaration", path+".tools", toolType, false, "namespace tools is required")
 		}
-		children, err := normalizeResponsesToolArray(rawChildren, path+".tools", profile, additional, report)
-		if err != nil {
-			return nil, err
-		}
 		var childItems []json.RawMessage
-		if err := json.Unmarshal(children, &childItems); err != nil || len(childItems) == 0 {
+		if err := json.Unmarshal(rawChildren, &childItems); err != nil || len(childItems) == 0 {
 			return nil, wireValidationError("empty_tool_declaration", path+".tools", toolType, false, "namespace tools must be a non-empty array")
 		}
 		seenNames := make(map[string]struct{}, len(childItems))

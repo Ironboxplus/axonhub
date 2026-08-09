@@ -92,10 +92,11 @@ type Action struct {
 }
 
 type CapabilityProfile struct {
-	ID            string
-	APIFormat     llm.APIFormat
-	NativeTools   ToolCapabilitySet
-	EmulatedTools ToolCapabilitySet
+	ID                        string
+	APIFormat                 llm.APIFormat
+	NativeTools               ToolCapabilitySet
+	EmulatedTools             ToolCapabilitySet
+	NamespaceChildNativeTools ToolCapabilitySet
 }
 
 type ToolCapabilitySet uint32

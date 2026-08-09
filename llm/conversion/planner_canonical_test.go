@@ -3,10 +3,125 @@ package conversion
 import (
 	"encoding/json"
 	"errors"
+	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/looplj/axonhub/llm"
+	"github.com/looplj/axonhub/llm/httpclient"
 )
+
+func TestResponsesLiteHeaderPlansOnlyNamespacedCustomAsFunction(t *testing.T) {
+	t.Parallel()
+
+	request := &llm.Request{
+		APIFormat: llm.APIFormatOpenAIResponse,
+		RawRequest: &httpclient.Request{Headers: http.Header{
+			"X-OpenAI-Internal-Codex-Responses-Lite": []string{"true"},
+		}},
+		ToolDefinitions: []llm.ToolDefinition{
+			{
+				Kind: llm.ToolKindCustom, LogicalName: "top_level_exec", Execution: llm.ExecutionOwnerClient,
+				Freeform: &llm.FreeformDefinition{Format: "grammar", Syntax: "lark", Definition: "start: source"},
+			},
+			{
+				Kind: llm.ToolKindCustom, LogicalName: "agents__exec", Execution: llm.ExecutionOwnerClient,
+				Freeform: &llm.FreeformDefinition{Format: "grammar", Syntax: "lark", Definition: "start: source", Namespace: "agents"},
+			},
+		},
+	}
+	if !llm.UsesResponsesLiteWireProfile(request) {
+		t.Fatalf("Responses Lite raw header did not select the shared wire profile")
+	}
+
+	plan, err := NewPlanner().Plan(request, llm.APIFormatOpenAIResponse)
+	if err != nil || plan == nil || !plan.Complete() {
+		t.Fatalf("plan Responses Lite namespace restriction = %#v, err=%v", plan, err)
+	}
+	var topLevel, namespaced *Action
+	for index := range plan.Actions {
+		action := &plan.Actions[index]
+		if action.Ref.Kind != ObjectToolDefinition {
+			continue
+		}
+		switch action.Ref.ToolIndex {
+		case 0:
+			topLevel = action
+		case 1:
+			namespaced = action
+		}
+	}
+	if topLevel == nil || topLevel.Kind != ActionNative || topLevel.Strategy != StrategyNative {
+		t.Fatalf("top-level custom action = %#v, want native", topLevel)
+	}
+	if namespaced == nil || namespaced.Kind != ActionLower || namespaced.Strategy != StrategyCustomAsFunction ||
+		namespaced.Reason != ReasonTargetFunctionOnly || !namespaced.Reversible || plan.Summary.Lowered != 1 {
+		t.Fatalf("namespaced custom lowering is not visible in plan summary: action=%#v plan=%#v", namespaced, plan)
+	}
+}
+
+func TestResponsesLitePlannerHelpersCoverScopedCapabilityBranches(t *testing.T) {
+	t.Parallel()
+
+	base, ok := ProfileFor(llm.APIFormatOpenAIResponse)
+	if !ok {
+		t.Fatal("Responses capability profile is unavailable")
+	}
+	if got := effectiveRequestCapabilityProfile(base, nil); got != base {
+		t.Fatalf("ordinary Responses profile changed without Lite signal: %#v", got)
+	}
+	chat, _ := ProfileFor(llm.APIFormatOpenAIChatCompletion)
+	liteRequest := &llm.Request{TransformerMetadata: map[string]any{
+		llm.ResponsesWireProfileMetadataKey: llm.ResponsesWireProfileLiteValue,
+	}}
+	if got := effectiveRequestCapabilityProfile(chat, liteRequest); got != chat {
+		t.Fatalf("non-Responses target acquired a Lite restriction: %#v", got)
+	}
+	lite := effectiveRequestCapabilityProfile(base, liteRequest)
+	if lite.NamespaceChildNativeTools != CapabilityFunctionTool || lite.NativeTools != base.NativeTools ||
+		!strings.Contains(lite.ID, responsesLiteProfileSuffix) {
+		t.Fatalf("Lite profile did not scope function-only restriction to namespace children: %#v", lite)
+	}
+	if repeated := effectiveRequestCapabilityProfile(lite, liteRequest); repeated.ID != lite.ID {
+		t.Fatalf("Lite profile suffix was duplicated: %#v", repeated)
+	}
+	if got := namespaceChildCapabilityProfile(base, ""); got != base {
+		t.Fatalf("empty namespace changed capability profile: %#v", got)
+	}
+	if got := namespaceChildCapabilityProfile(CapabilityProfile{NativeTools: base.NativeTools}, "agents"); got.NativeTools != base.NativeTools {
+		t.Fatalf("unset namespace rule changed capability profile: %#v", got)
+	}
+	if got := namespaceChildCapabilityProfile(lite, "agents"); got.NativeTools != CapabilityFunctionTool {
+		t.Fatalf("namespace capability = %b, want only function", got.NativeTools)
+	}
+
+	if action := actionForClientToolKind(llm.ToolKindCustom, base, ObjectRef{}); action.Kind != ActionNative {
+		t.Fatalf("native top-level custom action = %#v", action)
+	}
+	functionOnly := CapabilityProfile{NativeTools: CapabilityFunctionTool}
+	if action := actionForClientToolKind(llm.ToolKindCustom, functionOnly, ObjectRef{}); action.Kind != ActionLower || action.Strategy != StrategyCustomAsFunction {
+		t.Fatalf("function-only custom action = %#v", action)
+	}
+	if action := actionForClientToolKind(llm.ToolKindShell, functionOnly, ObjectRef{}); action.Kind != ActionLower || action.Strategy != StrategyClientToolAsFunc {
+		t.Fatalf("function-only client tool action = %#v", action)
+	}
+	if action := actionForClientToolKind(llm.ToolKindCustom, CapabilityProfile{}, ObjectRef{}); action.Kind != ActionUnknown {
+		t.Fatalf("unsupported custom action = %#v", action)
+	}
+
+	result := &llm.ToolResult{CallID: "call_1"}
+	if toolResultNamespace(nil, result) != "" || toolResultNamespace(&llm.Request{}, nil) != "" ||
+		toolResultNamespace(&llm.Request{}, &llm.ToolResult{}) != "" ||
+		toolResultNamespace(&llm.Request{}, result) != "" {
+		t.Fatal("unrelated tool result acquired a namespace")
+	}
+	request := &llm.Request{Input: []llm.Item{{Kind: llm.ItemKindToolCall, ToolCall: &llm.ToolInvocation{
+		CallID: "call_1", Namespace: "agents",
+	}}}}
+	if got := toolResultNamespace(request, result); got != "agents" {
+		t.Fatalf("tool result namespace = %q, want agents", got)
+	}
+}
 
 func TestPlannerAccountsForCanonicalToolObjects(t *testing.T) {
 	request := &llm.Request{

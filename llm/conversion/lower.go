@@ -53,6 +53,7 @@ func lower(request *llm.Request, plan *Plan, trace bool) (*llm.Request, *Session
 		applyAllowedMCPRestrictions(lowered.ToolDefinitions, allowedMCPNames, allowedMCPUnrestricted)
 	}
 	definitionIndexes := make(map[string]int, len(lowered.ToolDefinitions))
+	customChoiceNames := make(map[string][]string, len(lowered.ToolDefinitions))
 	for index := range lowered.ToolDefinitions {
 		definitionIndexes[lowered.ToolDefinitions[index].LogicalName] = index
 	}
@@ -114,8 +115,14 @@ func lower(request *llm.Request, plan *Plan, trace bool) (*llm.Request, *Session
 			}
 			definition.Kind = llm.ToolKindFunction
 			definition.LogicalName = session.syntheticNameInNamespace(sourceName, namespace)
+			customChoiceNames[custom.Name] = append(customChoiceNames[custom.Name], definition.LogicalName)
+			if sourceName != custom.Name {
+				customChoiceNames[sourceName] = append(customChoiceNames[sourceName], definition.LogicalName)
+			}
 			definition.Description = customFunctionDescription(custom)
-			definition.Function = &llm.FunctionDefinition{Parameters: append(json.RawMessage(nil), customFunctionParameters...), Strict: lo.ToPtr(true)}
+			definition.Function = &llm.FunctionDefinition{
+				Parameters: append(json.RawMessage(nil), customFunctionParameters...), Strict: lo.ToPtr(true), Namespace: namespace,
+			}
 			definition.Freeform = nil
 		default:
 			lowerClientToolDefinition(definition, session)
@@ -165,7 +172,11 @@ func lower(request *llm.Request, plan *Plan, trace bool) (*llm.Request, *Session
 		choice := lowered.ToolChoice.NamedToolChoice
 		if choice.Type == llm.ToolTypeResponsesCustomTool || choice.Type == "custom" {
 			choice.Type = llm.ToolTypeFunction
-			choice.Function.Name = session.syntheticName(choice.Function.Name)
+			if candidates := customChoiceNames[choice.Function.Name]; len(candidates) == 1 {
+				choice.Function.Name = candidates[0]
+			} else {
+				choice.Function.Name = session.syntheticName(choice.Function.Name)
+			}
 		} else if choice.Type == string(llm.ToolKindToolSearch) {
 			choice.Type = llm.ToolTypeFunction
 			choice.Function.Name = session.syntheticToolName(llm.ToolKindToolSearch, "tool_search")
@@ -200,6 +211,7 @@ func lower(request *llm.Request, plan *Plan, trace bool) (*llm.Request, *Session
 			call.Type = llm.ToolTypeFunction
 			call.Function = llm.FunctionCall{
 				Name:      session.syntheticNameInNamespace(customCall.Name, customCall.Namespace),
+				Namespace: customCall.Namespace,
 				Arguments: string(arguments),
 			}
 			call.ResponseCustomToolCall = nil
@@ -219,7 +231,6 @@ func lower(request *llm.Request, plan *Plan, trace bool) (*llm.Request, *Session
 			}
 			call.Kind = llm.ToolKindFunction
 			call.LogicalName = session.syntheticNameInNamespace(call.LogicalName, call.Namespace)
-			call.Namespace = ""
 			call.ArgumentsJSON = arguments
 			call.ArgumentsText = ""
 			call.InputText = ""
@@ -231,7 +242,6 @@ func lower(request *llm.Request, plan *Plan, trace bool) (*llm.Request, *Session
 			sourceKind, sourceName := call.Kind, call.LogicalName
 			call.Kind = llm.ToolKindFunction
 			call.LogicalName = session.syntheticToolNameInNamespace(sourceKind, sourceName, call.Namespace)
-			call.Namespace = ""
 		}
 		if item.ToolResult != nil && planLowersItem(plan, ObjectToolResult, itemIndex) {
 			result := item.ToolResult
@@ -387,10 +397,16 @@ func planNeedsLowering(plan *Plan) bool {
 }
 
 func customFunctionDescription(custom *llm.ResponseCustomTool) string {
-	parts := make([]string, 0, 3)
-	if description := strings.TrimSpace(custom.Description); description != "" {
-		parts = append(parts, description)
+	if custom == nil || strings.TrimSpace(custom.Description) == "" {
+		// A lowered function must not manufacture a semantic description for a
+		// free-form custom tool. Responses Lite requires that field and its final
+		// wire contract will reject it before transport, preserving the original
+		// fail-closed rule rather than treating the generic envelope instruction
+		// as a description of client behavior.
+		return ""
 	}
+	parts := make([]string, 0, 3)
+	parts = append(parts, strings.TrimSpace(custom.Description))
 	parts = append(parts, "Pass the complete free-form tool input verbatim in the input field.")
 	if custom.Format != nil && custom.Format.Type != "" {
 		constraint := "Input format: " + custom.Format.Type

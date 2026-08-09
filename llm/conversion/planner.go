@@ -3,6 +3,7 @@ package conversion
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/looplj/axonhub/llm"
@@ -43,15 +44,46 @@ func (p *Planner) preparePlan(request *llm.Request, targetFormat llm.APIFormat, 
 	return prepared, plan, err
 }
 
-func (p *Planner) profileFor(targetFormat llm.APIFormat) (CapabilityProfile, bool) {
+func (p *Planner) profileFor(request *llm.Request, targetFormat llm.APIFormat) (CapabilityProfile, bool) {
 	profile, ok := ProfileFor(targetFormat)
 	if p != nil && p.profile != nil && p.profile.APIFormat == targetFormat {
-		return *p.profile, true
+		profile, ok = *p.profile, true
 	}
 	if !ok {
 		return CapabilityProfile{ID: "unknown/v1", APIFormat: targetFormat}, false
 	}
-	return profile, true
+	return effectiveRequestCapabilityProfile(profile, request), true
+}
+
+const (
+	responsesLiteProfileSuffix = "+responses-lite-namespace-function-only"
+)
+
+// effectiveRequestCapabilityProfile applies a known final-wire restriction to
+// the concrete target profile. Responses Lite is still APIFormatOpenAIResponse
+// at the protocol level, but its namespace declarations only accept function
+// children. The restriction is intentionally scoped to namespace children:
+// top-level Responses custom tools remain native. Keeping that fact in
+// capability planning makes the existing reversible custom-to-function
+// lowering run before encoding; a final wire validator can then fail closed
+// if raw mutation somehow reintroduces a non-function child.
+func effectiveRequestCapabilityProfile(profile CapabilityProfile, request *llm.Request) CapabilityProfile {
+	if profile.APIFormat != llm.APIFormatOpenAIResponse || !llm.UsesResponsesLiteWireProfile(request) {
+		return profile
+	}
+	profile.NamespaceChildNativeTools = CapabilityFunctionTool
+	if !strings.Contains(profile.ID, responsesLiteProfileSuffix) {
+		profile.ID += responsesLiteProfileSuffix
+	}
+	return profile
+}
+
+func namespaceChildCapabilityProfile(profile CapabilityProfile, namespace string) CapabilityProfile {
+	if namespace == "" || profile.NamespaceChildNativeTools == 0 {
+		return profile
+	}
+	profile.NativeTools = profile.NamespaceChildNativeTools
+	return profile
 }
 
 func (p *Planner) requestControlFailurePlan(request *llm.Request, targetFormat llm.APIFormat, trace bool, cause error) *Plan {
@@ -59,7 +91,7 @@ func (p *Planner) requestControlFailurePlan(request *llm.Request, targetFormat l
 	if trace {
 		startedAt = time.Now()
 	}
-	profile, _ := p.profileFor(targetFormat)
+	profile, _ := p.profileFor(request, targetFormat)
 	itemIndex := -1
 	var controlErr *llm.RequestControlError
 	if errors.As(cause, &controlErr) {
@@ -86,7 +118,7 @@ func (p *Planner) plan(request *llm.Request, targetFormat llm.APIFormat, trace b
 	if trace {
 		startedAt = time.Now()
 	}
-	profile, ok := p.profileFor(targetFormat)
+	profile, ok := p.profileFor(request, targetFormat)
 	plan := &Plan{
 		Target: profile,
 	}
@@ -169,17 +201,19 @@ func (p *Planner) plan(request *llm.Request, targetFormat llm.APIFormat, trace b
 		choice := request.ToolChoice.NamedToolChoice
 		ref := ObjectRef{Kind: ObjectToolChoice, ToolIndex: -1, ItemIndex: -1, MessageIndex: -1, ToolCallIndex: -1}
 		owner := llm.ExecutionOwner("")
+		choiceProfile := profile
 		for index := range request.ToolDefinitions {
 			definition := &request.ToolDefinitions[index]
 			if string(definition.Kind) == choice.Type && (choice.Function.Name == "" || definition.LogicalName == choice.Function.Name) {
 				owner = definition.Execution
+				choiceProfile = namespaceChildCapabilityProfile(profile, toolDefinitionNamespace(definition))
 				break
 			}
 		}
 		if owner == llm.ExecutionOwnerClient {
-			plan.Actions = append(plan.Actions, actionForClientToolKind(llm.ToolKind(choice.Type), profile, ref))
+			plan.Actions = append(plan.Actions, actionForClientToolKind(llm.ToolKind(choice.Type), choiceProfile, ref))
 		} else {
-			plan.Actions = append(plan.Actions, actionForToolKind(choice.Type, profile, ref))
+			plan.Actions = append(plan.Actions, actionForToolKind(choice.Type, choiceProfile, ref))
 		}
 	}
 
@@ -209,7 +243,7 @@ func (p *Planner) plan(request *llm.Request, targetFormat llm.APIFormat, trace b
 			case llm.ItemKindToolResult:
 				if item.ToolResult != nil {
 					plan.Actions = append(plan.Actions, actionForToolResult(
-						item.ToolResult, profile,
+						item.ToolResult, namespaceChildCapabilityProfile(profile, toolResultNamespace(request, item.ToolResult)),
 						ObjectRef{Kind: ObjectToolResult, ToolIndex: -1, ItemIndex: itemIndex, MessageIndex: -1, ToolCallIndex: -1},
 					))
 					for contentIndex := range item.ToolResult.Content {
@@ -532,6 +566,7 @@ func actionForToolCall(call *llm.ToolInvocation, target CapabilityProfile, ref O
 	if call == nil {
 		return Action{Ref: ref, Kind: ActionUnknown, Strategy: StrategyUnavailable, Reason: ReasonNoStrategy}
 	}
+	target = namespaceChildCapabilityProfile(target, call.Namespace)
 	// Anthropic tool_use.input is JSON, unlike Chat/Responses function
 	// arguments which are strings. Never let the encoder silently replace an
 	// invalid argument string with an empty object.
@@ -559,6 +594,7 @@ func actionForToolDefinition(definition *llm.ToolDefinition, source llm.APIForma
 	if definition == nil {
 		return Action{Ref: ref, Kind: ActionUnknown, Strategy: StrategyUnavailable, Reason: ReasonNoStrategy}
 	}
+	target = namespaceChildCapabilityProfile(target, toolDefinitionNamespace(definition))
 	capability := capabilityForToolKind(string(definition.Kind))
 	if definition.Execution == llm.ExecutionOwnerProvider && definition.Kind == llm.ToolKindMCP {
 		// A standard remote-MCP definition is native on Responses. A read_only
@@ -607,6 +643,9 @@ func actionForClientToolKind(kind llm.ToolKind, target CapabilityProfile, ref Ob
 	if clientToolNativeEquivalent(kind, target.APIFormat) && target.NativeTools.Supports(capability) {
 		return Action{Ref: ref, Kind: ActionNative, Strategy: StrategyNative, Reason: ReasonTargetNative, Reversible: true}
 	}
+	if kind == llm.ToolKindCustom && target.NativeTools.Supports(CapabilityFunctionTool) {
+		return Action{Ref: ref, Kind: ActionLower, Strategy: StrategyCustomAsFunction, Reason: ReasonTargetFunctionOnly, Reversible: true}
+	}
 	if kind != llm.ToolKindFunction && target.NativeTools.Supports(CapabilityFunctionTool) {
 		return Action{Ref: ref, Kind: ActionLower, Strategy: StrategyClientToolAsFunc, Reason: ReasonTargetFunctionOnly, Reversible: true}
 	}
@@ -629,4 +668,17 @@ func clientToolNativeEquivalent(kind llm.ToolKind, target llm.APIFormat) bool {
 
 func isCustomToolCall(call llm.ToolCall) bool {
 	return call.ResponseCustomToolCall != nil || call.Type == llm.ToolTypeResponsesCustomTool || call.Type == "custom"
+}
+
+func toolResultNamespace(request *llm.Request, result *llm.ToolResult) string {
+	if request == nil || result == nil || result.CallID == "" {
+		return ""
+	}
+	for index := range request.Input {
+		call := request.Input[index].ToolCall
+		if call != nil && call.CallID == result.CallID {
+			return call.Namespace
+		}
+	}
+	return ""
 }

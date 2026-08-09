@@ -3,7 +3,11 @@ package responses
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
+
+	"github.com/looplj/axonhub/llm"
+	"github.com/looplj/axonhub/llm/transformer"
 )
 
 func TestNormalizeAndValidateResponsesRequestBodyProfilesAndUnions(t *testing.T) {
@@ -41,10 +45,16 @@ func TestNormalizeAndValidateResponsesRequestBodyProfilesAndUnions(t *testing.T)
 			wantCode: "missing_tool_description", wantPath: "input[0].tools[0].description",
 		},
 		{
-			name:     "namespace child custom missing description rejects",
+			name:     "lite namespace child custom rejects before description inference",
 			profile:  ResponsesWireProfileLite,
 			body:     `{"input":[{"type":"additional_tools","tools":[{"type":"namespace","name":"apps","description":"Apps.","tools":[{"type":"custom","name":"exec"}]}]}]}`,
-			wantCode: "missing_tool_description", wantPath: "input[0].tools[0].tools[0].description",
+			wantCode: "responses_lite_namespace_child_must_be_function", wantPath: "input[0].tools[0].tools[0].type",
+		},
+		{
+			name:     "lite namespace custom with description still rejects before provider dispatch",
+			profile:  ResponsesWireProfileLite,
+			body:     `{"input":[{"type":"additional_tools","tools":[{"type":"namespace","name":"apps","description":"Apps.","tools":[{"type":"custom","name":"exec","description":"Execute."}]}]}]}`,
+			wantCode: "responses_lite_namespace_child_must_be_function", wantPath: "input[0].tools[0].tools[0].type",
 		},
 		{
 			name:     "function parameters missing",
@@ -205,6 +215,28 @@ func TestNormalizeAndValidateResponsesRequestBodyTopLevelBranches(t *testing.T) 
 	var nilWireErr *ResponsesWireValidationError
 	if got := nilWireErr.Error(); got != "" {
 		t.Fatalf("nil typed wire error = %q, want empty", got)
+	}
+}
+
+func TestResponsesWireValidationErrorSurvivesOutboundInvalidRequestWrapping(t *testing.T) {
+	t.Parallel()
+	if got := (*ResponsesWireValidationError)(nil).SafeDiagnostic(); got != (llm.ErrorDiagnostic{}) {
+		t.Fatalf("nil wire diagnostic = %#v", got)
+	}
+
+	wireErr := &ResponsesWireValidationError{
+		Code: "missing_tool_description", Path: "input[0].tools[0].description", ObjectType: "function",
+	}
+	wrapped := fmt.Errorf("%w: %w", transformer.ErrInvalidRequest, wireErr)
+	var typed *ResponsesWireValidationError
+	if !errors.As(wrapped, &typed) || typed != wireErr {
+		t.Fatalf("wrapped error did not preserve Responses wire type: %T %v", wrapped, wrapped)
+	}
+	diagnostic := llm.ErrorDiagnosticFrom(wrapped)
+	if diagnostic == nil || diagnostic.Component != "outbound_wire_validation" ||
+		diagnostic.Code != wireErr.Code || diagnostic.StatusCode != 400 ||
+		diagnostic.Message != "Outbound Responses wire validation blocked before provider dispatch." {
+		t.Fatalf("safe wire diagnostic = %#v", diagnostic)
 	}
 }
 

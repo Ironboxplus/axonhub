@@ -64,9 +64,9 @@ func (t *InboundTransformer) TransformRequest(ctx context.Context, httpReq *http
 	if err != nil {
 		return nil, err
 	}
-	if strings.EqualFold(strings.TrimSpace(httpReq.Headers.Get(ResponsesLiteHeader)), "true") {
+	if llm.UsesResponsesLiteWireRequest(httpReq) {
 		converted.RawRequest = httpReq
-		converted.TransformerMetadata["responses_wire_profile"] = string(ResponsesWireProfileLite)
+		converted.TransformerMetadata[llm.ResponsesWireProfileMetadataKey] = llm.ResponsesWireProfileLiteValue
 	}
 	return converted, nil
 }

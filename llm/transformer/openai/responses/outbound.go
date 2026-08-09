@@ -30,7 +30,7 @@ var (
 const (
 	TransportHTTP       = "http"
 	TransportWebSocket  = "websocket"
-	ResponsesLiteHeader = "X-OpenAI-Internal-Codex-Responses-Lite"
+	ResponsesLiteHeader = llm.OpenAIResponsesLiteHeader
 )
 
 type Config struct {
@@ -328,7 +328,7 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 	}
 	body, _, err = NormalizeAndValidateResponsesRequestBody(body, profile)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", transformer.ErrInvalidRequest, err)
+		return nil, fmt.Errorf("%w: %w", transformer.ErrInvalidRequest, err)
 	}
 
 	headers := make(http.Header)
@@ -363,13 +363,7 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 }
 
 func isResponsesLiteWireProfile(request *llm.Request) bool {
-	if request == nil {
-		return false
-	}
-	if request.TransformerMetadata != nil && request.TransformerMetadata["responses_wire_profile"] == string(ResponsesWireProfileLite) {
-		return true
-	}
-	return request.RawRequest != nil && strings.EqualFold(strings.TrimSpace(request.RawRequest.Headers.Get(ResponsesLiteHeader)), "true")
+	return llm.UsesResponsesLiteWireProfile(request)
 }
 
 func hasResponsesToolDeclaration(request *llm.Request) bool {
