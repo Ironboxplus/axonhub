@@ -26,6 +26,7 @@ const (
 	GatewayStopRequestDeadline    GatewayStopReason = "request_deadline_exceeded"
 	GatewayStopHostedMaxUses      GatewayStopReason = "hosted_max_uses"
 	GatewayStopRepeatedInvocation GatewayStopReason = "hosted_repeated_invocation"
+	GatewayStopRequiredTool       GatewayStopReason = "required_gateway_tool_call_missing"
 )
 
 const (
@@ -93,6 +94,11 @@ func (failure *gatewayFailure) SafeDiagnostic() llm.ErrorDiagnostic {
 		return llm.ErrorDiagnostic{
 			Component: "gateway", Code: "hosted_repeated_invocation",
 			Message: "The provider repeated a hosted tool call without making progress.", StatusCode: http.StatusBadGateway,
+		}
+	case GatewayStopRequiredTool:
+		return llm.ErrorDiagnostic{
+			Component: "gateway", Code: "required_gateway_tool_call_missing",
+			Message: "The provider did not call the required gateway tool.", StatusCode: http.StatusBadGateway,
 		}
 	default:
 		return llm.ErrorDiagnostic{}

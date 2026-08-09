@@ -561,6 +561,253 @@ func TestControllerRunsPortableResponsesMCPThroughForcedGatewayOverRealHTTP(t *t
 	require.EqualValues(t, 1, emulationObservation.ToolCalls)
 }
 
+// TestControllerRunsReadOnlyResponsesMCPRequiredToolThroughGatewayOverRealHTTP
+// covers the Responses-only route selected when an MCP read_only filter must be
+// applied from tools/list annotations. The actual provider and MCP peers are
+// HTTP servers: the provider is intentionally strict about the synthetic
+// function identity and the continuation must contain the real MCP result.
+func TestControllerRunsReadOnlyResponsesMCPRequiredToolThroughGatewayOverRealHTTP(t *testing.T) {
+	t.Parallel()
+	const authorization = "Bearer responses-readonly-private-token"
+	var mcpCalls atomic.Int64
+	mcpServer := newControllerMCPServer(t, authorization, &mcpCalls)
+	allowedMCP, err := url.Parse(mcpServer.URL)
+	require.NoError(t, err)
+
+	var providerRounds atomic.Int64
+	var syntheticName string
+	var providerIssues []string
+	var providerIssuesMu sync.Mutex
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		round := providerRounds.Add(1)
+		body, readErr := io.ReadAll(request.Body)
+		if readErr != nil {
+			http.Error(writer, "read", http.StatusBadRequest)
+			return
+		}
+		var payload struct {
+			Tools []struct {
+				Type       string         `json:"type"`
+				Name       string         `json:"name"`
+				Parameters map[string]any `json:"parameters"`
+			} `json:"tools"`
+			ToolChoice *struct {
+				Type string `json:"type"`
+				Name string `json:"name"`
+			} `json:"tool_choice"`
+			Input json.RawMessage `json:"input"`
+		}
+		if json.Unmarshal(body, &payload) != nil || len(payload.Tools) != 1 || payload.Tools[0].Type != "function" ||
+			strings.Contains(string(body), `"type":"mcp"`) || strings.Contains(string(body), `"read_only"`) ||
+			!rootUnionBranchesAreExplicitObjects(payload.Tools[0].Parameters) {
+			providerIssuesMu.Lock()
+			providerIssues = append(providerIssues, fmt.Sprintf("round %d provider body was not a lowered read_only Responses request: %s", round, body))
+			providerIssuesMu.Unlock()
+			http.Error(writer, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		if round == 1 {
+			syntheticName = payload.Tools[0].Name
+			if !strings.HasPrefix(syntheticName, "axon_mcp_") {
+				providerIssuesMu.Lock()
+				providerIssues = append(providerIssues, "first round did not use an opaque MCP function")
+				providerIssuesMu.Unlock()
+			}
+			if payload.ToolChoice == nil || payload.ToolChoice.Type != "function" || payload.ToolChoice.Name != syntheticName {
+				providerIssuesMu.Lock()
+				providerIssues = append(providerIssues, fmt.Sprintf("first round did not force the discovered function: %s", body))
+				providerIssuesMu.Unlock()
+			}
+			_, _ = fmt.Fprintf(writer, `{"id":"resp_readonly_required_1","object":"response","created_at":1785382100,"model":"fixture-model","status":"completed","output":[{"id":"item_call_1","type":"function_call","call_id":"provider_call_1","name":%q,"arguments":"{\"sku\":\"A-1\"}","status":"completed"}],"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}`, syntheticName)
+			return
+		}
+		if payload.ToolChoice != nil {
+			providerIssuesMu.Lock()
+			providerIssues = append(providerIssues, fmt.Sprintf("round %d retained forced tool choice: %s", round, body))
+			providerIssuesMu.Unlock()
+			http.Error(writer, "retained required tool", http.StatusBadRequest)
+			return
+		}
+		var inputItems []struct {
+			Type   string `json:"type"`
+			CallID string `json:"call_id"`
+			Output string `json:"output"`
+		}
+		foundResult := json.Unmarshal(payload.Input, &inputItems) == nil
+		if foundResult {
+			foundResult = false
+			for _, item := range inputItems {
+				if item.Type == "function_call_output" && item.CallID == "provider_call_1" && strings.Contains(item.Output, `"available":7`) {
+					foundResult = true
+					break
+				}
+			}
+		}
+		if round != 2 || !foundResult {
+			providerIssuesMu.Lock()
+			providerIssues = append(providerIssues, fmt.Sprintf("round %d missing lowered read_only MCP result: %s", round, body))
+			providerIssuesMu.Unlock()
+			http.Error(writer, "missing function result", http.StatusBadRequest)
+			return
+		}
+		_, _ = io.WriteString(writer, `{"id":"resp_readonly_required_2","object":"response","created_at":1785382101,"model":"fixture-model","status":"completed","output":[{"id":"msg_1","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"read-only lookup returned 7 units","annotations":[]}]}],"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}`)
+	}))
+	t.Cleanup(provider.Close)
+
+	controller, err := emulation.NewController(emulation.ControllerConfig{
+		MCP: mcp.RegistryConfig{
+			SyntheticNameKey: []byte(strings.Repeat("responses-readonly-required-controller-key-", 2)),
+			EndpointPolicy: func(candidate *url.URL) error {
+				if candidate.Scheme != allowedMCP.Scheme || candidate.Host != allowedMCP.Host {
+					return fmt.Errorf("MCP endpoint is not allowlisted")
+				}
+				return nil
+			},
+		},
+		MaxRounds: 4, MaxToolCalls: 8, MaxParallelCalls: 2,
+	})
+	require.NoError(t, err)
+	outbound, err := responses.NewOutboundTransformer(provider.URL, "provider-key")
+	require.NoError(t, err)
+	executor := httpclient.NewHttpClientWithProxy(&httpclient.ProxyConfig{Type: httpclient.ProxyTypeDisabled})
+	t.Cleanup(executor.CloseIdleConnections)
+	observer := &controllerObservationRecorder{}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	result, err := pipeline.NewFactory(executor).Pipeline(
+		responses.NewInboundTransformer(), conversion.NewOutbound(outbound),
+		pipeline.WithToolLoopController(controller), pipeline.WithObserver(observer),
+	).Process(ctx, &httpclient.Request{
+		Method: http.MethodPost, URL: "/v1/responses",
+		Headers: http.Header{"Content-Type": []string{"application/json"}},
+		Body: []byte(fmt.Sprintf(`{
+			"model":"fixture-model","input":"check read-only inventory",
+			"tools":[{"type":"mcp","server_label":"inventory","server_url":%q,"authorization":%q,
+			"allowed_tools":{"tool_names":["lookup"],"read_only":true},"require_approval":"never"}],
+			"tool_choice":"required"
+		}`, mcpServer.URL, authorization)),
+	})
+	require.NoError(t, err)
+	require.NotNil(t, result.Response)
+	require.EqualValues(t, 2, providerRounds.Load())
+	require.EqualValues(t, 1, mcpCalls.Load())
+	providerIssuesMu.Lock()
+	require.Empty(t, providerIssues)
+	providerIssuesMu.Unlock()
+
+	wire := string(result.Response.Body)
+	require.Contains(t, wire, `"type":"mcp_list_tools"`)
+	require.Contains(t, wire, `"type":"mcp_call"`)
+	require.Contains(t, wire, `"name":"lookup"`)
+	require.Contains(t, wire, "read-only lookup returned 7 units")
+	require.NotContains(t, wire, syntheticName)
+	require.NotContains(t, wire, authorization)
+	emulationObservation := observer.emulation()
+	require.NotNil(t, emulationObservation)
+	require.EqualValues(t, 2, emulationObservation.InternalRounds)
+	require.EqualValues(t, 1, emulationObservation.ToolCalls)
+	require.EqualValues(t, 0, emulationObservation.Failures)
+}
+
+// TestControllerRejectsProviderSuccessThatOmitsRequiredReadOnlyGatewayToolOverRealHTTP
+// fixes the production-equivalent boundary: a provider can return HTTP 200
+// and a completed Responses message while ignoring the explicitly named
+// synthetic function. The controller must stop after that one provider round,
+// must not execute MCP or attempt a synthetic continuation, and must emit a
+// safe typed diagnostic for the relay to persist without provider payloads.
+func TestControllerRejectsProviderSuccessThatOmitsRequiredReadOnlyGatewayToolOverRealHTTP(t *testing.T) {
+	t.Parallel()
+	const authorization = "Bearer responses-required-omitted-private-token"
+	var mcpCalls atomic.Int64
+	mcpServer := newControllerMCPServer(t, authorization, &mcpCalls)
+	allowedMCP, err := url.Parse(mcpServer.URL)
+	require.NoError(t, err)
+
+	var providerRounds atomic.Int64
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		providerRounds.Add(1)
+		body, readErr := io.ReadAll(request.Body)
+		if readErr != nil {
+			http.Error(writer, "read", http.StatusBadRequest)
+			return
+		}
+		var payload struct {
+			Tools []struct {
+				Type string `json:"type"`
+				Name string `json:"name"`
+			} `json:"tools"`
+			ToolChoice *struct {
+				Type string `json:"type"`
+				Name string `json:"name"`
+			} `json:"tool_choice"`
+		}
+		if json.Unmarshal(body, &payload) != nil || len(payload.Tools) != 1 || payload.Tools[0].Type != "function" ||
+			!strings.HasPrefix(payload.Tools[0].Name, "axon_mcp_") || payload.ToolChoice == nil ||
+			payload.ToolChoice.Type != "function" || payload.ToolChoice.Name != payload.Tools[0].Name {
+			http.Error(writer, "expected required synthetic function", http.StatusBadRequest)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(writer, `{"id":"resp_required_omitted","object":"response","created_at":1785382200,"model":"fixture-model","status":"completed","output":[{"id":"rs_1","type":"reasoning","summary":[]},{"id":"msg_1","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"MCP_READ_ONLY_GATEWAY_RESPONSES_C28E","annotations":[]}]}],"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}`)
+	}))
+	t.Cleanup(provider.Close)
+
+	controller, err := emulation.NewController(emulation.ControllerConfig{
+		MCP: mcp.RegistryConfig{
+			SyntheticNameKey: []byte(strings.Repeat("responses-required-omitted-controller-key-", 2)),
+			EndpointPolicy: func(candidate *url.URL) error {
+				if candidate.Scheme != allowedMCP.Scheme || candidate.Host != allowedMCP.Host {
+					return fmt.Errorf("MCP endpoint is not allowlisted")
+				}
+				return nil
+			},
+		},
+		MaxRounds: 4, MaxToolCalls: 8, MaxParallelCalls: 2,
+	})
+	require.NoError(t, err)
+	outbound, err := responses.NewOutboundTransformer(provider.URL, "provider-key")
+	require.NoError(t, err)
+	executor := httpclient.NewHttpClientWithProxy(&httpclient.ProxyConfig{Type: httpclient.ProxyTypeDisabled})
+	t.Cleanup(executor.CloseIdleConnections)
+	observer := &controllerObservationRecorder{}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	result, processErr := pipeline.NewFactory(executor).Pipeline(
+		responses.NewInboundTransformer(), conversion.NewOutbound(outbound),
+		pipeline.WithToolLoopController(controller), pipeline.WithObserver(observer),
+	).Process(ctx, &httpclient.Request{
+		Method: http.MethodPost, URL: "/v1/responses",
+		Headers: http.Header{"Content-Type": []string{"application/json"}},
+		Body: []byte(fmt.Sprintf(`{
+			"model":"fixture-model","input":"call the read-only inventory tool once",
+			"tools":[{"type":"mcp","server_label":"inventory","server_url":%q,"authorization":%q,
+			"allowed_tools":{"tool_names":["lookup"],"read_only":true},"require_approval":"never"}],
+			"tool_choice":"required"
+		}`, mcpServer.URL, authorization)),
+	})
+	require.Nil(t, result)
+	require.ErrorIs(t, processErr, emulation.ErrRequiredGatewayToolCall)
+	require.EqualValues(t, 1, providerRounds.Load(), "provider success without a required call must not be retried")
+	require.EqualValues(t, 0, mcpCalls.Load(), "a missing call must not execute MCP")
+	require.Equal(t, &llm.ErrorDiagnostic{
+		Component: "gateway", Code: "required_gateway_tool_call_missing",
+		Message: "The provider did not call the required gateway tool.", StatusCode: http.StatusBadGateway,
+	}, llm.ErrorDiagnosticFrom(processErr))
+	trace := observer.emulation()
+	require.NotNil(t, trace)
+	require.EqualValues(t, 0, trace.InternalRounds)
+	require.EqualValues(t, 1, trace.ProviderRoundAttempts)
+	require.EqualValues(t, 1, trace.ProviderRoundsCompleted)
+	require.Len(t, trace.ProviderRounds, 1)
+	require.Equal(t, "completed", trace.ProviderRounds[0].Outcome)
+	require.True(t, trace.ProviderRounds[0].ProviderDispatched)
+	require.EqualValues(t, 0, trace.ToolCalls)
+	require.EqualValues(t, 1, trace.Failures)
+}
+
 // TestControllerRunsAnthropicMCPServersThroughResponsesGatewayOverRealHTTP
 // exercises the exact client shape used by Anthropic mcp_servers callers. The
 // two HTTP servers are real protocol peers: one is a Streamable HTTP MCP

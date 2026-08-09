@@ -484,7 +484,7 @@ func (stream *controllerMCPStream) finishRound() error {
 	stream.totalCalls += processed.gatewayCalls
 	if stream.requiredGatewayTool && processed.gatewayCalls == 0 {
 		pipeline.RecordEmulationFailure(stream.ctx)
-		return ErrRequiredGatewayToolCall
+		return newGatewayFailure(GatewayStopRequiredTool, ErrRequiredGatewayToolCall, nil)
 	}
 	if stream.requiredGatewayTool && processed.gatewayCalls > 0 {
 		stream.prepared.ToolChoice = nil

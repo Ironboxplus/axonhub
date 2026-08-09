@@ -212,7 +212,7 @@ func (controller *Controller) completeMCP(ctx context.Context, request *llm.Requ
 		totalCalls += processed.gatewayCalls
 		if requiredGatewayTool && processed.gatewayCalls == 0 {
 			pipeline.RecordEmulationFailure(loopCtx)
-			return nil, ErrRequiredGatewayToolCall
+			return nil, newGatewayFailure(GatewayStopRequiredTool, ErrRequiredGatewayToolCall, nil)
 		}
 		if requiredGatewayTool && processed.gatewayCalls > 0 {
 			prepared.ToolChoice = nil
