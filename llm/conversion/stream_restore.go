@@ -268,6 +268,7 @@ func restoreCanonicalToolSnapshot(item *llm.Item, state *streamToolState, input 
 	item.ProtocolHints.SourceType = "custom_tool_call"
 	item.ToolCall.Kind = llm.ToolKindCustom
 	item.ToolCall.LogicalName = state.identity.SourceName
+	item.ToolCall.Namespace = state.identity.SourceNamespace
 	item.ToolCall.ArgumentsJSON = nil
 	item.ToolCall.ArgumentsText = ""
 	item.ToolCall.InputText = input
@@ -351,9 +352,7 @@ func (r *streamRestorer) restoreMessage(choiceIndex int, message *llm.Message) {
 		call.ID = state.callID
 		call.Type = llm.ToolTypeResponsesCustomTool
 		call.ResponseCustomToolCall = &llm.ResponseCustomToolCall{
-			CallID: state.callID,
-			Name:   state.identity.SourceName,
-			Input:  input,
+			CallID: state.callID, Name: state.identity.SourceName, Namespace: state.identity.SourceNamespace, Input: input,
 		}
 		call.Function = llm.FunctionCall{}
 	}
@@ -398,9 +397,7 @@ func (r *streamRestorer) flushIncomplete(choiceIndex int, choice *llm.Choice) {
 			ID:    state.callID,
 			Type:  llm.ToolTypeResponsesCustomTool,
 			ResponseCustomToolCall: &llm.ResponseCustomToolCall{
-				CallID: state.callID,
-				Name:   state.identity.SourceName,
-				Input:  input,
+				CallID: state.callID, Name: state.identity.SourceName, Namespace: state.identity.SourceNamespace, Input: input,
 			},
 		})
 		state.finished = true

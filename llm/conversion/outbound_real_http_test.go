@@ -1143,7 +1143,7 @@ func assertResponsesAdditionalNamespaceCalls(t *testing.T, body []byte) {
 	}
 	if len(response.Output) != 2 || response.Output[0].Type != "function_call" ||
 		response.Output[0].Name != "send_message" || response.Output[0].Namespace != "collaboration" ||
-		response.Output[1].Type != "custom_tool_call" || response.Output[1].Name != "terminal__exec" ||
+		response.Output[1].Type != "custom_tool_call" || response.Output[1].Name != "exec" || response.Output[1].Namespace != "terminal" ||
 		response.Output[1].Input != "pwd" {
 		t.Fatalf("additional namespace calls degraded: %s", body)
 	}

@@ -82,14 +82,24 @@ func newSession(plan *Plan, request *llm.Request, traceEnabled bool) *Session {
 	if request != nil {
 		for index := range request.ToolDefinitions {
 			definition := &request.ToolDefinitions[index]
-			if definition.Kind != llm.ToolKindFunction || definition.Function == nil || definition.Function.Namespace == "" {
+			var namespace string
+			switch definition.Kind {
+			case llm.ToolKindFunction:
+				if definition.Function != nil {
+					namespace = definition.Function.Namespace
+				}
+			case llm.ToolKindCustom:
+				if definition.Freeform != nil {
+					namespace = definition.Freeform.Namespace
+				}
+			}
+			if namespace == "" {
 				continue
 			}
-			sourceName := strings.TrimPrefix(definition.LogicalName, definition.Function.Namespace+"__")
-			identity := toolIdentity{
-				SourceKind: llm.ToolKindFunction, SourceName: sourceName, SourceNamespace: definition.Function.Namespace,
-			}
-			session.registerToolIdentity(definition.LogicalName, definition.Function.Namespace, identity)
+			sourceName := strings.TrimPrefix(definition.LogicalName, namespace+"__")
+			identity := toolIdentity{SourceKind: definition.Kind, SourceName: sourceName, SourceNamespace: namespace}
+			session.registerToolIdentity(definition.LogicalName, namespace, identity)
+			session.syntheticToolNameInNamespace(definition.Kind, sourceName, namespace)
 		}
 		for _, tool := range request.Tools {
 			if tool.Type == llm.ToolTypeFunction && tool.Function.Name != "" {
@@ -138,13 +148,21 @@ func (s *Session) syntheticName(sourceName string) string {
 }
 
 func (s *Session) syntheticToolName(sourceKind llm.ToolKind, sourceName string) string {
-	sourceKey := string(sourceKind) + "\x00" + sourceName
+	return s.syntheticToolNameInNamespace(sourceKind, sourceName, "")
+}
+
+func (s *Session) syntheticNameInNamespace(sourceName, namespace string) string {
+	return s.syntheticToolNameInNamespace(llm.ToolKindCustom, sourceName, namespace)
+}
+
+func (s *Session) syntheticToolNameInNamespace(sourceKind llm.ToolKind, sourceName, namespace string) string {
+	sourceKey := string(sourceKind) + "\x00" + namespace + "\x00" + sourceName
 	if existing, ok := s.bySourceName[sourceKey]; ok {
 		return existing
 	}
 
 	hasher := fnv.New32a()
-	_, _ = hasher.Write([]byte(sourceName))
+	_, _ = hasher.Write([]byte(string(sourceKind) + "\x00" + namespace + "\x00" + sourceName))
 	base := fmt.Sprintf("axc_%08x", hasher.Sum32())
 	name := base
 	for suffix := 1; ; suffix++ {
@@ -155,7 +173,7 @@ func (s *Session) syntheticToolName(sourceKind llm.ToolKind, sourceName string) 
 	}
 	s.occupiedNames[name] = struct{}{}
 	s.bySourceName[sourceKey] = name
-	s.registerToolIdentity(name, "", toolIdentity{SourceKind: sourceKind, SourceName: sourceName})
+	s.registerToolIdentity(name, namespace, toolIdentity{SourceKind: sourceKind, SourceName: sourceName, SourceNamespace: namespace})
 	return name
 }
 
@@ -171,8 +189,14 @@ func (s *Session) registerToolIdentity(targetName, namespace string, identity to
 	}
 	s.bySyntheticName[targetName] = identity
 	if namespace != "" {
-		wireName := strings.TrimPrefix(targetName, namespace+"__")
+		wireName := identity.SourceName
+		if wireName == "" {
+			wireName = strings.TrimPrefix(targetName, namespace+"__")
+		}
 		s.byWireIdentity[toolWireIdentityKey{name: wireName, namespace: namespace}] = identity
+		if targetWireName := strings.TrimPrefix(targetName, namespace+"__"); targetWireName != "" && targetWireName != wireName {
+			s.byWireIdentity[toolWireIdentityKey{name: targetWireName, namespace: namespace}] = identity
+		}
 	}
 }
 

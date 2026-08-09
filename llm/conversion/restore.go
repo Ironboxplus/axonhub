@@ -140,6 +140,7 @@ func restoreCanonicalOutput(output []llm.Item, session *Session, direction llm.C
 		item.ProtocolHints.SourceType = "custom_tool_call"
 		item.ToolCall.Kind = llm.ToolKindCustom
 		item.ToolCall.LogicalName = identity.SourceName
+		item.ToolCall.Namespace = identity.SourceNamespace
 		item.ToolCall.ArgumentsJSON = nil
 		item.ToolCall.ArgumentsText = ""
 		item.ToolCall.InputText = input
@@ -175,9 +176,7 @@ func restoreMessage(message *llm.Message, session *Session, direction llm.Conver
 		}
 		call.Type = llm.ToolTypeResponsesCustomTool
 		call.ResponseCustomToolCall = &llm.ResponseCustomToolCall{
-			CallID: call.ID,
-			Name:   identity.SourceName,
-			Input:  input,
+			CallID: call.ID, Name: identity.SourceName, Namespace: identity.SourceNamespace, Input: input,
 		}
 		call.Function = llm.FunctionCall{}
 		recordIdentityRestore(session, direction, messageToolRef(choiceIndex, callIndex), identity, valid)

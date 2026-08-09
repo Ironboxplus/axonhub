@@ -187,6 +187,89 @@ func TestResponsesMCPDefinitionAndSecretsRoundTripOverRealHTTP(t *testing.T) {
 	require.JSONEq(t, `"never"`, string(mcp.RequireApproval))
 }
 
+func TestResponsesAdditionalMCPSecretsRoundTripOverRealHTTPWithoutCanonicalLeak(t *testing.T) {
+	t.Parallel()
+	const authorization = "Bearer additional-private-token"
+	const headerSecret = "additional-private-header"
+	requestBody := []byte(`{
+		"model":"fixture-model",
+		"input":[
+			{"type":"additional_tools","role":"developer","tools":[{
+				"type":"mcp","server_label":"inventory","server_url":"https://mcp.example.invalid/rpc",
+				"authorization":"Bearer additional-private-token","headers":{"X-MCP-Secret":"additional-private-header"}
+			}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"use inventory"}]}
+		]
+	}`)
+
+	inbound := responses.NewInboundTransformer()
+	decoded, err := inbound.TransformRequest(context.Background(), &httpclient.Request{
+		Method: http.MethodPost, URL: "/v1/responses",
+		Headers: http.Header{"Content-Type": []string{"application/json"}}, Body: requestBody,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, decoded.ToolExecutionSecrets)
+	require.Equal(t, authorization, decoded.ToolExecutionSecrets.MCP["inventory"].Authorization)
+	require.Equal(t, headerSecret, decoded.ToolExecutionSecrets.MCP["inventory"].Headers["X-MCP-Secret"])
+	canonicalJSON, err := json.Marshal(decoded)
+	require.NoError(t, err)
+	require.NotContains(t, string(canonicalJSON), authorization)
+	require.NotContains(t, string(canonicalJSON), headerSecret)
+	if extension := decoded.ProviderExtensions; extension != nil && extension.OpenAIResponses != nil && extension.OpenAIResponses.Request != nil {
+		require.NotContains(t, string(extension.OpenAIResponses.Request.ResidualFields), authorization)
+		require.NotContains(t, string(extension.OpenAIResponses.Request.ResidualFields), headerSecret)
+	}
+
+	var hits atomic.Int32
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		hits.Add(1)
+		body, readErr := io.ReadAll(request.Body)
+		if readErr != nil {
+			http.Error(writer, "read provider request", http.StatusBadRequest)
+			return
+		}
+		var payload struct {
+			Input []struct {
+				Type  string `json:"type"`
+				Tools []struct {
+					Type          string            `json:"type"`
+					ServerLabel   string            `json:"server_label"`
+					Authorization string            `json:"authorization"`
+					Headers       map[string]string `json:"headers"`
+				} `json:"tools"`
+			} `json:"input"`
+		}
+		if err := json.Unmarshal(body, &payload); err != nil || len(payload.Input) == 0 ||
+			payload.Input[0].Type != "additional_tools" || len(payload.Input[0].Tools) != 1 {
+			http.Error(writer, "invalid additional MCP declaration", http.StatusBadRequest)
+			return
+		}
+		mcp := payload.Input[0].Tools[0]
+		if mcp.Type != "mcp" || mcp.ServerLabel != "inventory" || mcp.Authorization != authorization ||
+			mcp.Headers["X-MCP-Secret"] != headerSecret {
+			http.Error(writer, "additional MCP secrets were not replayed", http.StatusBadRequest)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(writer, `{"id":"resp_additional_mcp","object":"response","created_at":1,"status":"completed","model":"fixture-model","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)
+	}))
+	t.Cleanup(provider.Close)
+
+	outbound, err := responses.NewOutboundTransformer(provider.URL, "provider-key")
+	require.NoError(t, err)
+	executor := httpclient.NewHttpClientWithClient(provider.Client())
+	t.Cleanup(executor.CloseIdleConnections)
+	result, err := pipeline.NewFactory(executor).
+		Pipeline(inbound, conversion.NewOutbound(outbound)).
+		Process(context.Background(), &httpclient.Request{
+			Method: http.MethodPost, URL: "/v1/responses",
+			Headers: http.Header{"Content-Type": []string{"application/json"}}, Body: requestBody,
+		})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.EqualValues(t, 1, hits.Load())
+}
+
 func TestResponsesMCPReadOnlyFilterRequiresGatewayBeforeProviderHTTP(t *testing.T) {
 	t.Parallel()
 	inbound := responses.NewInboundTransformer()

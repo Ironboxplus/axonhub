@@ -104,6 +104,8 @@ func lower(request *llm.Request, plan *Plan, trace bool) (*llm.Request, *Session
 			if definition.Freeform == nil {
 				continue
 			}
+			namespace := definition.Freeform.Namespace
+			sourceName := strings.TrimPrefix(definition.LogicalName, namespace+"__")
 			custom := &llm.ResponseCustomTool{
 				Name: definition.LogicalName, Description: definition.Description,
 				Format: &llm.ResponseCustomToolFormat{
@@ -111,7 +113,7 @@ func lower(request *llm.Request, plan *Plan, trace bool) (*llm.Request, *Session
 				},
 			}
 			definition.Kind = llm.ToolKindFunction
-			definition.LogicalName = session.syntheticName(custom.Name)
+			definition.LogicalName = session.syntheticNameInNamespace(sourceName, namespace)
 			definition.Description = customFunctionDescription(custom)
 			definition.Function = &llm.FunctionDefinition{Parameters: append(json.RawMessage(nil), customFunctionParameters...), Strict: lo.ToPtr(true)}
 			definition.Freeform = nil
@@ -197,7 +199,7 @@ func lower(request *llm.Request, plan *Plan, trace bool) (*llm.Request, *Session
 			call.ID = customCall.CallID
 			call.Type = llm.ToolTypeFunction
 			call.Function = llm.FunctionCall{
-				Name:      session.syntheticName(customCall.Name),
+				Name:      session.syntheticNameInNamespace(customCall.Name, customCall.Namespace),
 				Arguments: string(arguments),
 			}
 			call.ResponseCustomToolCall = nil
@@ -208,7 +210,7 @@ func lower(request *llm.Request, plan *Plan, trace bool) (*llm.Request, *Session
 		item := &lowered.Input[itemIndex]
 		if item.ToolCall != nil && planLowersItem(plan, ObjectToolCall, itemIndex) && item.ToolCall.Kind == llm.ToolKindCustom {
 			call := item.ToolCall
-			callIdentities[call.CallID] = toolIdentity{SourceKind: call.Kind, SourceName: call.LogicalName}
+			callIdentities[call.CallID] = toolIdentity{SourceKind: call.Kind, SourceName: call.LogicalName, SourceNamespace: call.Namespace}
 			arguments, err := json.Marshal(struct {
 				Input string `json:"input"`
 			}{Input: call.InputText})
@@ -216,7 +218,8 @@ func lower(request *llm.Request, plan *Plan, trace bool) (*llm.Request, *Session
 				return nil, nil, fmt.Errorf("encode canonical custom input: %w", err)
 			}
 			call.Kind = llm.ToolKindFunction
-			call.LogicalName = session.syntheticName(call.LogicalName)
+			call.LogicalName = session.syntheticNameInNamespace(call.LogicalName, call.Namespace)
+			call.Namespace = ""
 			call.ArgumentsJSON = arguments
 			call.ArgumentsText = ""
 			call.InputText = ""
@@ -224,10 +227,11 @@ func lower(request *llm.Request, plan *Plan, trace bool) (*llm.Request, *Session
 		}
 		if item.ToolCall != nil && planLowersItem(plan, ObjectToolCall, itemIndex) && item.ToolCall.Kind != llm.ToolKindCustom {
 			call := item.ToolCall
-			callIdentities[call.CallID] = toolIdentity{SourceKind: call.Kind, SourceName: call.LogicalName}
+			callIdentities[call.CallID] = toolIdentity{SourceKind: call.Kind, SourceName: call.LogicalName, SourceNamespace: call.Namespace}
 			sourceKind, sourceName := call.Kind, call.LogicalName
 			call.Kind = llm.ToolKindFunction
-			call.LogicalName = session.syntheticToolName(sourceKind, sourceName)
+			call.LogicalName = session.syntheticToolNameInNamespace(sourceKind, sourceName, call.Namespace)
+			call.Namespace = ""
 		}
 		if item.ToolResult != nil && planLowersItem(plan, ObjectToolResult, itemIndex) {
 			result := item.ToolResult
@@ -239,6 +243,12 @@ func lower(request *llm.Request, plan *Plan, trace bool) (*llm.Request, *Session
 				if sourceName == "" {
 					sourceName = identity.SourceName
 				}
+				if result.LogicalName == "" {
+					result.LogicalName = identity.SourceName
+				}
+				if sourceKind == llm.ToolKindCustom {
+					result.LogicalName = session.syntheticNameInNamespace(sourceName, identity.SourceNamespace)
+				}
 			}
 			if sourceName == "" {
 				sourceName = string(sourceKind)
@@ -246,7 +256,11 @@ func lower(request *llm.Request, plan *Plan, trace bool) (*llm.Request, *Session
 			item.ToolResult.Kind = llm.ToolKindFunction
 			if sourceKind == llm.ToolKindCustom {
 				if sourceName != "" {
-					item.ToolResult.LogicalName = session.syntheticName(sourceName)
+					namespace := ""
+					if identity, ok := callIdentities[result.CallID]; ok {
+						namespace = identity.SourceNamespace
+					}
+					item.ToolResult.LogicalName = session.syntheticNameInNamespace(sourceName, namespace)
 				}
 			} else {
 				item.ToolResult.LogicalName = session.syntheticToolName(sourceKind, sourceName)

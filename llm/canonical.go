@@ -826,11 +826,45 @@ func (definition *ToolDefinition) Validate() error {
 	if branches != 1 {
 		return fmt.Errorf("tool definition kind %q has %d payload branches, want exactly one", definition.Kind, branches)
 	}
+	switch definition.Kind {
+	case ToolKindFunction:
+		if definition.Function == nil {
+			return fmt.Errorf("tool definition kind %q requires a function payload", definition.Kind)
+		}
+	case ToolKindLocalShell, ToolKindToolSearch:
+		if definition.Function == nil && definition.Hosted == nil {
+			return fmt.Errorf("tool definition kind %q requires a function or hosted payload", definition.Kind)
+		}
+	case ToolKindCustom:
+		if definition.Freeform == nil {
+			return errors.New("custom tool definition requires a freeform payload")
+		}
+	case ToolKindMCP:
+		if definition.MCP == nil {
+			return errors.New("MCP tool definition requires an MCP payload")
+		}
+	case ToolKindWebSearch, ToolKindWebFetch, ToolKindFileSearch, ToolKindCodeInterpreter,
+		ToolKindCodeExecution, ToolKindShell, ToolKindApplyPatch, ToolKindComputer,
+		ToolKindImageGeneration, ToolKindAnthropicServer, ToolKindUnknownBehavioral:
+		if definition.Hosted == nil {
+			return fmt.Errorf("tool definition kind %q requires a hosted payload", definition.Kind)
+		}
+	default:
+		// Provider-owned hosted variants are intentionally open-ended. Their
+		// concrete kind may be introduced before Axon knows a named constant,
+		// but the hosted branch and its non-empty wire type remain mandatory.
+		if definition.Hosted == nil {
+			return fmt.Errorf("tool definition kind %q requires a hosted payload", definition.Kind)
+		}
+	}
 	if definition.Function != nil && len(definition.Function.Parameters) > 0 && !json.Valid(definition.Function.Parameters) {
 		return errors.New("function parameters are invalid JSON")
 	}
 	if definition.Hosted != nil && len(definition.Hosted.Configuration) > 0 && !json.Valid(definition.Hosted.Configuration) {
 		return errors.New("hosted tool configuration is invalid JSON")
+	}
+	if definition.Hosted != nil && definition.Hosted.Type == "" {
+		return errors.New("hosted tool definition requires type")
 	}
 	if definition.MCP != nil {
 		mcp := definition.MCP

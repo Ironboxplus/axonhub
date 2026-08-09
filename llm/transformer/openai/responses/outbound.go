@@ -304,7 +304,7 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 	}
 
 	// Responses Lite requires an explicit false value, even when no top-level tools are sent.
-	if llmReq.RawRequest != nil && strings.EqualFold(strings.TrimSpace(llmReq.RawRequest.Headers.Get(ResponsesLiteHeader)), "true") {
+	if isResponsesLiteWireProfile(llmReq) {
 		payload.ParallelToolCalls = lo.ToPtr(false)
 	} else if len(payload.Tools) == 0 && !hasResponsesToolDeclaration(llmReq) {
 		// Some Responses providers reject parallel_tool_calls when the request has
@@ -322,7 +322,12 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal responses api request: %w", err)
 	}
-	if err := ValidateCompactionTriggerPlacement(body); err != nil {
+	profile := ResponsesWireProfileStandard
+	if isResponsesLiteWireProfile(llmReq) {
+		profile = ResponsesWireProfileLite
+	}
+	body, _, err = NormalizeAndValidateResponsesRequestBody(body, profile)
+	if err != nil {
 		return nil, fmt.Errorf("%w: %v", transformer.ErrInvalidRequest, err)
 	}
 
@@ -355,6 +360,16 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 	}
 
 	return httpReq, nil
+}
+
+func isResponsesLiteWireProfile(request *llm.Request) bool {
+	if request == nil {
+		return false
+	}
+	if request.TransformerMetadata != nil && request.TransformerMetadata["responses_wire_profile"] == string(ResponsesWireProfileLite) {
+		return true
+	}
+	return request.RawRequest != nil && strings.EqualFold(strings.TrimSpace(request.RawRequest.Headers.Get(ResponsesLiteHeader)), "true")
 }
 
 func hasResponsesToolDeclaration(request *llm.Request) bool {

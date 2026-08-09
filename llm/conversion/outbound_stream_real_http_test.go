@@ -751,7 +751,7 @@ func assertResponsesAdditionalNamespaceStream(t *testing.T, events [][]byte) {
 				}
 			}
 			if event.Item.CallID == "call_exec" {
-				valid := event.Item.Type == "custom_tool_call" && event.Item.Name == "terminal__exec"
+				valid := event.Item.Type == "custom_tool_call" && event.Item.Name == "exec" && event.Item.Namespace == "terminal"
 				if event.Type == "response.output_item.added" {
 					customAdded = valid
 				} else {

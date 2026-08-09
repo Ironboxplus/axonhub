@@ -237,7 +237,7 @@ func responseItemToCanonical(item *Item, raw json.RawMessage, ordinal int) (*llm
 			Kind: llm.ItemKindToolCall, ID: item.ID, Role: llm.RoleAssistant, Status: status,
 			ToolCall: &llm.ToolInvocation{
 				Kind: llm.ToolKindCustom, ID: item.ID, CallID: item.CallID,
-				LogicalName: item.Name, InputText: stringValue(item.Input),
+				LogicalName: item.Name, Namespace: item.Namespace, InputText: stringValue(item.Input),
 				Status: canonicalToolCallStatus(item.Status), Execution: llm.ExecutionOwnerClient,
 			},
 			ProtocolHints: hints,

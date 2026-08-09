@@ -29,6 +29,9 @@ func canonicalRequestTools(request *llm.Request) ([]Tool, bool, error) {
 		toolStart := len(tools)
 		switch definition.Kind {
 		case llm.ToolKindFunction:
+			if definition.Function == nil {
+				return nil, true, fmt.Errorf("canonical function %q has no function payload", definition.LogicalName)
+			}
 			parameters := make(map[string]any)
 			if len(definition.Function.Parameters) > 0 {
 				if err := json.Unmarshal(definition.Function.Parameters, &parameters); err != nil {
@@ -55,8 +58,11 @@ func canonicalRequestTools(request *llm.Request) ([]Tool, bool, error) {
 			}
 			tools = append(tools, function)
 		case llm.ToolKindCustom:
+			if definition.Freeform == nil {
+				return nil, true, fmt.Errorf("canonical custom tool %q has no freeform payload", definition.LogicalName)
+			}
 			format := (*CustomToolFormat)(nil)
-			if freeform := definition.Freeform; freeform != nil && (freeform.Format != "" || freeform.Syntax != "" || freeform.Definition != "") {
+			if freeform := definition.Freeform; freeform.Format != "" || freeform.Syntax != "" || freeform.Definition != "" {
 				format = &CustomToolFormat{Type: freeform.Format, Syntax: freeform.Syntax, Definition: freeform.Definition}
 			}
 			custom := Tool{Type: "custom", Name: definition.LogicalName, Description: definition.Description, Format: format, DeferLoading: definition.DeferLoading}
@@ -359,7 +365,10 @@ func canonicalToolDeclarationToResponses(request *llm.Request, item *llm.Item) (
 		}
 		definitions = append(definitions, definition)
 	}
-	tools, represented, err := canonicalRequestTools(&llm.Request{ToolDefinitions: definitions})
+	tools, represented, err := canonicalRequestTools(&llm.Request{
+		ToolDefinitions:      definitions,
+		ToolExecutionSecrets: request.ToolExecutionSecrets,
+	})
 	if err != nil {
 		return Item{}, err
 	}
@@ -501,7 +510,7 @@ func canonicalItemToResponsesTyped(item *llm.Item) (Item, bool) {
 		call := item.ToolCall
 		if call.Kind == llm.ToolKindCustom {
 			input := call.InputText
-			return Item{ID: item.ID, Type: "custom_tool_call", CallID: call.CallID, Name: call.LogicalName, Input: &input, Status: responsesStatus(item.Status)}, true
+			return Item{ID: item.ID, Type: "custom_tool_call", CallID: call.CallID, Name: call.LogicalName, Namespace: call.Namespace, Input: &input, Status: responsesStatus(item.Status)}, true
 		}
 		if call.Kind == llm.ToolKindLocalShell {
 			var wire Item

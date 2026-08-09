@@ -121,6 +121,23 @@ func (tool Tool) MarshalJSON() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Function schemas are a required wire union member. A map together with
+	// omitempty used to erase both a valid empty schema ({}) and malformed
+	// nil/missing state. Keep the field explicit so the final wire contract can
+	// distinguish and reject null while preserving a legal empty object.
+	if tool.Type == "function" && len(tool.Parameters) == 0 {
+		parameters, err := json.Marshal(tool.Parameters)
+		if err != nil {
+			return nil, err
+		}
+		if len(raw) == 0 || raw[len(raw)-1] != '}' {
+			return nil, fmt.Errorf("function tool must marshal to an object")
+		}
+		raw = append(raw[:len(raw)-1], ',')
+		raw = append(raw, `"parameters":`...)
+		raw = append(raw, parameters...)
+		raw = append(raw, '}')
+	}
 	return mergeResidualObject(raw, tool.Residual)
 }
 

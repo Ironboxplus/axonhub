@@ -55,7 +55,7 @@ func canonicalItemsToMessages(items []llm.Item) []llm.Message {
 			if call.Kind == llm.ToolKindCustom {
 				legacy.Type = llm.ToolTypeResponsesCustomTool
 				legacy.ResponseCustomToolCall = &llm.ResponseCustomToolCall{
-					CallID: call.CallID, Name: call.LogicalName, Input: call.InputText,
+					CallID: call.CallID, Name: call.LogicalName, Namespace: call.Namespace, Input: call.InputText,
 				}
 			} else {
 				legacy.Function = llm.FunctionCall{

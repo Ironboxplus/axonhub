@@ -60,7 +60,15 @@ func (t *InboundTransformer) TransformRequest(ctx context.Context, httpReq *http
 		return nil, fmt.Errorf("%w: model is required", transformer.ErrInvalidRequest)
 	}
 
-	return convertToLLMRequest(&req, httpReq.Body)
+	converted, err := convertToLLMRequest(&req, httpReq.Body)
+	if err != nil {
+		return nil, err
+	}
+	if strings.EqualFold(strings.TrimSpace(httpReq.Headers.Get(ResponsesLiteHeader)), "true") {
+		converted.RawRequest = httpReq
+		converted.TransformerMetadata["responses_wire_profile"] = string(ResponsesWireProfileLite)
+	}
+	return converted, nil
 }
 
 // TransformResponse transforms llm.Response to OpenAI Responses API HTTP response.
@@ -314,7 +322,7 @@ func convertToLLMRequest(req *Request, rawBody ...[]byte) (*llm.Request, error) 
 	}
 	chatReq.Input = canonicalInput
 	chatReq.ToolDefinitions = canonicalTools
-	chatReq.ToolExecutionSecrets = responsesMCPExecutionSecrets(req.Tools)
+	chatReq.ToolExecutionSecrets = responsesMCPExecutionSecrets(responseRequestToolGroups(req))
 	if len(rawBody) > 0 {
 		attachOpenAIResponsesRequestExtensions(chatReq, req, rawBody[0])
 	}
@@ -325,20 +333,43 @@ func convertToLLMRequest(req *Request, rawBody ...[]byte) (*llm.Request, error) 
 	return chatReq, nil
 }
 
-func responsesMCPExecutionSecrets(tools []Tool) *llm.ToolExecutionSecrets {
-	var secrets *llm.ToolExecutionSecrets
-	for index := range tools {
-		tool := &tools[index]
-		if tool.Type != "mcp" || tool.ServerLabel == "" || tool.Authorization == "" && len(tool.Headers) == 0 {
+func responseRequestToolGroups(req *Request) [][]Tool {
+	if req == nil {
+		return nil
+	}
+	groups := make([][]Tool, 0, len(req.Input.Items)+1)
+	groups = append(groups, req.Tools)
+	for index := range req.Input.Items {
+		if len(req.Input.Items[index].AdditionalTools) == 0 {
 			continue
 		}
-		if secrets == nil {
-			secrets = &llm.ToolExecutionSecrets{MCP: make(map[string]llm.MCPConnectionSecrets)}
+		groups = append(groups, req.Input.Items[index].AdditionalTools)
+	}
+	return groups
+}
+
+func responsesMCPExecutionSecrets(groups [][]Tool) *llm.ToolExecutionSecrets {
+	var secrets *llm.ToolExecutionSecrets
+	for _, tools := range groups {
+		var collect func([]Tool)
+		collect = func(candidates []Tool) {
+			for index := range candidates {
+				tool := &candidates[index]
+				if tool.Type == "mcp" && tool.ServerLabel != "" && (tool.Authorization != "" || len(tool.Headers) > 0) {
+					if secrets == nil {
+						secrets = &llm.ToolExecutionSecrets{MCP: make(map[string]llm.MCPConnectionSecrets)}
+					}
+					secrets.MCP[tool.ServerLabel] = llm.MCPConnectionSecrets{
+						Authorization: tool.Authorization,
+						Headers:       maps.Clone(tool.Headers),
+					}
+				}
+				if len(tool.Tools) > 0 {
+					collect(tool.Tools)
+				}
+			}
 		}
-		secrets.MCP[tool.ServerLabel] = llm.MCPConnectionSecrets{
-			Authorization: tool.Authorization,
-			Headers:       maps.Clone(tool.Headers),
-		}
+		collect(tools)
 	}
 	return secrets
 }
