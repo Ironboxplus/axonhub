@@ -65,9 +65,55 @@ type Request struct {
 	// This supports any type of value for flexibility.
 	TransformerMetadata map[string]any `json:"-"`
 
+	// OnTransportStart is invoked after the complete HTTP request has been built
+	// (including auth and streaming headers) and immediately before the client
+	// starts its RoundTrip. Callers use it to record the irreversible provider
+	// transport boundary; BuildHttpRequest failures deliberately never invoke it.
+	// The hook must be quick and must not retain or mutate the request body.
+	OnTransportStart TransportStartHook `json:"-"`
+
+	// OnRequestBuilt is invoked after BuildHttpRequest has successfully opened
+	// any body source, applied authentication, and constructed the net/http
+	// request, but before streaming headers and transport start. It lets callers
+	// distinguish local build failures (not_sent) from a successfully built
+	// request that never reaches RoundTrip.
+	OnRequestBuilt RequestBuiltHook `json:"-"`
+
 	// SkipInboundQueryMerge when set to true, prevents query parameters from the original
 	// inbound request from being merged into this request during MergeInboundRequest.
 	SkipInboundQueryMerge bool `json:"-"`
+}
+
+// TransportStartHook observes the exact point at which HttpClient is about to
+// hand a fully built request to net/http. It is invoked synchronously on the
+// calling goroutine and is shared by Do and DoStream.
+type TransportStartHook func(context.Context, *http.Request)
+
+// RequestBuiltHook observes a successfully constructed net/http request before
+// any provider transport is attempted. It is invoked synchronously by Do and
+// DoStream and is never called when BuildHttpRequest returns an error.
+type RequestBuiltHook func(context.Context, *http.Request)
+
+// RequestBuildError reports a local failure while HttpClient was constructing
+// the net/http request. No provider transport has started when this error is
+// returned, including BodySource open, URL, authentication, and header setup
+// failures.
+type RequestBuildError struct {
+	Cause error
+}
+
+func (err *RequestBuildError) Error() string {
+	if err == nil || err.Cause == nil {
+		return "failed to build HTTP request"
+	}
+	return "failed to build HTTP request: " + err.Cause.Error()
+}
+
+func (err *RequestBuildError) Unwrap() error {
+	if err == nil {
+		return nil
+	}
+	return err.Cause
 }
 
 // BodySource is a replayable request body. Implementations must return a new

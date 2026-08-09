@@ -2,6 +2,7 @@ package httpclient
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -794,5 +795,138 @@ func TestBuildHttpRequest_UserAgentPassThrough(t *testing.T) {
 			ua := result.Header.Get("User-Agent")
 			require.Equal(t, tt.wantUserAgent, ua)
 		})
+	}
+}
+
+func TestHttpClientTransportStartHookRunsOnlyAfterRequestBuild(t *testing.T) {
+	t.Parallel()
+
+	var providerHits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		providerHits.Add(1)
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(writer, `{"ok":true}`)
+	}))
+	t.Cleanup(server.Close)
+
+	for _, testCase := range []struct {
+		name      string
+		request   *Request
+		wantHook  int32
+		wantBuilt int32
+		wantHit   int32
+		wantErr   bool
+		stream    bool
+	}{
+		{
+			name:      "non_stream_transport",
+			request:   &Request{Method: http.MethodPost, URL: server.URL, Headers: make(http.Header), Body: []byte(`{}`)},
+			wantHook:  1,
+			wantBuilt: 1,
+			wantHit:   1,
+		},
+		{
+			name:      "stream_transport",
+			request:   &Request{Method: http.MethodPost, URL: server.URL, Headers: make(http.Header), Body: []byte(`{}`)},
+			wantHook:  1,
+			wantBuilt: 1,
+			wantHit:   1,
+			stream:    true,
+		},
+		{
+			name:    "build_error_never_starts_transport",
+			request: &Request{Method: http.MethodPost, URL: "://invalid-url", Headers: make(http.Header)},
+			wantErr: true,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			providerHits.Store(0)
+			var hookCalls atomic.Int32
+			var builtCalls atomic.Int32
+			testCase.request.OnRequestBuilt = func(ctx context.Context, raw *http.Request) {
+				if ctx == nil || raw == nil || raw.Header.Get("User-Agent") == "" {
+					t.Errorf("request-built hook received an incomplete request: ctx=%v request=%#v", ctx, raw)
+				}
+				builtCalls.Add(1)
+			}
+			testCase.request.OnTransportStart = func(ctx context.Context, raw *http.Request) {
+				if ctx == nil || raw == nil || raw.Header.Get("User-Agent") == "" {
+					t.Errorf("transport hook received an unbuilt request: ctx=%v request=%#v", ctx, raw)
+				}
+				hookCalls.Add(1)
+			}
+
+			client := NewHttpClientWithClient(server.Client())
+			if testCase.stream {
+				stream, err := client.DoStream(t.Context(), testCase.request)
+				if testCase.wantErr {
+					require.Error(t, err)
+					var buildErr *RequestBuildError
+					require.True(t, errors.As(err, &buildErr), "error = %v, want RequestBuildError", err)
+				} else {
+					require.NoError(t, err)
+					require.NotNil(t, stream)
+					for stream.Next() {
+					}
+					require.NoError(t, stream.Err())
+					require.NoError(t, stream.Close())
+				}
+			} else {
+				_, err := client.Do(t.Context(), testCase.request)
+				if testCase.wantErr {
+					require.Error(t, err)
+					var buildErr *RequestBuildError
+					require.True(t, errors.As(err, &buildErr), "error = %v, want RequestBuildError", err)
+				} else {
+					require.NoError(t, err)
+				}
+			}
+			if got := hookCalls.Load(); got != testCase.wantHook {
+				t.Fatalf("transport hook calls = %d, want %d", got, testCase.wantHook)
+			}
+			if got := builtCalls.Load(); got != testCase.wantBuilt {
+				t.Fatalf("request-built hook calls = %d, want %d", got, testCase.wantBuilt)
+			}
+			if got := providerHits.Load(); got != testCase.wantHit {
+				t.Fatalf("provider hits = %d, want %d", got, testCase.wantHit)
+			}
+		})
+	}
+}
+
+func TestRequestBuildAndTransportHooksAreNilSafe(t *testing.T) {
+	t.Parallel()
+	raw, err := http.NewRequest(http.MethodPost, "https://provider.example.test", nil)
+	require.NoError(t, err)
+
+	invokeRequestBuilt(t.Context(), nil, raw)
+	invokeRequestBuilt(t.Context(), &Request{}, raw)
+	invokeRequestBuilt(t.Context(), &Request{OnRequestBuilt: func(context.Context, *http.Request) {}}, nil)
+	invokeTransportStart(t.Context(), nil, raw)
+	invokeTransportStart(t.Context(), &Request{}, raw)
+	invokeTransportStart(t.Context(), &Request{OnTransportStart: func(context.Context, *http.Request) {}}, nil)
+
+	var builtCalls, transportCalls atomic.Int32
+	request := &Request{
+		OnRequestBuilt:   func(context.Context, *http.Request) { builtCalls.Add(1) },
+		OnTransportStart: func(context.Context, *http.Request) { transportCalls.Add(1) },
+	}
+	invokeRequestBuilt(t.Context(), request, raw)
+	invokeTransportStart(t.Context(), request, raw)
+	if builtCalls.Load() != 1 || transportCalls.Load() != 1 {
+		t.Fatalf("hook calls = built:%d transport:%d", builtCalls.Load(), transportCalls.Load())
+	}
+
+	for _, buildErr := range []*RequestBuildError{nil, {}, {Cause: errors.New("private local cause")}} {
+		if buildErr.Error() == "" {
+			t.Fatal("RequestBuildError formatted an empty error")
+		}
+		if buildErr != nil && buildErr.Cause != nil && !errors.Is(buildErr, buildErr.Cause) {
+			t.Fatalf("RequestBuildError did not unwrap its cause: %v", buildErr)
+		}
+	}
+	var nilBuildErr *RequestBuildError
+	if nilBuildErr.Unwrap() != nil {
+		t.Fatal("nil RequestBuildError unexpectedly unwrapped a cause")
 	}
 }

@@ -233,8 +233,9 @@ func (hc *HttpClient) Do(ctx context.Context, request *Request) (*Response, erro
 
 	rawReq, err := hc.BuildHttpRequest(ctx, request)
 	if err != nil {
-		return nil, fmt.Errorf("failed to build HTTP request: %w", err)
+		return nil, &RequestBuildError{Cause: err}
 	}
+	invokeRequestBuilt(ctx, request, rawReq)
 
 	// Only set the default Accept when the transformer did not specify one
 	// (e.g. TTS sets Accept: */* to receive binary audio).
@@ -242,6 +243,7 @@ func (hc *HttpClient) Do(ctx context.Context, request *Request) (*Response, erro
 		rawReq.Header.Set("Accept", "application/json")
 	}
 
+	invokeTransportStart(ctx, request, rawReq)
 	rawResp, err := hc.client.Do(rawReq)
 	if err != nil {
 		return nil, fmt.Errorf("HTTP request failed: %w", err)
@@ -332,8 +334,9 @@ func (hc *HttpClient) DoStream(ctx context.Context, request *Request) (streams.S
 
 	rawReq, err := hc.BuildHttpRequest(ctx, request)
 	if err != nil {
-		return nil, fmt.Errorf("failed to build HTTP request: %w", err)
+		return nil, &RequestBuildError{Cause: err}
 	}
+	invokeRequestBuilt(ctx, request, rawReq)
 
 	// Add streaming headers. Force SSE Accept unless the outbound transformer
 	// explicitly opted into a non-JSON Accept (e.g. "*/*" for binary TTS chunks),
@@ -345,6 +348,8 @@ func (hc *HttpClient) DoStream(ctx context.Context, request *Request) (streams.S
 	}
 	rawReq.Header.Set("Cache-Control", "no-cache")
 	rawReq.Header.Set("Connection", "keep-alive")
+
+	invokeTransportStart(ctx, request, rawReq)
 
 	// Execute request
 	rawResp, err := hc.client.Do(rawReq)
@@ -414,6 +419,20 @@ func (hc *HttpClient) DoStream(ctx context.Context, request *Request) (streams.S
 	stream := decoderFactory(ctx, rawResp.Body)
 
 	return stream, nil
+}
+
+func invokeTransportStart(ctx context.Context, request *Request, raw *http.Request) {
+	if request == nil || request.OnTransportStart == nil || raw == nil {
+		return
+	}
+	request.OnTransportStart(ctx, raw)
+}
+
+func invokeRequestBuilt(ctx context.Context, request *Request, raw *http.Request) {
+	if request == nil || request.OnRequestBuilt == nil || raw == nil {
+		return
+	}
+	request.OnRequestBuilt(ctx, raw)
 }
 
 // BuildHttpRequest builds an HTTP request from Request.
