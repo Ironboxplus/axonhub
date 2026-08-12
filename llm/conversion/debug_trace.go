@@ -56,6 +56,10 @@ func planActionEvidence(action Action) llm.ConversionActionTrace {
 		Result:          result,
 		Severity:        severity,
 		Reversible:      action.Reversible,
+		SourceType:      action.SourceType,
+		SemanticClass:   action.SemanticClass,
+		RawBytes:        action.RawBytes,
+		SourceDigest:    action.SourceDigest,
 	}
 }
 
@@ -82,6 +86,23 @@ func runtimeActionEvidence(
 		Severity:   severity,
 		Reversible: reversible,
 	}
+}
+
+func runtimeOutputBlockerEvidence(
+	direction llm.ConversionDirection,
+	ref ObjectRef,
+	item *llm.Item,
+	semanticClass string,
+	reason ReasonCode,
+) llm.ConversionActionTrace {
+	evidence := runtimeActionEvidence(direction, ref, string(ActionUnknown), StrategyUnavailable, reason, false)
+	evidence.SourceType = itemEvidenceSourceType(item, "unknown")
+	evidence.SemanticClass = semanticClass
+	if item != nil {
+		evidence.RawBytes = item.ProtocolHints.SourceBytes
+		evidence.SourceDigest = safeEvidenceSourceDigest(item.ProtocolHints.SourceDigest)
+	}
+	return evidence
 }
 
 func requiredRuntimeEvidence(action llm.ConversionActionTrace) bool {
@@ -121,6 +142,8 @@ func runtimeEvidenceResult(action string, reversible bool) (llm.ConversionEviden
 		return llm.ConversionResultNormalized, llm.ConversionSeverityWarning
 	case "repair":
 		return llm.ConversionResultRepaired, llm.ConversionSeverityWarning
+	case string(ActionUnknown):
+		return llm.ConversionResultUnknown, llm.ConversionSeverityCritical
 	default:
 		if reversible {
 			return llm.ConversionResultNative, llm.ConversionSeverityInfo
@@ -188,7 +211,7 @@ func objectEvidenceLocation(direction llm.ConversionDirection, ref ObjectRef, st
 		if ref.ItemIndex >= 0 {
 			objectID = indexed(sequence, ref.ItemIndex) + ".provider_data"
 		}
-	case ObjectCompaction, ObjectRequestControl, ObjectInputItem:
+	case ObjectCompaction, ObjectContextCompaction, ObjectRequestControl, ObjectInputItem, ObjectAgentMessage:
 		objectID = indexed(sequence, ref.ItemIndex)
 	default:
 		objectID = string(ref.Kind)

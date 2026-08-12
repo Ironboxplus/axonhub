@@ -79,3 +79,27 @@ func TestCanonicalChatOutboundGroupsAssistantContentReasoningAndParallelCalls(t 
 		t.Fatalf("grouped Chat assistant content = %#v", assistant.Content)
 	}
 }
+
+func TestCanonicalChatRequestKeepsLegacyAgentMessagesAsAssistantTurnBoundaries(t *testing.T) {
+	t.Parallel()
+	request := &llm.Request{APIFormat: llm.APIFormatOpenAIResponse, Input: []llm.Item{
+		{Kind: llm.ItemKindMessage, Role: llm.RoleUser, Content: []llm.ContentBlock{{Kind: llm.ContentKindText, Text: "before"}}},
+		{Kind: llm.ItemKindAgentMessage, AgentMessage: &llm.AgentMessage{Author: "/root", Recipient: "/root/worker", Content: []llm.AgentMessageContentPart{{Kind: llm.AgentMessageContentInputText, Text: "first"}}}},
+		{Kind: llm.ItemKindAgentMessage, AgentMessage: &llm.AgentMessage{Author: "/root", Recipient: "/root/worker", Content: []llm.AgentMessageContentPart{{Kind: llm.AgentMessageContentInputText, Text: "second"}}}},
+		{Kind: llm.ItemKindMessage, Role: llm.RoleUser, Content: []llm.ContentBlock{{Kind: llm.ContentKindText, Text: "after"}}},
+	}}
+	messages, ok := canonicalRequestMessages(request, ReasoningFieldContent)
+	if !ok || len(messages) != 4 || messages[0].Role != "user" || messages[1].Role != "assistant" || messages[2].Role != "assistant" || messages[3].Role != "user" ||
+		messages[1].Content.Content == nil || messages[2].Content.Content == nil {
+		t.Fatalf("legacy inter-agent turn boundaries=%#v ok=%v", messages, ok)
+	}
+	for index, want := range []string{"first", "second"} {
+		var legacy struct {
+			Content string `json:"content"`
+			Trigger bool   `json:"trigger_turn"`
+		}
+		if err := json.Unmarshal([]byte(*messages[index+1].Content.Content), &legacy); err != nil || legacy.Content != want || !legacy.Trigger {
+			t.Fatalf("legacy inter-agent message %d=%q decoded=%#v err=%v", index, *messages[index+1].Content.Content, legacy, err)
+		}
+	}
+}

@@ -169,6 +169,14 @@ func (encoder *canonicalStreamEncoder) addItem(source *responsesInboundStream, e
 	}
 	outputIndex := encoder.outputIndex(key, event.ItemRef.OutputIndex)
 	itemID := wire.ID
+	// Opaque same-Responses identity keeps the whole union in Raw, so its
+	// convenience Item.ID is intentionally empty. The canonical snapshot still
+	// carries the typed structural ID needed by the lifecycle index; do not lose
+	// it before item.done merely because the wire encoder correctly avoids
+	// rebuilding the opaque object.
+	if itemID == "" && event.Snapshot != nil {
+		itemID = event.Snapshot.ID
+	}
 	if itemID == "" && event.Snapshot.ProtocolHints.SourceFormat != llm.APIFormatOpenAIResponse {
 		itemID = generateItemID()
 		wire.ID = itemID
@@ -179,7 +187,15 @@ func (encoder *canonicalStreamEncoder) addItem(source *responsesInboundStream, e
 	}
 	encoder.itemIDs[key] = referenceID
 	encoder.itemKinds[key] = event.Snapshot.Kind
-	markResponsesWireItemInProgress(&wire)
+	// A Responses stream may legally omit status on an output_item.added
+	// snapshot. Preserve every same-Responses source snapshot: Codex's current
+	// ev_message_item_added fixture does exactly that, and its SSE decoder
+	// accepts the item without synthesizing a status. The canonical lifecycle
+	// still records ItemAdded internally. Only a snapshot synthesized from a
+	// different protocol needs an in-progress lifecycle projection.
+	if event.Snapshot == nil || event.Snapshot.ProtocolHints.SourceFormat != llm.APIFormatOpenAIResponse {
+		markResponsesWireItemInProgress(&wire)
+	}
 	encoder.items[key] = wire
 	if event.Snapshot.Kind == llm.ItemKindToolCall || event.Snapshot.Kind == llm.ItemKindMCPCall {
 		encoder.arguments[key] = &strings.Builder{}
@@ -511,7 +527,7 @@ func (source *responsesInboundStream) canonicalResponse(status string, output []
 }
 
 func markResponsesWireItemInProgress(item *Item) {
-	if item == nil {
+	if item == nil || !responsesItemHasLifecycleStatus(item.Type) {
 		return
 	}
 	status := "in_progress"
@@ -534,6 +550,23 @@ func markResponsesWireItemInProgress(item *Item) {
 		item.Summary = []ReasoningSummary{}
 	case "shell_call_output":
 		item.RawOutput = json.RawMessage(`[]`)
+	}
+}
+
+// responsesItemHasLifecycleStatus is deliberately closed. status is not a
+// universal Responses item field: current Codex ResponseItem schemas exclude
+// agent_message, compaction, context_compaction, and unknown future unions.
+// Never synthesize a lifecycle field for those identities merely because the
+// canonical stream state is in progress.
+func responsesItemHasLifecycleStatus(itemType string) bool {
+	switch itemType {
+	case "message", "reasoning", "local_shell_call", "function_call", "tool_search_call",
+		"tool_search_output", "custom_tool_call", "web_search_call", "image_generation_call",
+		"mcp_call", "mcp_list_tools", "shell_call", "computer_call", "apply_patch_call",
+		"shell_call_output", "computer_call_output", "apply_patch_call_output":
+		return true
+	default:
+		return false
 	}
 }
 

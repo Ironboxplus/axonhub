@@ -12,6 +12,9 @@ func TestItemUnmarshalJSONUnionBranches(t *testing.T) {
 	if err := invalid.UnmarshalJSON([]byte(`{`)); err == nil {
 		t.Fatal("direct Item.UnmarshalJSON accepted invalid JSON")
 	}
+	if err := invalid.UnmarshalJSON([]byte(`{"type":"message","status":1}`)); err == nil {
+		t.Fatal("direct Item.UnmarshalJSON accepted a non-string status")
+	}
 	tests := []struct {
 		name    string
 		wire    string
@@ -146,6 +149,11 @@ func TestItemMarshalJSONUnionBranches(t *testing.T) {
 			requireJSONField(t, object, "future", `1`)
 		}},
 		{name: "invalid residual", item: Item{Type: "message", Residual: json.RawMessage(`{`)}, wantErr: "unexpected end"},
+		{name: "opaque raw identity", item: Item{Raw: json.RawMessage(`{ "type":"future", "content":null }`)}, check: func(t *testing.T, object map[string]json.RawMessage) {
+			requireJSONField(t, object, "type", `"future"`)
+			requireJSONField(t, object, "content", `null`)
+		}},
+		{name: "invalid opaque raw identity", item: Item{Raw: json.RawMessage(`{`)}, wantErr: "opaque Responses item raw identity must be valid JSON"},
 	}
 
 	for _, test := range tests {

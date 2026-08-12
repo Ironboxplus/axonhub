@@ -85,12 +85,32 @@ func planEmulatesCompact(plan *Plan) bool {
 	return false
 }
 
-func restoreCompactEmulation(response *llm.Response, session *Session) *llm.Response {
+func restoreCompactEmulation(response *llm.Response, session *Session) (*llm.Response, error) {
 	if response == nil || session == nil || session.compactEmulation == nil {
-		return response
+		return response, nil
 	}
-
-	output := canonicalItemsToMessages(response.Output)
+	for index := range response.Output {
+		item := &response.Output[index]
+		if item.Kind != llm.ItemKindAgentMessage || item.AgentMessage == nil {
+			continue
+		}
+		// canonicalItemsToMessages correctly rejects encrypted, mixed, and
+		// malformed agent messages below. A valid plaintext agent message is the
+		// exceptional case: it has a request-only legacy lowering, but a provider
+		// output must never become compact continuation history. Reject that one
+		// shape here without exposing its routing/content payload.
+		if _, err := item.AgentMessage.LegacyInterAgentMessageJSON(); err == nil {
+			return nil, fmt.Errorf("%w: compact emulation output has no safe legacy projection", ErrIncompletePlan)
+		}
+	}
+	output, err := canonicalItemsToMessages(response.Output)
+	if err != nil {
+		// CompactInboundTransformer requires Compact output. Returning the ordinary
+		// response here looked non-destructive, but caused a later protocol error
+		// after provider completion and falsely advertised a usable compact result.
+		// Do not flatten or retain encrypted agent content as continuation history.
+		return nil, fmt.Errorf("%w: compact emulation output has no safe legacy projection", ErrIncompletePlan)
+	}
 	if len(output) == 0 {
 		legacy := make([]llm.Message, 0, len(response.Choices))
 		for index := range response.Choices {
@@ -113,5 +133,5 @@ func restoreCompactEmulation(response *llm.Response, session *Session) *llm.Resp
 		Instructions: session.compactEmulation.instructions,
 		Output:       output,
 	}
-	return response
+	return response, nil
 }

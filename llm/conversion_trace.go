@@ -136,6 +136,10 @@ type ConversionActionTrace struct {
 	Result          ConversionEvidenceResult   `json:"result"`
 	Severity        ConversionEvidenceSeverity `json:"severity"`
 	Reversible      bool                       `json:"reversible"`
+	SourceType      string                     `json:"source_type,omitempty"`
+	SemanticClass   string                     `json:"semantic_class,omitempty"`
+	RawBytes        uint32                     `json:"raw_bytes,omitempty"`
+	SourceDigest    string                     `json:"source_digest,omitempty"`
 	LogicalIDHash   string                     `json:"logical_id_hash,omitempty"`
 }
 
@@ -143,13 +147,17 @@ type ConversionActionTrace struct {
 // always bounded by MaxConversionDebugActions; Truncated preserves evidence
 // that additional decisions existed without retaining them.
 type ConversionDebugTrace struct {
-	Mode      ConversionEvidenceMode  `json:"mode"`
-	Actions   []ConversionActionTrace `json:"actions,omitempty"`
-	Truncated uint32                  `json:"truncated,omitempty"`
+	Mode              ConversionEvidenceMode  `json:"mode"`
+	Actions           []ConversionActionTrace `json:"actions,omitempty"`
+	Truncated         uint32                  `json:"truncated,omitempty"`
+	CriticalTruncated uint32                  `json:"critical_truncated,omitempty"`
+	WarningTruncated  uint32                  `json:"warning_truncated,omitempty"`
+	InfoTruncated     uint32                  `json:"info_truncated,omitempty"`
 
 	key           [sha256.Size]byte
 	maxActions    int
 	hashLogicalID bool
+	nextSeq       uint32
 	mu            sync.Mutex
 }
 
@@ -194,18 +202,19 @@ func NewRequiredConversionDebugTrace(expectedActions int) *ConversionDebugTrace 
 }
 
 // Append records a payload-free decision. logicalRef must be a structural
-// reference (indexes/kinds), never a raw tool name or provider call ID.
+// reference (indexes/kinds), never a raw tool name or provider call ID. The
+// bounded buffer is severity-prioritized: critical actions displace earlier
+// warning/info entries, so a decisive blocker at the tail of a large plan is
+// still observable. Work per append is O(maxActions), and maxActions is a hard
+// small constant.
 func (trace *ConversionDebugTrace) Append(action ConversionActionTrace, logicalRef []byte) {
 	if trace == nil {
 		return
 	}
 	trace.mu.Lock()
 	defer trace.mu.Unlock()
-	if len(trace.Actions) >= trace.maxActions {
-		trace.Truncated++
-		return
-	}
-	action.Seq = uint32(len(trace.Actions) + 1)
+	trace.nextSeq++
+	action.Seq = trace.nextSeq
 	if trace.hashLogicalID {
 		hasher := hmac.New(sha256.New, trace.key[:])
 		_, _ = hasher.Write(logicalRef)
@@ -214,10 +223,60 @@ func (trace *ConversionDebugTrace) Append(action ConversionActionTrace, logicalR
 		hex.Encode(logicalHash[:], digest[:8])
 		action.LogicalIDHash = string(logicalHash[:])
 	}
-	trace.Actions = append(trace.Actions, action)
+	if len(trace.Actions) < trace.maxActions {
+		trace.Actions = append(trace.Actions, action)
+		return
+	}
+	victim := trace.lowerPriorityAction(action.Severity)
+	if victim < 0 {
+		trace.recordTruncated(action.Severity)
+		return
+	}
+	trace.recordTruncated(trace.Actions[victim].Severity)
+	copy(trace.Actions[victim:], trace.Actions[victim+1:])
+	trace.Actions[len(trace.Actions)-1] = action
 }
 
-// Clone returns a persistence-safe snapshot with no request-scoped hash key.
+func (trace *ConversionDebugTrace) lowerPriorityAction(incoming ConversionEvidenceSeverity) int {
+	incomingPriority := conversionEvidencePriority(incoming)
+	victim, victimPriority := -1, incomingPriority
+	for index := range trace.Actions {
+		priority := conversionEvidencePriority(trace.Actions[index].Severity)
+		if priority >= incomingPriority || (victim >= 0 && priority >= victimPriority) {
+			continue
+		}
+		victim, victimPriority = index, priority
+	}
+	return victim
+}
+
+func conversionEvidencePriority(severity ConversionEvidenceSeverity) int {
+	switch severity {
+	case ConversionSeverityCritical:
+		return 3
+	case ConversionSeverityWarning:
+		return 2
+	default:
+		return 1
+	}
+}
+
+func (trace *ConversionDebugTrace) recordTruncated(severity ConversionEvidenceSeverity) {
+	trace.Truncated++
+	switch severity {
+	case ConversionSeverityCritical:
+		trace.CriticalTruncated++
+	case ConversionSeverityWarning:
+		trace.WarningTruncated++
+	default:
+		trace.InfoTruncated++
+	}
+}
+
+// Clone returns a persistence-safe immutable snapshot with no request-scoped
+// hash key. The snapshot is for observation/persistence only; callers must not
+// Append to it. All production callers obtain it from a live Session trace or
+// response metadata and never use a cloned trace as a mutable working trace.
 func (trace *ConversionDebugTrace) Clone() *ConversionDebugTrace {
 	if trace == nil {
 		return nil
@@ -225,9 +284,12 @@ func (trace *ConversionDebugTrace) Clone() *ConversionDebugTrace {
 	trace.mu.Lock()
 	defer trace.mu.Unlock()
 	return &ConversionDebugTrace{
-		Mode:      trace.Mode,
-		Actions:   append([]ConversionActionTrace(nil), trace.Actions...),
-		Truncated: trace.Truncated,
+		Mode:              trace.Mode,
+		Actions:           append([]ConversionActionTrace(nil), trace.Actions...),
+		Truncated:         trace.Truncated,
+		CriticalTruncated: trace.CriticalTruncated,
+		WarningTruncated:  trace.WarningTruncated,
+		InfoTruncated:     trace.InfoTruncated,
 	}
 }
 

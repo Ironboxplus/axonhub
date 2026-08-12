@@ -135,6 +135,8 @@ func (encoder *anthropicCanonicalEncoder) addItem(event llm.Event, emit func(*St
 		if event.Snapshot.ProtocolHints.SourceFormat == llm.APIFormatAnthropicMessage && isAnthropicSpecialToolUseBlock(event.Snapshot.ProtocolHints.SourceType) {
 			block.Type = event.Snapshot.ProtocolHints.SourceType
 		}
+	case llm.ItemKindAgentMessage, llm.ItemKindCompaction, llm.ItemKindContextCompaction, llm.ItemKindUnknown:
+		return fmt.Errorf("Anthropic cannot encode canonical stream item kind %q", event.Snapshot.Kind)
 	default:
 		return fmt.Errorf("canonical item kind %q has no Anthropic stream block", event.Snapshot.Kind)
 	}

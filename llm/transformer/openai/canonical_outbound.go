@@ -21,6 +21,13 @@ func validateCanonicalChatRequest(request *llm.Request) error {
 		item := &request.Input[index]
 		switch item.Kind {
 		case llm.ItemKindMessage, llm.ItemKindReasoning, llm.ItemKindToolDeclaration:
+		case llm.ItemKindAgentMessage:
+			if item.AgentMessage == nil {
+				return fmt.Errorf("canonical item %d agent_message payload is missing", index)
+			}
+			if _, err := item.AgentMessage.LegacyInterAgentMessageJSON(); err != nil {
+				return fmt.Errorf("canonical item %d agent_message has no Chat encoding: %w", index, err)
+			}
 		case llm.ItemKindToolCall:
 			if item.ToolCall == nil || item.ToolCall.Kind != llm.ToolKindFunction {
 				return fmt.Errorf("canonical item %d tool call has no Chat encoding", index)
@@ -62,6 +69,20 @@ func canonicalRequestMessages(request *llm.Request, reasoningField ReasoningFiel
 			value := item.Reasoning.Content
 			message := llm.Message{Role: "assistant", ReasoningContent: &value, Reasoning: &value}
 			messages = appendCanonicalChatMessage(messages, MessageFromLLMWithConfig(message, reasoningField))
+		case llm.ItemKindAgentMessage:
+			if item.AgentMessage == nil {
+				continue
+			}
+			envelope, err := item.AgentMessage.LegacyInterAgentMessageJSON()
+			if err != nil {
+				continue
+			}
+			// Codex detects the JSON envelope only when it is the whole assistant
+			// message. Do not merge two typed inter-agent boundaries into one
+			// multi-part Chat message.
+			messages = append(messages, Message{
+				Role: "assistant", Content: MessageContent{Content: &envelope},
+			})
 		case llm.ItemKindToolCall:
 			if item.ToolCall == nil {
 				continue

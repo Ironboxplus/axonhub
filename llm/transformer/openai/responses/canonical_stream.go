@@ -97,7 +97,7 @@ func (decoder *canonicalStreamDecoder) decode(wire *StreamEvent) ([]llm.Event, e
 			return nil, err
 		}
 	case StreamEventTypeOutputItemAdded:
-		item, err := canonicalStreamItem(wire.Item, wire.OutputIndex, true)
+		item, err := canonicalStreamItem(wire.Item, wire.ItemRaw, wire.OutputIndex, true)
 		if err != nil {
 			return nil, err
 		}
@@ -255,7 +255,7 @@ func (decoder *canonicalStreamDecoder) decode(wire *StreamEvent) ([]llm.Event, e
 		// typed item state on output_item.done; emitting every base64 preview as
 		// trace metadata would be both lossy and prohibitively expensive.
 	case StreamEventTypeOutputItemDone:
-		item, err := canonicalStreamItem(wire.Item, wire.OutputIndex, false)
+		item, err := canonicalStreamItem(wire.Item, wire.ItemRaw, wire.OutputIndex, false)
 		if err != nil {
 			return nil, err
 		}
@@ -411,11 +411,11 @@ func responsesSourceSequenceError(wire *StreamEvent, cause error) error {
 	}
 }
 
-func canonicalStreamItem(item *Item, outputIndex int, added bool) (*llm.Item, error) {
+func canonicalStreamItem(item *Item, raw json.RawMessage, outputIndex int, added bool) (*llm.Item, error) {
 	if item == nil {
 		return nil, fmt.Errorf("Responses output item event at index %d has no item", outputIndex)
 	}
-	canonical, err := responseItemToCanonical(item, nil, outputIndex)
+	canonical, err := responseItemToCanonical(item, raw, outputIndex)
 	if err != nil {
 		return nil, fmt.Errorf("decode Responses stream item %q: %w", item.Type, err)
 	}
@@ -848,9 +848,22 @@ func cloneCanonicalItem(item *llm.Item) *llm.Item {
 		reasoning.ContentParts = cloneCanonicalReasoningParts(item.Reasoning.ContentParts)
 		clone.Reasoning = &reasoning
 	}
+	if item.AgentMessage != nil {
+		message := *item.AgentMessage
+		message.Content = append([]llm.AgentMessageContentPart(nil), item.AgentMessage.Content...)
+		for index := range message.Content {
+			message.Content[index].SourceResidual = cloneRaw(item.AgentMessage.Content[index].SourceResidual)
+		}
+		clone.AgentMessage = &message
+	}
 	if item.Compaction != nil {
 		compaction := *item.Compaction
 		clone.Compaction = &compaction
+	}
+	if item.ContextCompaction != nil {
+		compaction := *item.ContextCompaction
+		compaction.EncryptedContent = stringPointerClone(item.ContextCompaction.EncryptedContent)
+		clone.ContextCompaction = &compaction
 	}
 	if item.Unknown != nil {
 		unknown := *item.Unknown

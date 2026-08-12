@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/require"
 
@@ -388,7 +389,7 @@ func TestInboundTransformer_TransformResponse_WithTestData(t *testing.T) {
 
 			// Compare with ignoring dynamic fields (IDs generated at runtime)
 			// Since Output is []Item, we need to ignore the ID field in Item structs
-			opts := cmp.FilterPath(func(p cmp.Path) bool {
+			opts := cmp.Options{cmp.FilterPath(func(p cmp.Path) bool {
 				// Ignore "ID" field in Item structs within Output array
 				if len(p) >= 2 {
 					if sf, ok := p[len(p)-1].(cmp.StructField); ok {
@@ -399,7 +400,7 @@ func TestInboundTransformer_TransformResponse_WithTestData(t *testing.T) {
 				}
 
 				return false
-			}, cmp.Ignore())
+			}, cmp.Ignore()), cmpopts.IgnoreUnexported(Item{})}
 			if diff := cmp.Diff(expected, resp, opts); diff != "" {
 				t.Errorf("response mismatch (-expected +got):\n%s", diff)
 			}

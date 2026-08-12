@@ -1,6 +1,7 @@
 package responses
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -196,6 +197,7 @@ func responseItemToCanonical(item *Item, raw json.RawMessage, ordinal int) (*llm
 		ResidualOwnerType: item.Type,
 		SourceResidual:    residual,
 	}
+	setResponsesEvidenceHints(&hints, item.Type, raw)
 	status := canonicalItemStatus(item.Status)
 
 	switch item.Type {
@@ -492,11 +494,36 @@ func responseItemToCanonical(item *Item, raw json.RawMessage, ordinal int) (*llm
 			ProtocolHints: hints,
 		}, nil
 
+	case "agent_message":
+		content, known, err := responseAgentMessageContent(item.Content)
+		if err != nil {
+			return nil, fmt.Errorf("Responses agent_message item %q: %w", item.ID, err)
+		}
+		if !known {
+			return opaqueFutureAgentMessageItem(item, raw, hints, status)
+		}
+		return &llm.Item{
+			Kind: llm.ItemKindAgentMessage, ID: item.ID, Role: llm.RoleAssistant, Status: status,
+			AgentMessage: &llm.AgentMessage{
+				Author: item.Author, Recipient: item.Recipient, Content: content,
+			},
+			ProtocolHints: hints,
+		}, nil
+
 	case "compaction", "compaction_summary":
 		return &llm.Item{
 			Kind: llm.ItemKindCompaction, ID: item.ID, Status: status,
 			Compaction: &llm.CompactionItem{
 				EncryptedContent: stringValue(item.EncryptedContent), CreatedBy: stringValue(item.CreatedBy),
+			},
+			ProtocolHints: hints,
+		}, nil
+
+	case "context_compaction":
+		return &llm.Item{
+			Kind: llm.ItemKindContextCompaction, ID: item.ID, Status: status,
+			ContextCompaction: &llm.ContextCompactionItem{
+				EncryptedContent: stringPointerClone(item.EncryptedContent),
 			},
 			ProtocolHints: hints,
 		}, nil
@@ -516,11 +543,124 @@ func responseItemToCanonical(item *Item, raw json.RawMessage, ordinal int) (*llm
 		}
 		raw = encoded
 	}
+	// Unknown discriminators are decided only by this exact decode-switch
+	// default. Do not infer them from a string helper: ordinary known objects
+	// must stay allocation-light and must not receive object-level hashing.
+	setResponsesUnknownEvidenceHints(&hints, raw)
 	return &llm.Item{
 		Kind: llm.ItemKindUnknown, ID: item.ID, Status: status,
 		Unknown: &llm.UnknownItem{
 			Type: item.Type, Raw: append(json.RawMessage(nil), raw...), Behavioral: true,
 		},
+		ProtocolHints: hints,
+	}, nil
+}
+
+func setResponsesEvidenceHints(hints *llm.ProtocolHints, itemType string, raw json.RawMessage) {
+	if hints == nil || !responsesObjectEvidenceType(itemType) || len(raw) == 0 {
+		return
+	}
+	setResponsesRawEvidenceHints(hints, raw)
+}
+
+func setResponsesUnknownEvidenceHints(hints *llm.ProtocolHints, raw json.RawMessage) {
+	if hints == nil || len(raw) == 0 {
+		return
+	}
+	setResponsesRawEvidenceHints(hints, raw)
+}
+
+func setResponsesRawEvidenceHints(hints *llm.ProtocolHints, raw json.RawMessage) {
+	if hints == nil || len(raw) == 0 {
+		return
+	}
+	hints.SourceBytes = uint32(len(raw))
+	digest := sha256.Sum256(raw)
+	hints.SourceDigest = fmt.Sprintf("%x", digest)
+}
+
+func responsesObjectEvidenceType(itemType string) bool {
+	switch itemType {
+	case "agent_message", "compaction", "compaction_summary", "compaction_trigger", "context_compaction":
+		return true
+	default:
+		return false
+	}
+}
+
+func stringPointerClone(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	clone := *value
+	return &clone
+}
+
+// responseAgentMessageContent differentiates a malformed member of today's
+// closed content union from a future discriminator. The latter must make the
+// whole outer agent_message opaque instead of being guessed as text or
+// encryption. known=false therefore has no error by design.
+func responseAgentMessageContent(input *Input) (content []llm.AgentMessageContentPart, known bool, err error) {
+	if input == nil || input.Text != nil || len(input.Items) == 0 {
+		return nil, true, fmt.Errorf("content must be a non-empty typed item array")
+	}
+	content = make([]llm.AgentMessageContentPart, 0, len(input.Items))
+	sawFuture := false
+	for index := range input.Items {
+		part := &input.Items[index]
+		canonical := llm.AgentMessageContentPart{
+			Kind:              llm.AgentMessageContentKind(part.Type),
+			ResidualOwnerType: part.Type,
+			SourceResidual:    cloneRaw(part.Residual),
+		}
+		switch canonical.Kind {
+		case llm.AgentMessageContentInputText:
+			if part.Text == nil {
+				return nil, true, fmt.Errorf("content[%d] input_text requires text", index)
+			}
+			if part.EncryptedContent != nil {
+				return nil, true, fmt.Errorf("content[%d] input_text cannot contain encrypted_content", index)
+			}
+			canonical.Text = *part.Text
+		case llm.AgentMessageContentEncryptedContent:
+			if part.EncryptedContent == nil || strings.TrimSpace(*part.EncryptedContent) == "" {
+				return nil, true, fmt.Errorf("content[%d] encrypted_content requires encrypted_content", index)
+			}
+			if part.Text != nil {
+				return nil, true, fmt.Errorf("content[%d] encrypted_content cannot contain text", index)
+			}
+			canonical.EncryptedContent = *part.EncryptedContent
+		default:
+			sawFuture = true
+			continue
+		}
+		content = append(content, canonical)
+	}
+	if sawFuture {
+		return nil, false, nil
+	}
+	return content, true, nil
+}
+
+func opaqueFutureAgentMessageItem(item *Item, raw json.RawMessage, hints llm.ProtocolHints, status llm.ItemStatus) (*llm.Item, error) {
+	if item == nil {
+		return nil, nil
+	}
+	if len(raw) == 0 {
+		encoded, err := json.Marshal(item)
+		if err != nil {
+			return nil, fmt.Errorf("marshal future agent_message item %q: %w", item.ID, err)
+		}
+		raw = encoded
+	}
+	// Retain the known outer discriminator for bounded evidence while marking
+	// the semantic class as future behavioral through ItemKindUnknown. This is
+	// not a typed agent message and cannot enter legacy lowering.
+	hints.SourceType = "agent_message"
+	setResponsesUnknownEvidenceHints(&hints, raw)
+	return &llm.Item{
+		Kind: llm.ItemKindUnknown, ID: item.ID, Status: status,
+		Unknown:       &llm.UnknownItem{Type: "agent_message", Raw: append(json.RawMessage(nil), raw...), Behavioral: true},
 		ProtocolHints: hints,
 	}, nil
 }

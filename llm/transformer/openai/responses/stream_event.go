@@ -74,6 +74,10 @@ const (
 // Reference: https://platform.openai.com/docs/api-reference/responses-streaming
 type StreamEvent struct {
 	Residual json.RawMessage `json:"-"`
+	// ItemRaw retains the exact output_item snapshot when this event was decoded
+	// from SSE. It supplies bytes/digest evidence and opaque identity; manually
+	// constructed test events may legitimately leave it empty.
+	ItemRaw json.RawMessage `json:"-"`
 	// Common fields
 	Type           StreamEventType `json:"type"`
 	SequenceNumber *int            `json:"sequence_number,omitempty"`
@@ -122,12 +126,19 @@ type StreamEvent struct {
 
 func (event *StreamEvent) UnmarshalJSON(data []byte) error {
 	type streamEventWire StreamEvent
+	var raw struct {
+		Item json.RawMessage `json:"item"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
 	var wire streamEventWire
 	if err := json.Unmarshal(data, &wire); err != nil {
 		return err
 	}
 	*event = StreamEvent(wire)
 	event.Residual = jsonObjectResidual(data, responsesStreamEventFields)
+	event.ItemRaw = cloneRaw(raw.Item)
 	return nil
 }
 

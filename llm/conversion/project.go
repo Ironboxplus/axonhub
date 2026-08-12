@@ -2,6 +2,7 @@ package conversion
 
 import (
 	"encoding/json"
+	"fmt"
 
 	"github.com/looplj/axonhub/llm"
 )
@@ -21,13 +22,17 @@ func projectCanonical(request *llm.Request, target llm.APIFormat) (*llm.Request,
 		return request, nil
 	}
 	projected := request.Clone()
-	projected.Messages = canonicalItemsToMessages(projected.Input)
+	var err error
+	projected.Messages, err = canonicalItemsToMessages(projected.Input)
+	if err != nil {
+		return nil, err
+	}
 	projected.Tools = canonicalToolsToLegacy(projected.ToolDefinitions)
 	projected.APIFormat = request.APIFormat
 	return projected, nil
 }
 
-func canonicalItemsToMessages(items []llm.Item) []llm.Message {
+func canonicalItemsToMessages(items []llm.Item) ([]llm.Message, error) {
 	messages := make([]llm.Message, 0, len(items))
 	for index := range items {
 		item := &items[index]
@@ -39,7 +44,7 @@ func canonicalItemsToMessages(items []llm.Item) []llm.Message {
 			})
 		case llm.ItemKindReasoning:
 			if item.Reasoning == nil {
-				continue
+				return nil, fmt.Errorf("canonical reasoning item %d has no payload", index)
 			}
 			reasoning := *item.Reasoning
 			messages = append(messages, llm.Message{
@@ -48,7 +53,7 @@ func canonicalItemsToMessages(items []llm.Item) []llm.Message {
 			})
 		case llm.ItemKindToolCall:
 			if item.ToolCall == nil {
-				continue
+				return nil, fmt.Errorf("canonical tool_call item %d has no payload", index)
 			}
 			call := item.ToolCall
 			legacy := llm.ToolCall{ID: call.CallID, Type: llm.ToolTypeFunction}
@@ -65,7 +70,7 @@ func canonicalItemsToMessages(items []llm.Item) []llm.Message {
 			messages = append(messages, llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{legacy}})
 		case llm.ItemKindToolResult:
 			if item.ToolResult == nil {
-				continue
+				return nil, fmt.Errorf("canonical tool_result item %d has no payload", index)
 			}
 			callID := item.ToolResult.CallID
 			name := item.ToolResult.LogicalName
@@ -74,9 +79,23 @@ func canonicalItemsToMessages(items []llm.Item) []llm.Message {
 				Role: "tool", ToolCallID: &callID, ToolCallName: stringPointer(name), ToolCallIsError: &isError,
 				Content: canonicalContentOnly(item.ToolResult.Content),
 			})
+		case llm.ItemKindAgentMessage:
+			if item.AgentMessage == nil {
+				return nil, fmt.Errorf("canonical agent_message item %d has no payload", index)
+			}
+			envelope, err := item.AgentMessage.LegacyInterAgentMessageJSON()
+			if err != nil {
+				return nil, fmt.Errorf("canonical agent_message item %d has no safe legacy inter-agent projection: %w", index, err)
+			}
+			messages = append(messages, llm.Message{
+				// Codex treats a reparseable InterAgentCommunication JSON assistant
+				// message as a user-turn boundary when trigger_turn is true. Keep the
+				// legacy role and structured JSON together on request wires.
+				ID: item.ID, Role: string(llm.RoleAssistant), Content: llm.MessageContent{Content: stringPointer(envelope)},
+			})
 		case llm.ItemKindCompaction:
 			if item.Compaction == nil {
-				continue
+				return nil, fmt.Errorf("canonical compaction item %d has no payload", index)
 			}
 			createdBy := item.Compaction.CreatedBy
 			messages = append(messages, llm.Message{
@@ -87,9 +106,19 @@ func canonicalItemsToMessages(items []llm.Item) []llm.Message {
 					},
 				}}},
 			})
+		case llm.ItemKindContextCompaction:
+			// This checkpoint is neither response.compaction nor a request control.
+			// A legacy history has no equivalent encrypted context representation.
+			return nil, fmt.Errorf("canonical context_compaction item %d has no safe legacy projection", index)
+		case llm.ItemKindUnknown:
+			// Projection is only invoked for targets that require legacy message
+			// history. Silently omitting a future behavioral item here would turn a
+			// compact continuation into a misleading, incomplete state. Same-protocol
+			// identity has already bypassed this adapter, so fail closed instead.
+			return nil, fmt.Errorf("canonical item %d kind %q has no safe legacy projection", index, item.Kind)
 		}
 	}
-	return messages
+	return messages, nil
 }
 
 func canonicalToolsToLegacy(definitions []llm.ToolDefinition) []llm.Tool {

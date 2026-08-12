@@ -15,7 +15,9 @@ func BenchmarkResponsesIdentityNestedResidual512(b *testing.B) {
 }
 
 func BenchmarkResponsesIdentityNestedResidualSizes(b *testing.B) {
-	for _, messages := range []int{64, 256, 512} {
+	// These are ordinary message objects. The selected-union digest feature must
+	// not make their 64->512 allocation slope worse.
+	for _, messages := range []int{64, 512} {
 		b.Run(strconv.Itoa(messages), func(b *testing.B) {
 			benchmarkResponsesIdentityNestedResidual(b, messages)
 		})

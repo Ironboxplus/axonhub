@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -119,8 +120,9 @@ func TestAggregateStreamChunks_WithTestData(t *testing.T) {
 			require.NoError(t, err)
 
 			// Compare using xtest.Equal with cmp.Diff output on mismatch
-			if !xtest.Equal(expected, actual) {
-				t.Fatalf("response mismatch:\n%s", cmp.Diff(expected, actual))
+			decodeMetadata := cmpopts.IgnoreUnexported(Item{})
+			if !xtest.Equal(expected, actual, decodeMetadata) {
+				t.Fatalf("response mismatch:\n%s", cmp.Diff(expected, actual, decodeMetadata))
 			}
 
 			// Verify meta

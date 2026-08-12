@@ -77,6 +77,17 @@ func canonicalItemHasModelActivity(item *Item) bool {
 		return false
 	case ItemKindReasoning:
 		return item.Reasoning != nil && (item.Reasoning.Content != "" || item.Reasoning.Signature != "")
+	case ItemKindAgentMessage:
+		if item.AgentMessage == nil {
+			return false
+		}
+		for index := range item.AgentMessage.Content {
+			part := &item.AgentMessage.Content[index]
+			if part.Text != "" || part.EncryptedContent != "" {
+				return true
+			}
+		}
+		return false
 	case ItemKindToolCall:
 		return item.ToolCall != nil
 	case ItemKindHostedCall:
@@ -89,6 +100,8 @@ func canonicalItemHasModelActivity(item *Item) bool {
 		return item.MCPCall != nil
 	case ItemKindCompaction:
 		return item.Compaction != nil
+	case ItemKindContextCompaction:
+		return item.ContextCompaction != nil
 	case ItemKindUnknown:
 		return item.Unknown != nil
 	default:

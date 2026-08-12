@@ -55,6 +55,13 @@ func validateCanonicalAnthropicRequest(request *llm.Request) error {
 		item := &request.Input[index]
 		switch item.Kind {
 		case llm.ItemKindMessage, llm.ItemKindReasoning, llm.ItemKindToolDeclaration:
+		case llm.ItemKindAgentMessage:
+			if item.AgentMessage == nil {
+				return fmt.Errorf("canonical item %d agent_message payload is missing", index)
+			}
+			if _, err := item.AgentMessage.LegacyInterAgentMessageJSON(); err != nil {
+				return fmt.Errorf("canonical item %d agent_message has no Anthropic encoding: %w", index, err)
+			}
 		case llm.ItemKindToolCall:
 			if item.ToolCall == nil || item.ToolCall.Kind != llm.ToolKindFunction {
 				return fmt.Errorf("canonical item %d tool call has no Anthropic encoding", index)
@@ -109,6 +116,19 @@ func canonicalAnthropicRequest(request *llm.Request) (*SystemPrompt, []MessagePa
 			messages = appendCanonicalAnthropicMessage(messages, "assistant", []MessageContentBlock{{
 				Type: "thinking", Thinking: &content, Signature: &signature,
 			}})
+		case llm.ItemKindAgentMessage:
+			if item.AgentMessage == nil {
+				continue
+			}
+			envelope, err := item.AgentMessage.LegacyInterAgentMessageJSON()
+			if err != nil {
+				continue
+			}
+			// The legacy JSON must remain one complete assistant message so Codex
+			// can recognise trigger_turn as an inter-agent boundary.
+			messages = append(messages, MessageParam{Role: "assistant", Content: MessageContent{MultipleContent: []MessageContentBlock{{
+				Type: "text", Text: &envelope,
+			}}}})
 		case llm.ItemKindToolCall:
 			if item.ToolCall == nil {
 				continue

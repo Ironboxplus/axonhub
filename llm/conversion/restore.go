@@ -2,6 +2,7 @@ package conversion
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/looplj/axonhub/llm"
@@ -32,12 +33,48 @@ func RestoreResponseContext(ctx context.Context, response *llm.Response, session
 	}
 	restoreCanonicalOutput(response.Output, session, llm.ConversionDirectionResponse)
 	normalizeResponseIdentifiers(ctx, response, session, llm.ConversionDirectionResponse)
+	recordCrossProtocolOutputBlockers(session, llm.ConversionDirectionResponse, response.Output)
 	if session.traceEnabled {
 		session.addRestoreNanos(time.Since(startedAt).Nanoseconds())
 		setResponseSummary(response, session.Summary())
 	}
 	setResponseDebug(response, session.DebugTrace())
 	return response
+}
+
+func recordCrossProtocolOutputBlockers(session *Session, direction llm.ConversionDirection, output []llm.Item) {
+	if !shouldRecordResponsesProviderOutputBlocker(session) {
+		return
+	}
+	for index := range output {
+		item := &output[index]
+		ref := ObjectRef{Kind: ObjectInputItem, ToolIndex: -1, ItemIndex: index, ContentIndex: -1, MessageIndex: -1, ToolCallIndex: -1}
+		switch item.Kind {
+		case llm.ItemKindAgentMessage:
+			ref.Kind = ObjectAgentMessage
+			session.recordOutputBlocker(direction, ref, item, "agent_message_provider_output", ReasonProviderPrivate, fmt.Sprintf("output:%d", index))
+		case llm.ItemKindCompaction:
+			ref.Kind = ObjectCompaction
+			session.recordOutputBlocker(direction, ref, item, "compaction_checkpoint", ReasonProviderPrivate, fmt.Sprintf("output:%d", index))
+		case llm.ItemKindContextCompaction:
+			ref.Kind = ObjectContextCompaction
+			session.recordOutputBlocker(direction, ref, item, "context_compaction_checkpoint", ReasonProviderPrivate, fmt.Sprintf("output:%d", index))
+		case llm.ItemKindUnknown:
+			session.recordOutputBlocker(direction, ref, item, unknownItemSemanticClass(item), ReasonNoStrategy, fmt.Sprintf("output:%d", index))
+		}
+	}
+}
+
+// shouldRecordResponsesProviderOutputBlocker is deliberately directional:
+// Plan.Source is the client wire selected by the inbound transformer, while
+// Plan.Target is the concrete provider wire. Only a Responses provider result
+// heading back to a non-Responses client can contain these Responses-private
+// unions which the client projection must fail closed on. Do not infer that a
+// similarly-shaped canonical item from another provider is a Responses union.
+func shouldRecordResponsesProviderOutputBlocker(session *Session) bool {
+	return session != nil && session.plan != nil &&
+		session.plan.Target.APIFormat == llm.APIFormatOpenAIResponse &&
+		session.plan.Source != llm.APIFormatOpenAIResponse
 }
 
 func normalizeResponseIdentifiers(ctx context.Context, response *llm.Response, session *Session, direction llm.ConversionDirection) {

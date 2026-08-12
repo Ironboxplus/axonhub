@@ -40,6 +40,8 @@ func canonicalResponseToChat(response *llm.Response) (*Response, bool, error) {
 			}
 			value := item.Reasoning.Content
 			mergeCanonicalChatString(&message.ReasoningContent, &value)
+		case llm.ItemKindAgentMessage:
+			return nil, true, fmt.Errorf("canonical output item %d agent_message has no Chat output encoding", index)
 		case llm.ItemKindToolCall:
 			if item.ToolCall == nil || item.ToolCall.Kind != llm.ToolKindFunction {
 				return nil, true, fmt.Errorf("canonical output item %d tool call has no Chat encoding", index)
@@ -49,6 +51,10 @@ func canonicalResponseToChat(response *llm.Response) (*Response, bool, error) {
 				Index: len(message.ToolCalls), ID: call.CallID, Type: llm.ToolTypeFunction,
 				Function: FunctionCall{Name: call.LogicalName, Arguments: canonicalChatArguments(call)},
 			})
+		case llm.ItemKindContextCompaction:
+			return nil, true, fmt.Errorf("canonical output item %d context_compaction has no Chat encoding", index)
+		case llm.ItemKindUnknown:
+			return nil, true, fmt.Errorf("canonical output item %d future unknown item has no Chat encoding", index)
 		default:
 			return nil, true, fmt.Errorf("canonical output item %d kind %q has no Chat encoding", index, item.Kind)
 		}

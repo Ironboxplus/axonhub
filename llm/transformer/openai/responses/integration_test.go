@@ -78,8 +78,9 @@ func TestTransformRequest_Integration(t *testing.T) {
 			err = json.Unmarshal(outboundReq.Body, &gotReq)
 			require.NoError(t, err)
 
-			if !xtest.Equal(expectedReq, gotReq, cmpopts.IgnoreFields(Item{}, "EncryptedContent")) {
-				t.Errorf("wantReq != gotReq\n%s", cmp.Diff(expectedReq, gotReq))
+			decodeMetadata := cmpopts.IgnoreUnexported(Item{})
+			if !xtest.Equal(expectedReq, gotReq, cmpopts.IgnoreFields(Item{}, "EncryptedContent"), decodeMetadata) {
+				t.Errorf("wantReq != gotReq\n%s", cmp.Diff(expectedReq, gotReq, decodeMetadata))
 			}
 		})
 	}

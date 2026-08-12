@@ -8,7 +8,9 @@ import (
 	"github.com/looplj/axonhub/llm"
 )
 
-const PlanVersion uint32 = 4
+// PlanVersion 6 adds typed context-compaction decisions and stable selected
+// union source digests to payload-free conversion evidence.
+const PlanVersion uint32 = 6
 
 var ErrIncompletePlan = errors.New("semantic conversion plan is incomplete")
 
@@ -25,15 +27,17 @@ const (
 type ObjectKind string
 
 const (
-	ObjectToolDefinition ObjectKind = "tool_definition"
-	ObjectToolChoice     ObjectKind = "tool_choice"
-	ObjectToolCall       ObjectKind = "tool_call"
-	ObjectToolResult     ObjectKind = "tool_result"
-	ObjectInputItem      ObjectKind = "input_item"
-	ObjectContentBlock   ObjectKind = "content_block"
-	ObjectProviderData   ObjectKind = "provider_data"
-	ObjectCompaction     ObjectKind = "compaction"
-	ObjectRequestControl ObjectKind = "request_control"
+	ObjectToolDefinition    ObjectKind = "tool_definition"
+	ObjectToolChoice        ObjectKind = "tool_choice"
+	ObjectToolCall          ObjectKind = "tool_call"
+	ObjectToolResult        ObjectKind = "tool_result"
+	ObjectInputItem         ObjectKind = "input_item"
+	ObjectContentBlock      ObjectKind = "content_block"
+	ObjectProviderData      ObjectKind = "provider_data"
+	ObjectCompaction        ObjectKind = "compaction"
+	ObjectContextCompaction ObjectKind = "context_compaction"
+	ObjectRequestControl    ObjectKind = "request_control"
+	ObjectAgentMessage      ObjectKind = "agent_message"
 )
 
 type StrategyID string
@@ -55,6 +59,7 @@ const (
 	StrategySchemaNormalize            StrategyID = "schema_normalization"
 	StrategyOpaqueSidecar              StrategyID = "opaque_sidecar"
 	StrategyCompactAsChat              StrategyID = "compact_as_chat"
+	StrategyAgentMessageLegacyInput    StrategyID = "agent_message_legacy_input"
 	StrategyUnavailable                StrategyID = "unavailable"
 )
 
@@ -85,10 +90,16 @@ type ObjectRef struct {
 type Action struct {
 	Ref             ObjectRef
 	DestinationPath string
-	Kind            ActionKind
-	Strategy        StrategyID
-	Reason          ReasonCode
-	Reversible      bool
+	// SourceType, SemanticClass, RawBytes, and SourceDigest are payload-free
+	// evidence for a semantic decision. They intentionally contain no raw input.
+	SourceType    string
+	SemanticClass string
+	RawBytes      uint32
+	SourceDigest  string
+	Kind          ActionKind
+	Strategy      StrategyID
+	Reason        ReasonCode
+	Reversible    bool
 }
 
 type CapabilityProfile struct {

@@ -37,6 +37,8 @@ func canonicalResponseToAnthropic(response *llm.Response) (*Message, bool, error
 				signature = generateSignature()
 			}
 			message.Content = append(message.Content, MessageContentBlock{Type: "thinking", Thinking: &thinking, Signature: &signature})
+		case llm.ItemKindAgentMessage:
+			return nil, true, fmt.Errorf("canonical output item %d agent_message has no Anthropic output encoding", index)
 		case llm.ItemKindToolCall:
 			if item.ToolCall == nil || item.ToolCall.Kind != llm.ToolKindFunction {
 				return nil, true, fmt.Errorf("canonical output item %d tool call has no Anthropic encoding", index)
@@ -64,6 +66,12 @@ func canonicalResponseToAnthropic(response *llm.Response) (*Message, bool, error
 			}
 			message.Content = append(message.Content, blocks...)
 		case llm.ItemKindUnknown:
+			// Only Anthropic's own opaque block form can remain an Anthropic
+			// response. A Responses future union has behavioral semantics unknown to
+			// this protocol and must not be guessed from its JSON shape.
+			if item.ProtocolHints.SourceFormat != llm.APIFormatAnthropicMessage {
+				return nil, true, fmt.Errorf("canonical output item %d future unknown item has no Anthropic encoding", index)
+			}
 			if item.Unknown == nil || !json.Valid(item.Unknown.Raw) {
 				return nil, true, fmt.Errorf("canonical output item %d unknown payload is invalid", index)
 			}
@@ -72,6 +80,8 @@ func canonicalResponseToAnthropic(response *llm.Response) (*Message, bool, error
 				return nil, true, fmt.Errorf("canonical output item %d unknown payload has no Anthropic block encoding", index)
 			}
 			message.Content = append(message.Content, block)
+		case llm.ItemKindContextCompaction:
+			return nil, true, fmt.Errorf("canonical output item %d context_compaction has no Anthropic encoding", index)
 		default:
 			return nil, true, fmt.Errorf("canonical output item %d kind %q has no Anthropic encoding", index, item.Kind)
 		}

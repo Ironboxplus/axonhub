@@ -19,6 +19,34 @@ const (
 	ResponsesWireProfileLite     ResponsesWireProfile = "responses_lite"
 )
 
+// responsesValidationPhase makes the two contracts explicit. Ingress only
+// rejects malformed known unions before planning; it must not reject a native
+// client representation that canonicalization can safely lower for the final
+// provider profile. FinalWire validates the actual body after that lowering.
+type responsesValidationPhase uint8
+
+const (
+	responsesValidationIngress responsesValidationPhase = iota
+	responsesValidationFinalWire
+)
+
+type agentMessageContentPolicy uint8
+
+const (
+	agentMessageContentStrict agentMessageContentPolicy = iota
+	agentMessageContentOpaqueFuture
+)
+
+// agentMessageIngressPolicyForProfile is an input-wire compatibility decision,
+// not a target capability check. Standard can retain a future child as one
+// opaque outer item; Lite deliberately has a closed ingress child union.
+func agentMessageIngressPolicyForProfile(profile ResponsesWireProfile) agentMessageContentPolicy {
+	if profile == ResponsesWireProfileStandard {
+		return agentMessageContentOpaqueFuture
+	}
+	return agentMessageContentStrict
+}
+
 // WireRepair records a deterministic, provider-profile compatibility repair.
 // It contains structure only; it deliberately never records a sensitive value.
 type WireRepair struct {
@@ -41,6 +69,7 @@ type ResponsesWireValidationError struct {
 	ObjectType string `json:"object_type"`
 	Repairable bool   `json:"repairable"`
 	message    string
+	component  string
 }
 
 func (err *ResponsesWireValidationError) Error() string {
@@ -61,12 +90,15 @@ func (err *ResponsesWireValidationError) SafeDiagnostic() llm.ErrorDiagnostic {
 	if err == nil || err.Code == "" {
 		return llm.ErrorDiagnostic{}
 	}
-	return llm.ErrorDiagnostic{
-		Component:  "outbound_wire_validation",
-		Code:       err.Code,
-		Message:    "Outbound Responses wire validation blocked before provider dispatch.",
-		StatusCode: 400,
+	component := err.component
+	if component == "" {
+		component = "outbound_wire_validation"
 	}
+	message := "Outbound Responses wire validation blocked before provider dispatch."
+	if component == "inbound_wire_validation" {
+		message = "Inbound Responses request validation blocked before provider dispatch."
+	}
+	return llm.ErrorDiagnostic{Component: component, Code: err.Code, Message: message, StatusCode: 400}
 }
 
 // NormalizeAndValidateResponsesRequestBody validates the exact final Responses
@@ -78,8 +110,128 @@ func NormalizeAndValidateResponsesRequestBody(
 	body []byte,
 	profile ResponsesWireProfile,
 ) ([]byte, *ResponsesWireRepairReport, error) {
+	return normalizeAndValidateResponsesRequestBody(body, profile, responsesValidationFinalWire)
+}
+
+// ValidateResponsesIngressRequestBody performs only the target-independent
+// structural checks required before canonical decoding and planning. It does
+// not repair or impose a final provider wire capability constraint.
+func ValidateResponsesIngressRequestBody(body []byte, profile ResponsesWireProfile) error {
+	_, _, err := normalizeAndValidateResponsesRequestBody(body, profile, responsesValidationIngress)
+	return markResponsesIngressValidationError(err)
+}
+
+// validateParsedResponsesIngressRequest applies the ingress-only structural
+// checks to the Request which InboundTransformer has already decoded. It is
+// deliberately narrower than final-wire validation: namespace/tool lowering
+// remains a planner/egress concern. Keeping this validation on the parsed
+// request avoids re-unmarshalling every ordinary input item merely to discover
+// there is no agent_message to inspect.
+func validateParsedResponsesIngressRequest(request *Request, profile ResponsesWireProfile) error {
+	if request == nil || request.Input.Text != nil {
+		return nil
+	}
+	policy := agentMessageIngressPolicyForProfile(profile)
+	for index := range request.Input.Items {
+		item := &request.Input.Items[index]
+		path := fmt.Sprintf("input[%d]", index)
+		if err := validateParsedResponsesStatuslessItem(item, path); err != nil {
+			return err
+		}
+		if item.Type != "agent_message" {
+			// ContextCompaction.EncryptedContent is a *string: the primary JSON
+			// decode already rejects any non-string, non-null value. Other typed
+			// unions are either canonicalized or validated at final egress.
+			continue
+		}
+		if err := validateParsedResponsesAgentMessage(item, path, policy); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateParsedResponsesStatuslessItem(item *Item, path string) error {
+	if item == nil || !responsesItemTypeForbidsStatus(item.Type) || (!item.statusPresent && item.Status == nil) {
+		return nil
+	}
+	return wireValidationError("unsupported_item_status", path+".status", item.Type, false, "status is not permitted for this item type")
+}
+
+// validateParsedResponsesAgentMessage is the allocation-light counterpart of
+// the raw-wire validator. The parser has retained the declared discriminator
+// and the presence of text/encrypted fields as Type/Text/EncryptedContent,
+// which is sufficient to preserve the three-state known-valid,
+// known-malformed, and future-opaque decision. An unknown future child is
+// intentionally checked only after scanning every member, so a later malformed
+// known child can never escape as opaque.
+func validateParsedResponsesAgentMessage(item *Item, path string, policy agentMessageContentPolicy) error {
+	if item == nil || item.Content == nil || item.Content.Text != nil || len(item.Content.Items) == 0 {
+		return wireValidationError("invalid_agent_message", path+".content", "agent_message", false, "content must be a non-empty array")
+	}
+
+	sawFuture := false
+	for index := range item.Content.Items {
+		part := &item.Content.Items[index]
+		partPath := fmt.Sprintf("%s.content[%d]", path, index)
+		switch part.Type {
+		case "input_text":
+			if part.Text == nil || part.EncryptedContent != nil {
+				return wireValidationError("invalid_agent_message_content", partPath, "input_text", false, "input_text requires text and cannot contain encrypted_content")
+			}
+		case "encrypted_content":
+			if part.EncryptedContent == nil || strings.TrimSpace(*part.EncryptedContent) == "" || part.Text != nil {
+				return wireValidationError("invalid_agent_message_content", partPath, "encrypted_content", false, "encrypted_content requires encrypted_content and cannot contain text")
+			}
+		default:
+			// A missing/empty discriminator is malformed rather than future.
+			if part.Type == "" {
+				return wireValidationError("invalid_agent_message_content", partPath, "agent_message", false, "content type is required")
+			}
+			if policy != agentMessageContentOpaqueFuture {
+				return wireValidationError("invalid_agent_message_content", partPath+".type", "agent_message", false, "unsupported content type")
+			}
+			sawFuture = true
+		}
+	}
+	if sawFuture {
+		// The entire outer item will be lowered to behavioral opaque canonical
+		// form later. Applying today’s AgentPath grammar to its same-named
+		// residual fields would incorrectly reject an otherwise forward-safe
+		// same-Responses identity route.
+		return nil
+	}
+	for _, identity := range []struct{ field, value string }{{"author", item.Author}, {"recipient", item.Recipient}} {
+		if strings.TrimSpace(identity.value) == "" || strings.ContainsAny(identity.value, "\r\n") {
+			return wireValidationError("invalid_agent_message", path+"."+identity.field, "agent_message", false, "%s is required and must be a single line", identity.field)
+		}
+		if err := llm.ValidateCodexAgentPath(identity.value); err != nil {
+			return wireValidationError("invalid_agent_message_path", path+"."+identity.field, "agent_message", false, "%s must be a Codex AgentPath", identity.field)
+		}
+	}
+	return nil
+}
+
+func markResponsesIngressValidationError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if wireErr, ok := err.(*ResponsesWireValidationError); ok && wireErr != nil {
+		wireErr.component = "inbound_wire_validation"
+	}
+	return err
+}
+
+func normalizeAndValidateResponsesRequestBody(
+	body []byte,
+	profile ResponsesWireProfile,
+	phase responsesValidationPhase,
+) ([]byte, *ResponsesWireRepairReport, error) {
 	if profile != ResponsesWireProfileStandard && profile != ResponsesWireProfileLite {
 		return nil, nil, wireValidationError("unsupported_wire_profile", "", "request", false, "unknown profile %q", profile)
+	}
+	if phase == responsesValidationIngress {
+		return validateResponsesIngressBody(body, profile)
 	}
 	report := &ResponsesWireRepairReport{}
 	if profile == ResponsesWireProfileStandard {
@@ -121,10 +273,66 @@ func NormalizeAndValidateResponsesRequestBody(
 	return normalized, report, nil
 }
 
+func validateResponsesIngressBody(body []byte, profile ResponsesWireProfile) ([]byte, *ResponsesWireRepairReport, error) {
+	var envelope struct {
+		Input json.RawMessage `json:"input"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return nil, nil, wireValidationError("invalid_request_body", "", "request", false, "must be a JSON object")
+	}
+	if err := validateResponsesIngressInput(envelope.Input, profile); err != nil {
+		return nil, nil, err
+	}
+	return body, &ResponsesWireRepairReport{}, nil
+}
+
+func validateResponsesIngressInput(raw json.RawMessage, profile ResponsesWireProfile) error {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || trimmed[0] != '[' {
+		return nil
+	}
+	var items []json.RawMessage
+	if err := json.Unmarshal(trimmed, &items); err != nil {
+		return wireValidationError("invalid_input", "input", "input", false, "must be an array")
+	}
+	for index := range items {
+		path := fmt.Sprintf("input[%d]", index)
+		var item map[string]json.RawMessage
+		if err := json.Unmarshal(items[index], &item); err != nil || item == nil {
+			return wireValidationError("invalid_input_item", path, "input", false, "must be an object")
+		}
+		itemType, _ := rawJSONString(item["type"])
+		if err := validateResponsesStatuslessWireItem(item, itemType, path); err != nil {
+			return err
+		}
+		switch itemType {
+		case "agent_message":
+			if err := validateResponsesAgentMessageForPolicy(item, path, agentMessageIngressPolicyForProfile(profile)); err != nil {
+				return err
+			}
+		case "context_compaction":
+			if err := validateResponsesContextCompaction(item["encrypted_content"], path); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 type standardResponsesWireEnvelope struct {
 	Tools      json.RawMessage `json:"tools"`
 	Input      json.RawMessage `json:"input"`
 	ToolChoice json.RawMessage `json:"tool_choice"`
+}
+
+type standardResponsesWireInput struct {
+	Type             string          `json:"type"`
+	Tools            json.RawMessage `json:"tools"`
+	Author           string          `json:"author"`
+	Recipient        string          `json:"recipient"`
+	Content          json.RawMessage `json:"content"`
+	EncryptedContent json.RawMessage `json:"encrypted_content"`
+	Status           json.RawMessage `json:"status"`
 }
 
 type standardResponsesWireTool struct {
@@ -159,30 +367,41 @@ func validateStandardResponsesInput(raw json.RawMessage) error {
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || trimmed[0] != '[' {
 		return nil
 	}
-	var items []struct {
-		Type  string            `json:"type"`
-		Tools []json.RawMessage `json:"tools"`
-	}
+	// Keep the standard profile's common-message path allocation-light. The
+	// typed agent_message validator only needs its three declared fields, while
+	// ordinary input items retain the established type/tools fast path.
+	var items []standardResponsesWireInput
 	if err := json.Unmarshal(trimmed, &items); err != nil {
 		return wireValidationError("invalid_input", "input", "input", false, "must be an array")
 	}
 	triggerIndex := -1
 	for index := range items {
-		if items[index].Type == "compaction_trigger" {
+		path := fmt.Sprintf("input[%d]", index)
+		itemType := items[index].Type
+		if err := validateResponsesStatuslessRaw(itemType, items[index].Status, len(items[index].Status) > 0, path); err != nil {
+			return err
+		}
+		if itemType == "compaction_trigger" {
 			if triggerIndex >= 0 {
-				return wireValidationError("invalid_compaction_placement", fmt.Sprintf("input[%d]", index), "compaction_trigger", false, "multiple compaction_trigger items")
+				return wireValidationError("invalid_compaction_placement", path, "compaction_trigger", false, "multiple compaction_trigger items")
 			}
 			triggerIndex = index
 		}
-		if items[index].Type == "additional_tools" {
+		if itemType == "additional_tools" {
 			if len(items[index].Tools) == 0 {
-				return wireValidationError("empty_tool_declaration", fmt.Sprintf("input[%d].tools", index), "additional_tools", false, "tools must be a non-empty array")
+				return wireValidationError("empty_tool_declaration", path+".tools", "additional_tools", false, "tools must be a non-empty array")
 			}
-			encoded, err := json.Marshal(items[index].Tools)
-			if err != nil {
-				return wireValidationError("invalid_tool_array", fmt.Sprintf("input[%d].tools", index), "additional_tools", false, "marshal tools: %v", err)
+			if err := validateStandardResponsesToolArray(items[index].Tools, path+".tools", true); err != nil {
+				return err
 			}
-			if err := validateStandardResponsesToolArray(encoded, fmt.Sprintf("input[%d].tools", index), true); err != nil {
+		}
+		if itemType == "agent_message" {
+			if err := validateResponsesAgentMessageFieldsForPolicy(items[index].Author, items[index].Recipient, items[index].Content, path, agentMessageContentOpaqueFuture); err != nil {
+				return err
+			}
+		}
+		if itemType == "context_compaction" {
+			if err := validateResponsesContextCompaction(items[index].EncryptedContent, path); err != nil {
 				return err
 			}
 		}
@@ -287,11 +506,24 @@ func normalizeResponsesInput(
 			return nil, wireValidationError("invalid_input_item", path, "input", false, "must be an object")
 		}
 		itemType, _ := rawJSONString(item["type"])
+		if err := validateResponsesStatuslessWireItem(item, itemType, path); err != nil {
+			return nil, err
+		}
 		if itemType == "compaction_trigger" {
 			if triggerIndex >= 0 {
 				return nil, wireValidationError("invalid_compaction_placement", path, "compaction_trigger", false, "multiple compaction_trigger items")
 			}
 			triggerIndex = index
+		}
+		if itemType == "agent_message" {
+			if err := validateResponsesAgentMessage(item, path); err != nil {
+				return nil, err
+			}
+		}
+		if itemType == "context_compaction" {
+			if err := validateResponsesContextCompaction(item["encrypted_content"], path); err != nil {
+				return nil, err
+			}
 		}
 		if itemType != "additional_tools" {
 			continue
@@ -319,6 +551,132 @@ func normalizeResponsesInput(
 		return nil, wireValidationError("invalid_input", "input", "input", false, "marshal input: %v", err)
 	}
 	return normalized, nil
+}
+
+func validateResponsesStatuslessWireItem(item map[string]json.RawMessage, itemType, path string) error {
+	status, present := item["status"]
+	return validateResponsesStatuslessRaw(itemType, status, present, path)
+}
+
+func validateResponsesStatuslessRaw(itemType string, status json.RawMessage, present bool, path string) error {
+	if !responsesItemTypeForbidsStatus(itemType) || !present {
+		return nil
+	}
+	return wireValidationError("unsupported_item_status", path+".status", itemType, false, "status is not permitted for this item type")
+}
+
+func responsesItemTypeForbidsStatus(itemType string) bool {
+	switch itemType {
+	case "agent_message", "compaction", "compaction_summary", "context_compaction":
+		return true
+	default:
+		return false
+	}
+}
+
+// validateResponsesAgentMessage is intentionally strict about the typed union
+// while allowing unknown residual fields on known members. That preserves the
+// identity route without guessing that a future Responses item is an agent
+// message or accidentally treating encrypted data as plain text.
+func validateResponsesAgentMessage(item map[string]json.RawMessage, path string) error {
+	return validateResponsesAgentMessageForPolicy(item, path, agentMessageContentStrict)
+}
+
+func validateResponsesAgentMessageForPolicy(item map[string]json.RawMessage, path string, policy agentMessageContentPolicy) error {
+	author, authorOK := rawJSONString(item["author"])
+	recipient, recipientOK := rawJSONString(item["recipient"])
+	if !authorOK {
+		author = ""
+	}
+	if !recipientOK {
+		recipient = ""
+	}
+	return validateResponsesAgentMessageFieldsForPolicy(author, recipient, item["content"], path, policy)
+}
+
+func validateResponsesAgentMessageFields(author, recipient string, rawContent json.RawMessage, path string) error {
+	return validateResponsesAgentMessageFieldsForPolicy(author, recipient, rawContent, path, agentMessageContentOpaqueFuture)
+}
+
+func validateResponsesAgentMessageFieldsForPolicy(author, recipient string, rawContent json.RawMessage, path string, policy agentMessageContentPolicy) error {
+	future, err := validateResponsesAgentMessageContent(rawContent, path, policy)
+	if err != nil || future {
+		return err
+	}
+	for _, identity := range []struct{ field, value string }{{"author", author}, {"recipient", recipient}} {
+		if strings.TrimSpace(identity.value) == "" || strings.ContainsAny(identity.value, "\r\n") {
+			return wireValidationError("invalid_agent_message", path+"."+identity.field, "agent_message", false, "%s is required and must be a single line", identity.field)
+		}
+		if err := llm.ValidateCodexAgentPath(identity.value); err != nil {
+			return wireValidationError("invalid_agent_message_path", path+"."+identity.field, "agent_message", false, "%s must be a Codex AgentPath", identity.field)
+		}
+	}
+	return nil
+}
+
+// validateResponsesAgentMessageContent is the one closed-union classifier for
+// the nested member. A future discriminator makes the *outer* agent_message
+// opaque on Standard; it is not a typed agent message, so today’s AgentPath
+// grammar must not be applied merely because the raw object has matching keys.
+func validateResponsesAgentMessageContent(rawContent json.RawMessage, path string, policy agentMessageContentPolicy) (future bool, err error) {
+	if len(rawContent) == 0 {
+		return false, wireValidationError("invalid_agent_message", path+".content", "agent_message", false, "content is required")
+	}
+	var content []json.RawMessage
+	if err := json.Unmarshal(rawContent, &content); err != nil || len(content) == 0 {
+		return false, wireValidationError("invalid_agent_message", path+".content", "agent_message", false, "content must be a non-empty array")
+	}
+	sawFuture := false
+	for index := range content {
+		partPath := fmt.Sprintf("%s.content[%d]", path, index)
+		var part map[string]json.RawMessage
+		if err := json.Unmarshal(content[index], &part); err != nil || part == nil {
+			return false, wireValidationError("invalid_agent_message_content", partPath, "agent_message", false, "content item must be an object")
+		}
+		partType, ok := rawJSONString(part["type"])
+		if !ok {
+			return false, wireValidationError("invalid_agent_message_content", partPath, "agent_message", false, "content type is required")
+		}
+		text, textPresent := rawJSONString(part["text"])
+		encrypted, encryptedPresent := rawJSONString(part["encrypted_content"])
+		switch partType {
+		case "input_text":
+			if !textPresent || encryptedPresent {
+				return false, wireValidationError("invalid_agent_message_content", partPath, "input_text", false, "input_text requires text and cannot contain encrypted_content")
+			}
+			_ = text
+		case "encrypted_content":
+			if !encryptedPresent || strings.TrimSpace(encrypted) == "" || textPresent {
+				return false, wireValidationError("invalid_agent_message_content", partPath, "encrypted_content", false, "encrypted_content requires encrypted_content and cannot contain text")
+			}
+		default:
+			// Standard Responses routes preserve a future agent_message content
+			// discriminator as one behavioral opaque item. Lite has an explicit
+			// strict profile and performs its own closed-union validation below.
+			if policy == agentMessageContentOpaqueFuture {
+				sawFuture = true
+				continue
+			}
+			return false, wireValidationError("invalid_agent_message_content", partPath+".type", "agent_message", false, "unsupported content type")
+		}
+	}
+	return sawFuture, nil
+}
+
+// validateResponsesContextCompaction keeps the official typed union narrow
+// without requiring encrypted_content: the Responses contract permits an ID
+// and/or opaque checkpoint content. Null is preserved by identity routes;
+// any non-null value must be a JSON string, never an inferred nested shape.
+func validateResponsesContextCompaction(rawEncryptedContent json.RawMessage, path string) error {
+	trimmed := bytes.TrimSpace(rawEncryptedContent)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var value string
+	if err := json.Unmarshal(trimmed, &value); err != nil {
+		return wireValidationError("invalid_context_compaction", path+".encrypted_content", "context_compaction", false, "encrypted_content must be a string or null")
+	}
+	return nil
 }
 
 func normalizeResponsesToolArray(

@@ -248,7 +248,7 @@ func isStructurallyRepresentedInputItem(itemType string) bool {
 		"local_shell_call_output", "computer_call", "computer_call_output", "file_search_call", "code_interpreter_call",
 		"shell_call", "shell_call_output", "apply_patch_call", "apply_patch_call_output",
 		"tool_search_call", "tool_search_output", "reasoning",
-		"compaction", "compaction_summary", "compaction_trigger", "additional_tools":
+		"compaction", "compaction_summary", "context_compaction", "compaction_trigger", "additional_tools":
 		return true
 	default:
 		return false

@@ -144,7 +144,7 @@ func (o *Outbound) TransformResponse(ctx context.Context, response *httpclient.R
 		session.continuation = o.continuation
 	}
 	unified = RestoreResponseContext(ctx, unified, session)
-	return restoreCompactEmulation(unified, session), nil
+	return restoreCompactEmulation(unified, session)
 }
 
 func (o *Outbound) TransformStream(

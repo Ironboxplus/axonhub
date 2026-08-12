@@ -65,6 +65,7 @@ type Session struct {
 	terminalEvent         atomic.Value
 	traceEnabled          bool
 	debugMu               sync.Mutex
+	outputBlockers        map[string]struct{}
 	compactEmulation      *compactEmulationState
 }
 
@@ -77,6 +78,7 @@ func newSession(plan *Plan, request *llm.Request, traceEnabled bool) *Session {
 		occupiedNames:         make(map[string]struct{}),
 		schemaRestorations:    make(map[toolWireIdentityKey]schemaRestoration),
 		providerArgumentBytes: make(map[providerArgumentRecordKey]json.RawMessage),
+		outputBlockers:        make(map[string]struct{}),
 		traceEnabled:          traceEnabled,
 	}
 	if request != nil {
@@ -358,4 +360,39 @@ func (s *Session) recordDebug(
 	if trace != nil {
 		trace.Append(evidence, objectRefBytes(ref))
 	}
+}
+
+// recordOutputBlocker appends one payload-free critical runtime action for an
+// output union that cannot be shown to a non-Responses client. The internal
+// dedup key is a structural stream identity only; no ID or payload is placed
+// into the persisted trace.
+func (s *Session) recordOutputBlocker(
+	direction llm.ConversionDirection,
+	ref ObjectRef,
+	item *llm.Item,
+	semanticClass string,
+	reason ReasonCode,
+	dedupKey string,
+) {
+	if s == nil || s.plan == nil || dedupKey == "" {
+		return
+	}
+	key := string(direction) + ":" + dedupKey
+	s.debugMu.Lock()
+	if s.outputBlockers == nil {
+		s.outputBlockers = make(map[string]struct{})
+	}
+	if _, exists := s.outputBlockers[key]; exists {
+		s.debugMu.Unlock()
+		return
+	}
+	s.outputBlockers[key] = struct{}{}
+	evidence := runtimeOutputBlockerEvidence(direction, ref, item, semanticClass, reason)
+	trace := s.plan.Debug
+	if trace == nil {
+		trace = llm.NewRequiredConversionDebugTrace(1)
+		s.plan.Debug = trace
+	}
+	s.debugMu.Unlock()
+	trace.Append(evidence, objectRefBytes(ref))
 }

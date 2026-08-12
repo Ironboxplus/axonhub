@@ -41,6 +41,12 @@ func (p *Planner) preparePlan(request *llm.Request, targetFormat llm.APIFormat, 
 	}
 	plan, err := p.plan(prepared, targetFormat, trace)
 	appendRequestControlActions(plan, adjustments)
+	if err != nil && plan != nil {
+		var planErr *ConversionPlanError
+		if !errors.As(err, &planErr) {
+			err = &ConversionPlanError{Cause: err, Plan: plan}
+		}
+	}
 	return prepared, plan, err
 }
 
@@ -101,14 +107,15 @@ func (p *Planner) requestControlFailurePlan(request *llm.Request, targetFormat l
 	if request != nil {
 		plan.Source = request.APIFormat
 	}
-	plan.Actions = []Action{{
-		Ref: ObjectRef{
-			Kind: ObjectRequestControl, ToolIndex: -1, ItemIndex: itemIndex,
-			ContentIndex: -1, MessageIndex: -1, ToolCallIndex: -1,
-		},
-		Kind: ActionUnknown, Strategy: StrategyRequestControlMultiplicity,
-		Reason: ReasonDuplicateRequestControl,
-	}}
+	action := itemEvidenceAction(nil, itemIndex, ObjectRequestControl, "request_control", "request_control")
+	if request != nil && itemIndex >= 0 && itemIndex < len(request.Input) {
+		item := &request.Input[itemIndex]
+		if item.Kind == llm.ItemKindCompactionTrigger {
+			action = itemEvidenceAction(item, itemIndex, ObjectRequestControl, "compaction_trigger", "compaction_trigger_request_control")
+		}
+	}
+	action.Kind, action.Strategy, action.Reason = ActionUnknown, StrategyRequestControlMultiplicity, ReasonDuplicateRequestControl
+	plan.Actions = []Action{action}
 	plan.Summary = summarizePlan(plan.Source, profile, plan.Actions, startedAt)
 	return plan
 }
@@ -265,14 +272,34 @@ func (p *Planner) plan(request *llm.Request, targetFormat llm.APIFormat, trace b
 				}
 			case llm.ItemKindReasoning:
 				plan.Actions = append(plan.Actions, actionForReasoningItem(request.APIFormat, profile.APIFormat, itemIndex))
+			case llm.ItemKindAgentMessage:
+				plan.Actions = append(plan.Actions, actionForAgentMessage(request.APIFormat, profile.APIFormat, item, itemIndex))
 			case llm.ItemKindHostedCall:
 				plan.Actions = append(plan.Actions, actionForHostedCall(request.APIFormat, profile, item, itemIndex))
-			case llm.ItemKindCompaction, llm.ItemKindCompactionTrigger:
+			case llm.ItemKindCompaction:
+				action := itemEvidenceAction(item, itemIndex, ObjectCompaction, "compaction", "compaction_checkpoint")
 				if request.APIFormat == profile.APIFormat && profile.APIFormat == llm.APIFormatOpenAIResponse {
-					plan.Actions = append(plan.Actions, nativeItemAction(itemIndex))
+					action.Kind, action.Strategy, action.Reason, action.Reversible = ActionNative, StrategyNative, ReasonTargetNative, true
 				} else {
-					plan.Actions = append(plan.Actions, unknownItemAction(itemIndex, ReasonProviderPrivate))
+					action.Kind, action.Strategy, action.Reason = ActionUnknown, StrategyUnavailable, ReasonProviderPrivate
 				}
+				plan.Actions = append(plan.Actions, action)
+			case llm.ItemKindContextCompaction:
+				action := itemEvidenceAction(item, itemIndex, ObjectContextCompaction, "context_compaction", "context_compaction_checkpoint")
+				if request.APIFormat == profile.APIFormat && profile.APIFormat == llm.APIFormatOpenAIResponse {
+					action.Kind, action.Strategy, action.Reason, action.Reversible = ActionNative, StrategyNative, ReasonTargetNative, true
+				} else {
+					action.Kind, action.Strategy, action.Reason = ActionUnknown, StrategyUnavailable, ReasonProviderPrivate
+				}
+				plan.Actions = append(plan.Actions, action)
+			case llm.ItemKindCompactionTrigger:
+				action := itemEvidenceAction(item, itemIndex, ObjectRequestControl, "compaction_trigger", "compaction_trigger_request_control")
+				if request.APIFormat == profile.APIFormat && profile.APIFormat == llm.APIFormatOpenAIResponse {
+					action.Kind, action.Strategy, action.Reason, action.Reversible = ActionNative, StrategyNative, ReasonTargetNative, true
+				} else {
+					action.Kind, action.Strategy, action.Reason = ActionUnknown, StrategyUnavailable, ReasonProviderPrivate
+				}
+				plan.Actions = append(plan.Actions, action)
 			case llm.ItemKindToolDeclaration:
 				if request.APIFormat == profile.APIFormat && profile.APIFormat == llm.APIFormatOpenAIResponse {
 					plan.Actions = append(plan.Actions, nativeItemAction(itemIndex))
@@ -298,14 +325,13 @@ func (p *Planner) plan(request *llm.Request, targetFormat llm.APIFormat, trace b
 					plan.Actions = append(plan.Actions, unknownItemAction(itemIndex, ReasonNoStrategy))
 				}
 			case llm.ItemKindUnknown:
+				action := itemEvidenceAction(item, itemIndex, ObjectInputItem, "unknown", unknownItemSemanticClass(item))
 				if request.APIFormat == profile.APIFormat {
-					plan.Actions = append(plan.Actions, Action{
-						Ref:  ObjectRef{Kind: ObjectInputItem, ToolIndex: -1, ItemIndex: itemIndex, ContentIndex: -1, MessageIndex: -1, ToolCallIndex: -1},
-						Kind: ActionOpaque, Strategy: StrategyOpaqueSidecar, Reason: ReasonSameProtocolOpaque, Reversible: true,
-					})
+					action.Kind, action.Strategy, action.Reason, action.Reversible = ActionOpaque, StrategyOpaqueSidecar, ReasonSameProtocolOpaque, true
 				} else {
-					plan.Actions = append(plan.Actions, unknownItemAction(itemIndex, ReasonNoStrategy))
+					action.Kind, action.Strategy, action.Reason = ActionUnknown, StrategyUnavailable, ReasonNoStrategy
 				}
+				plan.Actions = append(plan.Actions, action)
 			}
 		}
 	} else {
@@ -353,6 +379,54 @@ func (p *Planner) plan(request *llm.Request, targetFormat llm.APIFormat, trace b
 	return plan, plan.Validate()
 }
 
+func actionForAgentMessage(source, target llm.APIFormat, item *llm.Item, itemIndex int) Action {
+	action := itemEvidenceAction(item, itemIndex, ObjectAgentMessage, "agent_message", "agent_message")
+	if item == nil || item.AgentMessage == nil {
+		action.Kind, action.Strategy, action.Reason = ActionUnknown, StrategyUnavailable, ReasonNoStrategy
+		action.SemanticClass = "agent_message_invalid"
+		return action
+	}
+	if source == target && target == llm.APIFormatOpenAIResponse {
+		action.Kind, action.Strategy, action.Reason, action.Reversible = ActionNative, StrategyNative, ReasonTargetNative, true
+		return action
+	}
+	if _, err := item.AgentMessage.LegacyInterAgentMessageJSON(); err != nil {
+		action.Kind, action.Strategy, action.Reason = ActionUnknown, StrategyUnavailable, ReasonProviderPrivate
+		action.SemanticClass = agentMessageSemanticClass(item.AgentMessage)
+		return action
+	}
+	// The legacy JSON adds trigger_turn because typed Responses agent_message
+	// has no equivalent field. The lowering is intentionally lossy.
+	action.Kind, action.Strategy, action.Reason, action.Reversible = ActionLower, StrategyAgentMessageLegacyInput, ReasonSemanticProjection, false
+	action.SemanticClass = "agent_message_plaintext"
+	return action
+}
+
+func agentMessageSemanticClass(message *llm.AgentMessage) string {
+	if message == nil {
+		return "agent_message_invalid"
+	}
+	plaintext, encrypted := false, false
+	for index := range message.Content {
+		switch message.Content[index].Kind {
+		case llm.AgentMessageContentInputText:
+			plaintext = true
+		case llm.AgentMessageContentEncryptedContent:
+			encrypted = true
+		}
+	}
+	switch {
+	case encrypted && plaintext:
+		return "agent_message_mixed"
+	case encrypted:
+		return "agent_message_encrypted"
+	case plaintext:
+		return "agent_message_plaintext"
+	default:
+		return "agent_message_invalid"
+	}
+}
+
 func actionForCompactRequest(request *llm.Request, profile CapabilityProfile) Action {
 	ref := ObjectRef{
 		Kind: ObjectCompaction, ToolIndex: -1, ItemIndex: -1, ContentIndex: -1,
@@ -386,6 +460,78 @@ func unknownItemAction(itemIndex int, reason ReasonCode) Action {
 		Ref:  ObjectRef{Kind: ObjectInputItem, ToolIndex: -1, ItemIndex: itemIndex, ContentIndex: -1, MessageIndex: -1, ToolCallIndex: -1},
 		Kind: ActionUnknown, Strategy: StrategyUnavailable, Reason: reason,
 	}
+}
+
+// itemEvidenceAction constructs an item-level action with structural identity
+// and payload-free source evidence. It never reads Unknown.Raw or any content
+// payload: provider/UI evidence can identify the blocked union without turning
+// source data into a persistence or log surface.
+func itemEvidenceAction(item *llm.Item, itemIndex int, kind ObjectKind, fallbackSourceType, semanticClass string) Action {
+	action := Action{
+		Ref:        ObjectRef{Kind: kind, ToolIndex: -1, ItemIndex: itemIndex, ContentIndex: -1, MessageIndex: -1, ToolCallIndex: -1},
+		SourceType: itemEvidenceSourceType(item, fallbackSourceType), SemanticClass: semanticClass,
+	}
+	if item != nil {
+		action.RawBytes = item.ProtocolHints.SourceBytes
+		action.SourceDigest = safeEvidenceSourceDigest(item.ProtocolHints.SourceDigest)
+	}
+	return action
+}
+
+// safeEvidenceSourceDigest accepts only the fixed SHA-256 representation that
+// the Responses boundary emits. A canonical caller can construct Items, so
+// trace evidence must not blindly persist a forged free-form digest value.
+func safeEvidenceSourceDigest(value string) string {
+	if len(value) != 64 {
+		return ""
+	}
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return ""
+		}
+	}
+	return value
+}
+
+func itemEvidenceSourceType(item *llm.Item, fallback string) string {
+	if item != nil {
+		if safeEvidenceSourceType(item.ProtocolHints.SourceType) {
+			return item.ProtocolHints.SourceType
+		}
+		if item.Unknown != nil && safeEvidenceSourceType(item.Unknown.Type) {
+			return item.Unknown.Type
+		}
+	}
+	if safeEvidenceSourceType(fallback) {
+		return fallback
+	}
+	return "unknown"
+}
+
+// safeEvidenceSourceType matches the compact identifier grammar expected by
+// Octopus evidence consumers. Source wire identity remains untouched; only the
+// copied evidence label is bounded so a future provider discriminator cannot
+// become an unbounded or control-character-bearing UI/persistence value.
+func safeEvidenceSourceType(value string) bool {
+	if len(value) == 0 || len(value) > 96 {
+		return false
+	}
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		if (character < 'a' || character > 'z') && (character < '0' || character > '9') &&
+			character != '_' && character != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func unknownItemSemanticClass(item *llm.Item) string {
+	if item != nil && item.Unknown != nil && item.Unknown.Behavioral {
+		return "future_unknown_behavioral"
+	}
+	return "future_unknown_nonbehavioral"
 }
 
 func actionForContentBlock(block *llm.ContentBlock, source, target llm.APIFormat, ref ObjectRef) Action {

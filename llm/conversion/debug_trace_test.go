@@ -2,6 +2,9 @@ package conversion
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/looplj/axonhub/llm"
@@ -222,6 +225,102 @@ func TestConversionRestoreMissLazilyCreatesRequiredEvidence(t *testing.T) {
 		action.Stage != llm.ConversionStageResponseRestore || action.Result != llm.ConversionResultRestoreMiss ||
 		action.Severity != llm.ConversionSeverityCritical {
 		t.Fatalf("restore miss evidence is not actionable: %#v", action)
+	}
+}
+
+func TestResponseOutputBlockersCarrySelectedEvidenceAndStreamsDeduplicateSafely(t *testing.T) {
+	t.Parallel()
+	raw := []byte(`{ "type":"future_behavior", "secret":"PRIVATE" }`)
+	digest := sha256.Sum256(raw)
+	blocked := llm.Item{
+		Kind:          llm.ItemKindUnknown,
+		Unknown:       &llm.UnknownItem{Type: "future_behavior", Raw: append(json.RawMessage(nil), raw...), Behavioral: true},
+		ProtocolHints: llm.ProtocolHints{SourceFormat: llm.APIFormatOpenAIResponse, SourceType: "future_behavior", SourceBytes: uint32(len(raw)), SourceDigest: fmt.Sprintf("%x", digest)},
+	}
+	session := &Session{plan: &Plan{Source: llm.APIFormatOpenAIChatCompletion, Target: CapabilityProfile{APIFormat: llm.APIFormatOpenAIResponse}}, outputBlockers: make(map[string]struct{})}
+	response := RestoreResponse(&llm.Response{Output: []llm.Item{blocked}}, session)
+	if response == nil {
+		t.Fatal("restore response returned nil")
+	}
+	trace := session.DebugTrace()
+	if trace == nil || len(trace.Actions) != 1 {
+		t.Fatalf("response blocker trace=%#v", trace)
+	}
+	assertOutputBlockerEvidence(t, trace.Actions[0], llm.ConversionDirectionResponse, "output[0]", "future_behavior", "future_unknown_behavioral", uint32(len(raw)), fmt.Sprintf("%x", digest))
+
+	streamSession := &Session{plan: &Plan{Source: llm.APIFormatOpenAIChatCompletion, Target: CapabilityProfile{APIFormat: llm.APIFormatOpenAIResponse}}, outputBlockers: make(map[string]struct{})}
+	index := 2
+	ref := llm.ItemRef{ItemID: "same-item", OutputIndex: &index}
+	stream := &llm.Response{Events: []llm.Event{
+		{Kind: llm.EventKindItemAdded, Sequence: 1, ItemRef: ref, Snapshot: cloneOutputBlockerItem(&blocked)},
+		{Kind: llm.EventKindItemDone, Sequence: 2, ItemRef: ref, Snapshot: cloneOutputBlockerItem(&blocked)},
+	}}
+	newStreamRestorer(streamSession).restore(stream)
+	trace = streamSession.DebugTrace()
+	if trace == nil || len(trace.Actions) != 1 {
+		t.Fatalf("stream paired blocker trace=%#v", trace)
+	}
+	assertOutputBlockerEvidence(t, trace.Actions[0], llm.ConversionDirectionStream, "output[2]", "future_behavior", "future_unknown_behavioral", uint32(len(raw)), fmt.Sprintf("%x", digest))
+
+	malformedSession := &Session{plan: &Plan{Source: llm.APIFormatOpenAIChatCompletion, Target: CapabilityProfile{APIFormat: llm.APIFormatOpenAIResponse}}, outputBlockers: make(map[string]struct{})}
+	malformed := &llm.Response{Events: []llm.Event{
+		{Kind: llm.EventKindItemAdded, Sequence: 11, ItemRef: llm.ItemRef{}, Snapshot: cloneOutputBlockerItem(&blocked)},
+		{Kind: llm.EventKindItemAdded, Sequence: 12, ItemRef: llm.ItemRef{}, Snapshot: cloneOutputBlockerItem(&blocked)},
+	}}
+	newStreamRestorer(malformedSession).restore(malformed)
+	trace = malformedSession.DebugTrace()
+	if trace == nil || len(trace.Actions) != 2 {
+		t.Fatalf("malformed stream blockers collided: %#v", trace)
+	}
+}
+
+func TestResponsesProviderOutputBlockerRouteIsDirectional(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name   string
+		source llm.APIFormat
+		target llm.APIFormat
+		want   bool
+	}{
+		{name: "chat client through Responses provider", source: llm.APIFormatOpenAIChatCompletion, target: llm.APIFormatOpenAIResponse, want: true},
+		{name: "Anthropic client through Responses provider", source: llm.APIFormatAnthropicMessage, target: llm.APIFormatOpenAIResponse, want: true},
+		{name: "Responses identity", source: llm.APIFormatOpenAIResponse, target: llm.APIFormatOpenAIResponse},
+		{name: "Responses client through Chat provider", source: llm.APIFormatOpenAIResponse, target: llm.APIFormatOpenAIChatCompletion},
+		{name: "Chat client through Anthropic provider", source: llm.APIFormatOpenAIChatCompletion, target: llm.APIFormatAnthropicMessage},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			session := &Session{plan: &Plan{Source: test.source, Target: CapabilityProfile{APIFormat: test.target}}}
+			if got := shouldRecordResponsesProviderOutputBlocker(session); got != test.want {
+				t.Fatalf("source=%s target=%s blocker=%v, want %v", test.source, test.target, got, test.want)
+			}
+		})
+	}
+}
+
+func cloneOutputBlockerItem(item *llm.Item) *llm.Item {
+	clone := *item
+	if item.Unknown != nil {
+		unknown := *item.Unknown
+		unknown.Raw = append(json.RawMessage(nil), item.Unknown.Raw...)
+		clone.Unknown = &unknown
+	}
+	return &clone
+}
+
+func assertOutputBlockerEvidence(
+	t *testing.T,
+	action llm.ConversionActionTrace,
+	direction llm.ConversionDirection,
+	objectID, sourceType, semantic string,
+	rawBytes uint32,
+	digest string,
+) {
+	t.Helper()
+	if action.Direction != direction || action.ObjectID != objectID || action.FieldPath != objectID || action.Action != string(ActionUnknown) ||
+		action.Result != llm.ConversionResultUnknown || action.Severity != llm.ConversionSeverityCritical || action.Reversible ||
+		action.SourceType != sourceType || action.SemanticClass != semantic || action.RawBytes != rawBytes || action.SourceDigest != digest {
+		t.Fatalf("output blocker evidence=%#v", action)
 	}
 }
 

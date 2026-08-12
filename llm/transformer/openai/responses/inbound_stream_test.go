@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/require"
 
@@ -160,10 +161,13 @@ var ignoreFields = cmp.FilterPath(func(p cmp.Path) bool {
 	// Ignore dynamic fields that are generated at runtime
 	if sf, ok := p.Last().(cmp.StructField); ok {
 		switch sf.Name() {
-		case "ID", "ItemID", "Obfuscation", "Logprobs", "Response", "Residual":
+		case "ID", "ItemID", "Obfuscation", "Logprobs", "Response", "Residual", "ItemRaw":
 			// This legacy Chat -> Responses fixture intentionally ignores provider-
-			// synthesized logprobs/obfuscation. Residual identity itself is covered
-			// by the canonical Responses -> Responses stream round-trip tests.
+			// synthesized logprobs/obfuscation and decoder-only raw snapshots. The
+			// source fixture has dynamic generated item IDs, so ItemRaw cannot be a
+			// semantic equality field here; wire IDs are still checked below for
+			// presence and format. Residual/raw identity itself is covered by the
+			// canonical Responses -> Responses stream round-trip tests.
 			return true
 		}
 	}
@@ -235,6 +239,26 @@ func TestInboundTransformer_StreamTransformation_WithTestData(t *testing.T) {
 
 			// Verify event count
 			require.Equal(t, len(expectedEvents), len(actualEvents), "Event count should match expected")
+			// ItemRaw is deliberately excluded from the legacy semantic fixture
+			// comparison below, because it is a private decoder snapshot containing
+			// dynamically generated IDs. Keep an explicit wire-level check here so
+			// that exclusion cannot hide missing, empty, or disconnected output-item
+			// identifiers or broken item_id linkage in the actual SSE sequence.
+			seenOutputItemIDs := make(map[string]struct{})
+			for index := range actualEvents {
+				event := actualEvents[index]
+				switch event.Type {
+				case StreamEventTypeOutputItemAdded, StreamEventTypeOutputItemDone:
+					require.NotNilf(t, event.Item, "event %d %s requires item", index, event.Type)
+					require.NotEmptyf(t, event.Item.ID, "event %d %s requires item.id", index, event.Type)
+					seenOutputItemIDs[event.Item.ID] = struct{}{}
+				}
+				if event.ItemID != nil {
+					require.NotEmptyf(t, *event.ItemID, "event %d %s has an empty item_id", index, event.Type)
+					_, exists := seenOutputItemIDs[*event.ItemID]
+					require.Truef(t, exists, "event %d %s item_id %q has no prior output item", index, event.Type, *event.ItemID)
+				}
+			}
 
 			for i, expectedEvent := range expectedEvents {
 				var expected StreamEvent
@@ -244,8 +268,9 @@ func TestInboundTransformer_StreamTransformation_WithTestData(t *testing.T) {
 
 				actual := actualEvents[i]
 
-				if !xtest.Equal(expected, actual, ignoreFields) {
-					t.Fatalf("event %d mismatch:\n%s", i, cmp.Diff(expected, actual, ignoreFields))
+				decodeMetadata := cmpopts.IgnoreUnexported(Item{})
+				if !xtest.Equal(expected, actual, ignoreFields, decodeMetadata) {
+					t.Fatalf("event %d mismatch:\n%s", i, cmp.Diff(expected, actual, ignoreFields, decodeMetadata))
 				}
 			}
 
@@ -277,9 +302,10 @@ func TestInboundTransformer_StreamTransformation_WithTestData(t *testing.T) {
 					return false
 				}, cmp.Ignore())
 
-				if !xtest.Equal(expectedResponse, *lastEvent.Response, responseIgnoreFields) {
+				decodeMetadata := cmpopts.IgnoreUnexported(Item{})
+				if !xtest.Equal(expectedResponse, *lastEvent.Response, responseIgnoreFields, decodeMetadata) {
 					t.Fatalf("response.completed response mismatch:\n%s",
-						cmp.Diff(expectedResponse, *lastEvent.Response, responseIgnoreFields))
+						cmp.Diff(expectedResponse, *lastEvent.Response, responseIgnoreFields, decodeMetadata))
 				}
 			}
 		})

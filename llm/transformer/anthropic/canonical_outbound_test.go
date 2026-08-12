@@ -38,6 +38,30 @@ func TestCanonicalAnthropicRequestGroupsAdjacentTurnBlocksWithoutReordering(t *t
 	}
 }
 
+func TestCanonicalAnthropicRequestKeepsLegacyAgentMessagesAsAssistantTurnBoundaries(t *testing.T) {
+	t.Parallel()
+	request := &llm.Request{APIFormat: llm.APIFormatOpenAIResponse, Input: []llm.Item{
+		{Kind: llm.ItemKindMessage, Role: llm.RoleUser, Content: []llm.ContentBlock{{Kind: llm.ContentKindText, Text: "before"}}},
+		{Kind: llm.ItemKindAgentMessage, AgentMessage: &llm.AgentMessage{Author: "/root", Recipient: "/root/worker", Content: []llm.AgentMessageContentPart{{Kind: llm.AgentMessageContentInputText, Text: "first"}}}},
+		{Kind: llm.ItemKindAgentMessage, AgentMessage: &llm.AgentMessage{Author: "/root", Recipient: "/root/worker", Content: []llm.AgentMessageContentPart{{Kind: llm.AgentMessageContentInputText, Text: "second"}}}},
+		{Kind: llm.ItemKindMessage, Role: llm.RoleUser, Content: []llm.ContentBlock{{Kind: llm.ContentKindText, Text: "after"}}},
+	}}
+	_, messages, _, ok := canonicalAnthropicRequest(request)
+	if !ok || len(messages) != 4 || messages[0].Role != "user" || messages[1].Role != "assistant" || messages[2].Role != "assistant" || messages[3].Role != "user" ||
+		len(messages[1].Content.MultipleContent) != 1 || len(messages[2].Content.MultipleContent) != 1 || messages[1].Content.MultipleContent[0].Text == nil || messages[2].Content.MultipleContent[0].Text == nil {
+		t.Fatalf("legacy inter-agent turn boundaries=%#v ok=%v", messages, ok)
+	}
+	for index, want := range []string{"first", "second"} {
+		var legacy struct {
+			Content string `json:"content"`
+			Trigger bool   `json:"trigger_turn"`
+		}
+		if err := json.Unmarshal([]byte(*messages[index+1].Content.MultipleContent[0].Text), &legacy); err != nil || legacy.Content != want || !legacy.Trigger {
+			t.Fatalf("legacy inter-agent message %d=%q decoded=%#v err=%v", index, *messages[index+1].Content.MultipleContent[0].Text, legacy, err)
+		}
+	}
+}
+
 func TestCanonicalAnthropicRequestEncodesNativeProviderToolSearchDefinition(t *testing.T) {
 	request := &llm.Request{
 		APIFormat: llm.APIFormatOpenAIResponse,

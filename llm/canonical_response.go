@@ -229,6 +229,12 @@ func CanonicalEventsFromResponse(response *Response) ([]Event, error) {
 	add(Event{Kind: EventKindResponseInProgress, ResponseSourceResidual: append(json.RawMessage(nil), responseResidual...)})
 	for index := range response.Output {
 		item := CloneCanonicalItem(response.Output[index])
+		if !canonicalItemHasLifecycleStatus(item.Kind) {
+			// The event lifecycle itself records progress. Statusless unions must
+			// not inherit a completed/incomplete Item.Status from a materialized
+			// non-stream response into either item.added or item.done snapshots.
+			item.Status = ""
+		}
 		outputIndex := index
 		ref := ItemRef{OutputIndex: &outputIndex, ItemID: item.ID}
 		if item.ToolCall != nil {
@@ -257,6 +263,14 @@ func CanonicalEventsFromResponse(response *Response) ([]Event, error) {
 			if item.Reasoning != nil && item.Reasoning.Content != "" {
 				add(Event{Kind: EventKindReasoningDelta, ItemRef: ref, Delta: Delta{Text: item.Reasoning.Content}})
 			}
+		case ItemKindAgentMessage:
+			// agent_message has its own typed Responses wire representation. A
+			// canonical stream retains it in item.added/item.done snapshots; emitting
+			// text deltas would silently turn routing metadata into display content.
+		case ItemKindContextCompaction:
+			// context_compaction is a typed checkpoint held in Responses item
+			// snapshots. It has no text-delta semantics and must never become a
+			// legacy compaction emulation input.
 		case ItemKindToolCall:
 			if item.ToolCall != nil {
 				delta := Delta{ArgumentsJSON: string(item.ToolCall.ArgumentsJSON), InputText: item.ToolCall.InputText}
@@ -346,6 +360,10 @@ func markCanonicalItemInProgress(item *Item) {
 	if item == nil {
 		return
 	}
+	if !canonicalItemHasLifecycleStatus(item.Kind) {
+		item.Status = ""
+		return
+	}
 	item.Status = ItemStatusInProgress
 	if item.ToolCall != nil {
 		item.ToolCall.Status = ToolCallStatusInProgress
@@ -358,6 +376,21 @@ func markCanonicalItemInProgress(item *Item) {
 		item.MCPCall.Status = MCPCallStatusInProgress
 		item.MCPCall.Output = ""
 		item.MCPCall.Error = ""
+	}
+}
+
+// canonicalItemHasLifecycleStatus is deliberately closed. Canonical lifecycle
+// state is broader than the item-level status field accepted by every current
+// Responses union: agent_message, compaction checkpoints, and future opaque
+// objects progress through the stream without gaining Item.Status.
+func canonicalItemHasLifecycleStatus(kind ItemKind) bool {
+	switch kind {
+	case ItemKindMessage, ItemKindReasoning, ItemKindToolCall, ItemKindToolResult,
+		ItemKindHostedCall, ItemKindMCPListTools, ItemKindMCPApprovalRequest,
+		ItemKindMCPApprovalResponse, ItemKindMCPCall:
+		return true
+	default:
+		return false
 	}
 }
 

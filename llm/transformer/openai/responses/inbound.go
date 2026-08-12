@@ -43,7 +43,10 @@ func (t *InboundTransformer) TransformRequest(ctx context.Context, httpReq *http
 	if len(httpReq.Body) == 0 {
 		return nil, fmt.Errorf("%w: request body is empty", transformer.ErrInvalidRequest)
 	}
-
+	profile := ResponsesWireProfileStandard
+	if llm.UsesResponsesLiteWireRequest(httpReq) {
+		profile = ResponsesWireProfileLite
+	}
 	// Check content type
 	contentType := httpReq.Headers.Get("Content-Type")
 	if contentType != "" && !strings.Contains(strings.ToLower(contentType), "application/json") {
@@ -53,6 +56,14 @@ func (t *InboundTransformer) TransformRequest(ctx context.Context, httpReq *http
 	var req Request
 	if err := json.Unmarshal(httpReq.Body, &req); err != nil {
 		return nil, fmt.Errorf("%w: failed to decode responses api request: %w", transformer.ErrInvalidRequest, err)
+	}
+	// Validate known typed unions after the single request decode. Ingress only
+	// closes malformed AgentPath/known-member cases for every eventual target;
+	// Standard still allows a future child to remain opaque for a same-Responses
+	// identity route. Keeping this on the decoded model avoids a second complete
+	// JSON parse for ordinary Responses requests.
+	if err := validateParsedResponsesIngressRequest(&req, profile); err != nil {
+		return nil, fmt.Errorf("%w: %w", transformer.ErrInvalidRequest, markResponsesIngressValidationError(err))
 	}
 
 	// Validate required fields

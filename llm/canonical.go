@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 type ItemKind string
@@ -18,7 +19,9 @@ const (
 	ItemKindMCPApprovalResponse ItemKind = "mcp_approval_response"
 	ItemKindMCPCall             ItemKind = "mcp_call"
 	ItemKindReasoning           ItemKind = "reasoning"
+	ItemKindAgentMessage        ItemKind = "agent_message"
 	ItemKindCompaction          ItemKind = "compaction"
+	ItemKindContextCompaction   ItemKind = "context_compaction"
 	ItemKindCompactionTrigger   ItemKind = "compaction_trigger"
 	ItemKindToolDeclaration     ItemKind = "tool_declaration"
 	ItemKindUnknown             ItemKind = "unknown"
@@ -127,7 +130,9 @@ type Item struct {
 	MCPApprovalResponse *MCPApprovalResponse   `json:"mcp_approval_response,omitempty"`
 	MCPCall             *MCPCall               `json:"mcp_call,omitempty"`
 	Reasoning           *ReasoningItem         `json:"reasoning,omitempty"`
+	AgentMessage        *AgentMessage          `json:"agent_message,omitempty"`
 	Compaction          *CompactionItem        `json:"compaction,omitempty"`
+	ContextCompaction   *ContextCompactionItem `json:"context_compaction,omitempty"`
 	CompactionTrigger   *CompactionTriggerItem `json:"compaction_trigger,omitempty"`
 	ToolDeclaration     *ToolDeclarationItem   `json:"tool_declaration,omitempty"`
 	Unknown             *UnknownItem           `json:"unknown,omitempty"`
@@ -145,6 +150,13 @@ type ProtocolHints struct {
 	SourceRole   Role      `json:"source_role,omitempty"`
 	SourceGroup  string    `json:"source_group,omitempty"`
 	Ordinal      int       `json:"ordinal,omitempty"`
+	// SourceBytes is the byte length of the source union object. It supports
+	// payload-free conversion evidence and is never serialized or persisted.
+	SourceBytes uint32 `json:"-"`
+	// SourceDigest is the SHA-256 digest of the exact source union object for
+	// selected privacy-sensitive item kinds. Like SourceBytes it is local
+	// conversion evidence, never canonical request/response data.
+	SourceDigest string `json:"-"`
 	// ResidualOwnerType is the source object type that owns SourceResidual.
 	// SourceType may describe a containing protocol construct such as
 	// additional_tools, so using it alone can attach old private fields after a
@@ -391,6 +403,186 @@ type CompactionItem struct {
 	CreatedBy        string `json:"created_by,omitempty"`
 }
 
+// ContextCompaction is a distinct Responses typed checkpoint union. It is not
+// a request control and it is not equivalent to response.compaction: targets
+// without the Responses context contract must not project its private state.
+type ContextCompactionItem struct {
+	EncryptedContent *string `json:"encrypted_content,omitempty"`
+}
+
+// AgentMessage is Codex's typed inter-agent Responses input item. It remains
+// distinct from an ordinary assistant message because author/recipient are
+// routing boundaries, not display decoration. Cross-protocol request encoders
+// may project plaintext parts through Codex's legacy inter-agent JSON message,
+// but must reject encrypted parts rather than treating them as text.
+type AgentMessage struct {
+	Author    string                    `json:"author"`
+	Recipient string                    `json:"recipient"`
+	Content   []AgentMessageContentPart `json:"content"`
+}
+
+type AgentMessageContentKind string
+
+const (
+	AgentMessageContentInputText        AgentMessageContentKind = "input_text"
+	AgentMessageContentEncryptedContent AgentMessageContentKind = "encrypted_content"
+)
+
+// AgentMessageContentPart preserves the source order and plaintext/encrypted
+// distinction. SourceResidual carries future fields of a known content union
+// member only and never enters canonical logs or persistence.
+type AgentMessageContentPart struct {
+	Kind              AgentMessageContentKind `json:"kind"`
+	Text              string                  `json:"text,omitempty"`
+	EncryptedContent  string                  `json:"encrypted_content,omitempty"`
+	ResidualOwnerType string                  `json:"-"`
+	SourceResidual    json.RawMessage         `json:"-"`
+}
+
+func (message *AgentMessage) Validate() error {
+	if message == nil {
+		return errors.New("agent_message payload is missing")
+	}
+	if strings.TrimSpace(message.Author) == "" || strings.TrimSpace(message.Recipient) == "" {
+		return errors.New("agent_message requires author and recipient")
+	}
+	if containsLineBreak(message.Author) || containsLineBreak(message.Recipient) {
+		return errors.New("agent_message author and recipient must not contain line breaks")
+	}
+	if len(message.Content) == 0 {
+		return errors.New("agent_message requires content")
+	}
+	for index := range message.Content {
+		if err := message.Content[index].Validate(); err != nil {
+			return fmt.Errorf("agent_message content %d: %w", index, err)
+		}
+	}
+	return nil
+}
+
+func (part *AgentMessageContentPart) Validate() error {
+	if part == nil {
+		return errors.New("nil agent_message content")
+	}
+	if len(part.SourceResidual) > 0 && !json.Valid(part.SourceResidual) {
+		return errors.New("agent_message content source residual is invalid JSON")
+	}
+	switch part.Kind {
+	case AgentMessageContentInputText:
+		if part.EncryptedContent != "" {
+			return errors.New("input_text agent_message content cannot contain encrypted_content")
+		}
+	case AgentMessageContentEncryptedContent:
+		if part.Text != "" {
+			return errors.New("encrypted_content agent_message content cannot contain text")
+		}
+		if strings.TrimSpace(part.EncryptedContent) == "" {
+			return errors.New("encrypted_content agent_message content requires encrypted_content")
+		}
+	default:
+		return fmt.Errorf("unsupported agent_message content type %q", part.Kind)
+	}
+	return nil
+}
+
+// plaintextAgentMessageContent exposes the ordered plaintext payload only to
+// construct the request-side legacy InterAgentCommunication JSON. It rejects
+// encrypted, mixed, future, and blank content. It is deliberately unexported:
+// an agent_message is not a display output projection.
+func (message *AgentMessage) plaintextAgentMessageContent() (string, error) {
+	if err := message.Validate(); err != nil {
+		return "", err
+	}
+	parts := make([]string, 0, len(message.Content))
+	for index := range message.Content {
+		part := &message.Content[index]
+		if part.Kind != AgentMessageContentInputText {
+			return "", errors.New("agent_message encrypted content has no plaintext projection")
+		}
+		parts = append(parts, part.Text)
+	}
+	content := strings.Join(parts, "\n")
+	if strings.TrimSpace(content) == "" {
+		return "", errors.New("agent_message plaintext content has no projection")
+	}
+	return content, nil
+}
+
+// LegacyInterAgentMessageJSON is Codex's historical assistant-message wire
+// form used to carry an inter-agent instruction over a protocol without the
+// typed Responses union. Codex detects this JSON as a user-turn boundary, so
+// trigger_turn must be set true even though the legacy message role is
+// assistant. The typed Responses union does not carry this bit, so this is a
+// deterministic but lossy lowering, never an identity or reversible mapping.
+// Fields and order match InterAgentCommunication's serde shape; no source-only
+// ID, encryption, or metadata can enter this request-only projection.
+func (message *AgentMessage) LegacyInterAgentMessageJSON() (string, error) {
+	content, err := message.plaintextAgentMessageContent()
+	if err != nil {
+		return "", err
+	}
+	if err := ValidateCodexAgentPath(message.Author); err != nil {
+		return "", fmt.Errorf("agent_message author has no legacy Codex AgentPath: %w", err)
+	}
+	if err := ValidateCodexAgentPath(message.Recipient); err != nil {
+		return "", fmt.Errorf("agent_message recipient has no legacy Codex AgentPath: %w", err)
+	}
+	legacy := struct {
+		Author          string   `json:"author"`
+		Recipient       string   `json:"recipient"`
+		OtherRecipients []string `json:"other_recipients"`
+		Content         string   `json:"content"`
+		TriggerTurn     bool     `json:"trigger_turn"`
+	}{
+		Author: message.Author, Recipient: message.Recipient, OtherRecipients: []string{}, Content: content, TriggerTurn: true,
+	}
+	encoded, err := json.Marshal(legacy)
+	if err != nil {
+		return "", fmt.Errorf("encode legacy inter-agent message: %w", err)
+	}
+	return string(encoded), nil
+}
+
+// ValidateCodexAgentPath applies the closed AgentPath grammar used by Codex
+// inter-agent routing. It belongs to the known typed union validation path;
+// callers must never apply it to an unknown future item merely because it has
+// fields named author or recipient.
+func ValidateCodexAgentPath(value string) error {
+	if value == "/morpheus" {
+		return nil
+	}
+	if value == "/root" {
+		return nil
+	}
+	if !strings.HasPrefix(value, "/root/") || strings.HasSuffix(value, "/") {
+		return errors.New("must be /morpheus or /root with lowercase child segments")
+	}
+	segments := strings.Split(strings.TrimPrefix(value, "/root/"), "/")
+	if len(segments) == 0 {
+		return errors.New("must have a non-empty child segment")
+	}
+	for _, segment := range segments {
+		if segment == "" || segment == "." || segment == ".." || segment == "root" {
+			return errors.New("has an invalid child segment")
+		}
+		for _, character := range segment {
+			if !(character >= 'a' && character <= 'z' || character >= '0' && character <= '9' || character == '_') {
+				return errors.New("child segments must use lowercase letters, digits, or underscore")
+			}
+		}
+	}
+	return nil
+}
+
+func containsLineBreak(value string) bool {
+	for _, character := range value {
+		if character == '\n' || character == '\r' {
+			return true
+		}
+	}
+	return false
+}
+
 // CompactionTrigger is a Responses request control. The upstream contract
 // requires exactly one trigger and requires it to be the final input item.
 // Keeping it typed prevents request-local canonical enrichments from moving an
@@ -496,7 +688,9 @@ func (item *Item) Validate() error {
 		item.MCPApprovalResponse != nil,
 		item.MCPCall != nil,
 		item.Reasoning != nil,
+		item.AgentMessage != nil,
 		item.Compaction != nil,
+		item.ContextCompaction != nil,
 		item.CompactionTrigger != nil,
 		item.ToolDeclaration != nil,
 		item.Unknown != nil,
@@ -585,9 +779,15 @@ func (item *Item) Validate() error {
 		if item.Reasoning == nil {
 			return errors.New("reasoning payload is missing")
 		}
+	case ItemKindAgentMessage:
+		return item.AgentMessage.Validate()
 	case ItemKindCompaction:
 		if item.Compaction == nil {
 			return errors.New("compaction payload is missing")
+		}
+	case ItemKindContextCompaction:
+		if item.ContextCompaction == nil {
+			return errors.New("context_compaction payload is missing")
 		}
 	case ItemKindCompactionTrigger:
 		if item.CompactionTrigger == nil {

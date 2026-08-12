@@ -16,6 +16,18 @@ func TestToolMarshalJSONFailureBranches(t *testing.T) {
 	if err == nil {
 		t.Fatal("invalid tool residual was accepted")
 	}
+	encoded, err := (Tool{Type: "function", Parameters: map[string]any{}}).MarshalJSON()
+	if err != nil || !strings.Contains(string(encoded), `"parameters":{}`) {
+		t.Fatalf("empty function schema was not explicit: %s err=%v", encoded, err)
+	}
+	_, err = (Tool{Type: "function", Parameters: map[string]any(nil)}).MarshalJSON()
+	if err != nil {
+		t.Fatalf("nil function schema marshal: %v", err)
+	}
+	encoded, err = (Tool{Type: "function", Parameters: map[string]any{}, Residual: json.RawMessage(`[]`)}).MarshalJSON()
+	if err == nil || len(encoded) != 0 {
+		t.Fatalf("non-object function tool encoding was accepted: %s err=%v", encoded, err)
+	}
 }
 
 func TestToolChoiceJSONBranches(t *testing.T) {
@@ -284,6 +296,9 @@ func TestStreamEventResidualCodecFailureBranches(t *testing.T) {
 	var event StreamEvent
 	if err := event.UnmarshalJSON([]byte(`{`)); err == nil {
 		t.Fatal("invalid stream event JSON was accepted")
+	}
+	if err := event.UnmarshalJSON([]byte(`{"type":"response.output_item.added","item":{"type":"web_search_call","action":1}}`)); err == nil {
+		t.Fatal("stream event accepted an invalid nested item union")
 	}
 	_, err := (StreamEvent{
 		Type: StreamEventTypeOutputItemAdded,

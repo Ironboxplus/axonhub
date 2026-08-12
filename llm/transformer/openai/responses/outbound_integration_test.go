@@ -189,8 +189,9 @@ func TestOutboundTransformer_TransformRequest_Integration(t *testing.T) {
 			actualRequest, err := xjson.To[Request](actualResult.Body)
 			require.NoError(t, err)
 
-			if !xtest.Equal(expectedRequest, actualRequest) {
-				t.Errorf("diff: %v", cmp.Diff(expectedRequest, actualRequest))
+			decodeMetadata := cmpopts.IgnoreUnexported(Item{})
+			if !xtest.Equal(expectedRequest, actualRequest, decodeMetadata) {
+				t.Errorf("diff: %v", cmp.Diff(expectedRequest, actualRequest, decodeMetadata))
 			}
 		})
 	}
@@ -299,6 +300,7 @@ func TestCompactTransformer_TransformResponse_Integration(t *testing.T) {
 
 	opts := []cmp.Option{
 		cmpopts.IgnoreFields(Item{}, "Annotations"),
+		cmpopts.IgnoreUnexported(Item{}),
 		cmpopts.EquateEmpty(),
 	}
 	if diff := cmp.Diff(expected.Output, actual.Output, opts...); diff != "" {
@@ -352,6 +354,7 @@ func TestResponsesTransformer_TransformResponse_Integration(t *testing.T) {
 
 	opts := []cmp.Option{
 		cmpopts.IgnoreFields(Item{}, "Annotations"),
+		cmpopts.IgnoreUnexported(Item{}),
 		cmpopts.EquateEmpty(),
 	}
 	if diff := cmp.Diff(expected.Output, actual.Output, opts...); diff != "" {

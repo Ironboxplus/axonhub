@@ -56,6 +56,12 @@ func TestEventValidateAllPayloadAndResidualBranches(t *testing.T) {
 	if err := valid.Validate(); err != nil {
 		t.Fatalf("valid residual event: %v", err)
 	}
+	if err := (&Event{
+		Kind: EventKindResponseFailed, TerminalReason: "provider_failure",
+		Error: &ResponseError{Detail: ErrorDetail{Message: "failed"}},
+	}).Validate(); err != nil {
+		t.Fatalf("response-failed terminal reason must be valid: %v", err)
+	}
 }
 
 func TestItemRefStableKeyCoversEveryIdentityShape(t *testing.T) {

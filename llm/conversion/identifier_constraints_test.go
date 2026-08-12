@@ -348,7 +348,15 @@ func TestToolIdentityRegistryUsesNamespaceAwareWireKeys(t *testing.T) {
 	}
 	session := &Session{}
 	session.registerToolIdentity("", "project", identity)
+	session.registerToolIdentity("plain_name", "", identity)
 	session.registerToolIdentity("project__read_file_hash", "project", identity)
+	session.registerToolIdentity("project__read.file", "project", toolIdentity{SourceKind: llm.ToolKindFunction, SourceNamespace: "project"})
+	if got, ok := session.identity("plain_name", ""); !ok || got != identity {
+		t.Fatalf("plain synthetic identity = %#v,%v", got, ok)
+	}
+	if got, ok := session.identity("read.file", "project"); !ok || got.SourceNamespace != "project" {
+		t.Fatalf("fallback namespace wire identity = %#v,%v", got, ok)
+	}
 	if got, ok := session.identity("read_file_hash", "project"); !ok || got != identity {
 		t.Fatalf("namespace wire identity = %#v,%v", got, ok)
 	}

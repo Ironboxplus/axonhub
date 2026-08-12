@@ -3,6 +3,7 @@ package anthropic
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -10,6 +11,54 @@ import (
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/httpclient"
 )
+
+func TestCanonicalResponseBlocksAgentMessageOutputToAnthropic(t *testing.T) {
+	t.Parallel()
+	message := &llm.AgentMessage{Author: "/root", Recipient: "/root/worker", Content: []llm.AgentMessageContentPart{
+		{Kind: llm.AgentMessageContentInputText, Text: "first"}, {Kind: llm.AgentMessageContentInputText, Text: "second"},
+	}}
+	response, encoded, err := canonicalResponseToAnthropic(&llm.Response{Output: []llm.Item{{Kind: llm.ItemKindAgentMessage, AgentMessage: message}}})
+	if response != nil || !encoded || err == nil || strings.Contains(err.Error(), "first") || strings.Contains(err.Error(), "second") {
+		t.Fatalf("Anthropic agent-message output response=%#v encoded=%v err=%v", response, encoded, err)
+	}
+}
+
+func TestCanonicalResponseBlocksResponsesPrivateOutputToAnthropic(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name string
+		item llm.Item
+	}{
+		{name: "encrypted agent", item: llm.Item{Kind: llm.ItemKindAgentMessage, AgentMessage: &llm.AgentMessage{Author: "/root", Recipient: "/root/worker", Content: []llm.AgentMessageContentPart{{Kind: llm.AgentMessageContentEncryptedContent, EncryptedContent: "PRIVATE_AGENT"}}}}},
+		{name: "context", item: llm.Item{Kind: llm.ItemKindContextCompaction, ContextCompaction: &llm.ContextCompactionItem{}}},
+		{name: "future", item: llm.Item{Kind: llm.ItemKindUnknown, Unknown: &llm.UnknownItem{Type: "future_behavior", Raw: []byte(`{"type":"future_behavior","secret":"PRIVATE_FUTURE"}`), Behavioral: true}, ProtocolHints: llm.ProtocolHints{SourceFormat: llm.APIFormatOpenAIResponse}}},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			_, encoded, err := canonicalResponseToAnthropic(&llm.Response{Output: []llm.Item{test.item}})
+			if !encoded || err == nil || strings.Contains(err.Error(), "PRIVATE") {
+				t.Fatalf("Anthropic non-projectable response encoded=%v err=%v", encoded, err)
+			}
+		})
+	}
+}
+
+func TestCanonicalAnthropicStreamBlocksAgentAndContext(t *testing.T) {
+	t.Parallel()
+	encoder := newAnthropicCanonicalEncoder()
+	outputIndex := 0
+	plain := llm.Item{Kind: llm.ItemKindAgentMessage, AgentMessage: &llm.AgentMessage{Author: "/root", Recipient: "/root/worker", Content: []llm.AgentMessageContentPart{{Kind: llm.AgentMessageContentInputText, Text: "handoff"}}}}
+	err := encoder.addItem(llm.Event{Kind: llm.EventKindItemAdded, ItemRef: llm.ItemRef{ItemID: "am_1", OutputIndex: &outputIndex}, Snapshot: &plain}, func(*StreamEvent) error { return nil })
+	if err == nil || strings.Contains(err.Error(), "handoff") {
+		t.Fatalf("Anthropic stream agent-message err=%v", err)
+	}
+	contextItem := llm.Item{Kind: llm.ItemKindContextCompaction, ContextCompaction: &llm.ContextCompactionItem{}}
+	err = newAnthropicCanonicalEncoder().addItem(llm.Event{Kind: llm.EventKindItemAdded, ItemRef: llm.ItemRef{ItemID: "ctx", OutputIndex: &outputIndex}, Snapshot: &contextItem}, func(*StreamEvent) error { return nil })
+	if err == nil {
+		t.Fatal("Anthropic stream accepted context_compaction")
+	}
+}
 
 func TestTransformResponseBuildsCanonicalHostedLifecycleFromAnthropic(t *testing.T) {
 	transformer, err := NewOutboundTransformer("https://example.com", "test")

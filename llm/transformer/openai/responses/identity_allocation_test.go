@@ -11,7 +11,7 @@ func TestResponsesIdentityResidualAllocationSlope(t *testing.T) {
 		t.Fatal(err)
 	}
 	smallBody := nestedResidualRequestBody(64)
-	largeBody := nestedResidualRequestBody(256)
+	largeBody := nestedResidualRequestBody(512)
 	var runErr error
 	small := testing.AllocsPerRun(3, func() {
 		if runErr == nil {
@@ -33,7 +33,7 @@ func TestResponsesIdentityResidualAllocationSlope(t *testing.T) {
 	if small > 14_500 {
 		t.Fatalf("64-object Responses identity allocations = %.0f, budget 14500", small)
 	}
-	allocationsPerAdditionalObject := (large - small) / (256 - 64)
+	allocationsPerAdditionalObject := (large - small) / (512 - 64)
 	if allocationsPerAdditionalObject > 215 {
 		t.Fatalf("Responses identity allocation slope = %.1f/object, budget 215", allocationsPerAdditionalObject)
 	}

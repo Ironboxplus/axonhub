@@ -444,6 +444,9 @@ func canonicalHostedResultToResponses(kind llm.ToolKind, result *llm.ToolResult)
 func canonicalItemToResponses(item *llm.Item) (Item, bool) {
 	wire, ok := canonicalItemToResponsesTyped(item)
 	if ok && item != nil {
+		if item.Kind == llm.ItemKindUnknown {
+			return wire, true
+		}
 		if responseResidualOwnedByWire(item.ProtocolHints, wire.Type) {
 			wire.Residual = cloneRaw(item.ProtocolHints.SourceResidual)
 		} else {
@@ -503,6 +506,33 @@ func canonicalItemToResponsesTyped(item *llm.Item) (Item, bool) {
 			}
 		}
 		return wire, true
+	case llm.ItemKindAgentMessage:
+		if item.AgentMessage == nil {
+			return Item{}, false
+		}
+		content := make([]Item, 0, len(item.AgentMessage.Content))
+		for index := range item.AgentMessage.Content {
+			part := &item.AgentMessage.Content[index]
+			wirePart := Item{Type: string(part.Kind)}
+			if item.ProtocolHints.SourceFormat == llm.APIFormatOpenAIResponse && part.ResidualOwnerType == string(part.Kind) {
+				wirePart.Residual = cloneRaw(part.SourceResidual)
+			}
+			switch part.Kind {
+			case llm.AgentMessageContentInputText:
+				text := part.Text
+				wirePart.Text = &text
+			case llm.AgentMessageContentEncryptedContent:
+				encrypted := part.EncryptedContent
+				wirePart.EncryptedContent = &encrypted
+			default:
+				return Item{}, false
+			}
+			content = append(content, wirePart)
+		}
+		return Item{
+			ID: item.ID, Type: "agent_message", Author: item.AgentMessage.Author,
+			Recipient: item.AgentMessage.Recipient, Content: &Input{Items: content},
+		}, true
 	case llm.ItemKindToolCall:
 		if item.ToolCall == nil {
 			return Item{}, false
@@ -737,22 +767,25 @@ func canonicalItemToResponsesTyped(item *llm.Item) (Item, bool) {
 		if item.ProtocolHints.SourceFormat == llm.APIFormatOpenAIResponse && item.ProtocolHints.SourceType == "compaction_summary" {
 			itemType = "compaction_summary"
 		}
-		return Item{ID: item.ID, Type: itemType, EncryptedContent: &encrypted, CreatedBy: createdBy, Status: responsesStatus(item.Status)}, true
+		return Item{ID: item.ID, Type: itemType, EncryptedContent: &encrypted, CreatedBy: createdBy}, true
 	case llm.ItemKindCompactionTrigger:
 		if item.CompactionTrigger == nil {
 			return Item{}, false
 		}
 		return Item{Type: "compaction_trigger"}, true
+	case llm.ItemKindContextCompaction:
+		if item.ContextCompaction == nil {
+			return Item{}, false
+		}
+		return Item{ID: item.ID, Type: "context_compaction", EncryptedContent: stringPointerClone(item.ContextCompaction.EncryptedContent)}, true
 	case llm.ItemKindUnknown:
 		if item.Unknown == nil || item.ProtocolHints.SourceFormat != llm.APIFormatOpenAIResponse {
 			return Item{}, false
 		}
-		var wire Item
-		if json.Unmarshal(item.Unknown.Raw, &wire) != nil {
+		if !json.Valid(item.Unknown.Raw) {
 			return Item{}, false
 		}
-		wire.Residual = append(json.RawMessage(nil), item.Unknown.Raw...)
-		return wire, true
+		return Item{Raw: cloneRaw(item.Unknown.Raw)}, true
 	default:
 		return Item{}, false
 	}

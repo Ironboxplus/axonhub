@@ -2,6 +2,7 @@ package conversion
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -75,10 +76,48 @@ func (r *streamRestorer) restore(response *llm.Response) *llm.Response {
 		}
 	}
 	r.restoreEvents(response)
+	r.recordCrossProtocolOutputBlockers(response)
 	if r.session.traceEnabled {
 		r.session.addRestoreNanos(time.Since(startedAt).Nanoseconds())
 	}
 	return response
+}
+
+func (r *streamRestorer) recordCrossProtocolOutputBlockers(response *llm.Response) {
+	if r == nil || response == nil || !shouldRecordResponsesProviderOutputBlocker(r.session) {
+		return
+	}
+	for index := range response.Events {
+		event := &response.Events[index]
+		if event.Kind != llm.EventKindItemAdded && event.Kind != llm.EventKindItemDone || event.Snapshot == nil {
+			continue
+		}
+		item := event.Snapshot
+		ref := ObjectRef{Kind: ObjectInputItem, ToolIndex: -1, ItemIndex: -1, ContentIndex: -1, MessageIndex: -1, ToolCallIndex: -1}
+		if event.ItemRef.OutputIndex != nil {
+			ref.ItemIndex = *event.ItemRef.OutputIndex
+		}
+		key, err := event.ItemRef.StableKey()
+		if err != nil {
+			// A malformed/missing item reference cannot safely pair added with
+			// done. Keep every observed event distinct using only its structural
+			// sequence, slice ordinal, kind, and output position.
+			key = fmt.Sprintf("event:%d:%d:%s:output:%d", event.Sequence, index, event.Kind, ref.ItemIndex)
+		}
+		switch item.Kind {
+		case llm.ItemKindAgentMessage:
+			ref.Kind = ObjectAgentMessage
+			r.session.recordOutputBlocker(llm.ConversionDirectionStream, ref, item, "agent_message_provider_output", ReasonProviderPrivate, key)
+		case llm.ItemKindCompaction:
+			ref.Kind = ObjectCompaction
+			r.session.recordOutputBlocker(llm.ConversionDirectionStream, ref, item, "compaction_checkpoint", ReasonProviderPrivate, key)
+		case llm.ItemKindContextCompaction:
+			ref.Kind = ObjectContextCompaction
+			r.session.recordOutputBlocker(llm.ConversionDirectionStream, ref, item, "context_compaction_checkpoint", ReasonProviderPrivate, key)
+		case llm.ItemKindUnknown:
+			r.session.recordOutputBlocker(llm.ConversionDirectionStream, ref, item, unknownItemSemanticClass(item), ReasonNoStrategy, key)
+		}
+	}
 }
 
 func (r *streamRestorer) restoreEvents(response *llm.Response) {

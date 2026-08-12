@@ -599,6 +599,7 @@ type conversionRestoreStream struct {
 	debugReporter conversionDebugReporter
 	request       *httpclient.Request
 	current       *llm.Response
+	reportedSeq   uint32
 	once          sync.Once
 }
 
@@ -622,11 +623,57 @@ func observeConversionRestoreStream(
 func (s *conversionRestoreStream) Next() bool {
 	if s.stream.Next() {
 		s.current = s.stream.Current()
+		// A client encoder can reject this chunk before asking the source for a
+		// next item. Publish any new runtime evidence immediately after restore,
+		// while it is still before StageClientStreamTransform, rather than only
+		// at EOF. The sequence watermark prevents a per-chunk duplicate for an
+		// unchanged trace even when the bounded trace replaces a lower-priority
+		// entry without changing its slice length.
+		s.observeProgress()
 		return true
 	}
 	s.current = nil
 	s.finish(s.stream.Err())
 	return false
+}
+
+func (s *conversionRestoreStream) observeProgress() {
+	if s == nil || s.debugReporter == nil {
+		return
+	}
+	debug, ok := s.debugReporter.ConversionDebugFromRequest(s.request)
+	if !ok || debug == nil {
+		return
+	}
+	latestSeq := latestConversionActionSeq(debug)
+	if latestSeq <= s.reportedSeq {
+		return
+	}
+	data := observationData{conversionDebug: debug}
+	if s.reporter != nil {
+		if summary, found := s.reporter.ConversionSummaryFromRequest(s.request); found {
+			data.conversion = &summary
+		}
+	}
+	s.reportedSeq = latestSeq
+	observeStage(s.ctx, StageConversionRestore, time.Time{}, nil, data)
+}
+
+// latestConversionActionSeq returns the monotonic watermark of retained
+// conversion evidence. ConversionDebugTrace may stay at its hard action bound
+// while a new critical action displaces an older lower-priority entry, so its
+// length is not a progress signal.
+func latestConversionActionSeq(debug *llm.ConversionDebugTrace) uint32 {
+	if debug == nil {
+		return 0
+	}
+	var latest uint32
+	for index := range debug.Actions {
+		if debug.Actions[index].Seq > latest {
+			latest = debug.Actions[index].Seq
+		}
+	}
+	return latest
 }
 
 func (s *conversionRestoreStream) Current() *llm.Response { return s.current }

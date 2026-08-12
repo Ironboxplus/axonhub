@@ -3,15 +3,189 @@ package responses
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/conversion"
 	"github.com/looplj/axonhub/llm/httpclient"
 )
+
+func TestResponsesObjectEvidenceIsSelectedAndFutureUnknownOnly(t *testing.T) {
+	t.Parallel()
+	messageRaw := json.RawMessage(`{"id":"msg_1","type":"message","role":"user","content":[{"type":"input_text","text":"ordinary"}]}`)
+	functionRaw := json.RawMessage(`{"id":"call_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"}`)
+	futureRaw := json.RawMessage(`{"id":"future_1","type":"future_behavior","tools":[],"content":null,"arguments":"","status":null,"future":{"mode":"opaque"}}`)
+	contextRaw := json.RawMessage(`{"id":"ctx_1","type":"context_compaction","encrypted_content":"opaque"}`)
+	for _, test := range []struct {
+		name       string
+		raw        json.RawMessage
+		wantDigest bool
+	}{
+		{name: "ordinary message", raw: messageRaw},
+		{name: "ordinary function", raw: functionRaw},
+		{name: "future unknown", raw: futureRaw, wantDigest: true},
+		{name: "context compaction", raw: contextRaw, wantDigest: true},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			var wire Item
+			if err := json.Unmarshal(test.raw, &wire); err != nil {
+				t.Fatalf("decode fixture: %v", err)
+			}
+			canonical, err := responseItemToCanonical(&wire, test.raw, 0)
+			if err != nil || canonical == nil {
+				t.Fatalf("canonical item=%#v err=%v", canonical, err)
+			}
+			if !test.wantDigest {
+				if canonical.ProtocolHints.SourceBytes != 0 || canonical.ProtocolHints.SourceDigest != "" {
+					t.Fatalf("ordinary item unexpectedly received object evidence: %#v", canonical.ProtocolHints)
+				}
+				return
+			}
+			wantDigest := fmt.Sprintf("%x", sha256.Sum256(test.raw))
+			if canonical.ProtocolHints.SourceBytes != uint32(len(test.raw)) || canonical.ProtocolHints.SourceDigest != wantDigest {
+				t.Fatalf("selected evidence = %#v, want bytes=%d digest=%s", canonical.ProtocolHints, len(test.raw), wantDigest)
+			}
+		})
+	}
+}
+
+func TestResponsesSelectedEvidenceUsesExactWireBytesAndSurvivesStreamSnapshots(t *testing.T) {
+	t.Parallel()
+	// Spaces and field order are intentional: this assertion must not derive the
+	// digest from re-marshaled semantic JSON.
+	raw := json.RawMessage(`{ "future": { "z": 1 }, "tools": [], "type": "future_behavior", "content": null, "arguments": "", "status": null }`)
+	var item Item
+	if err := json.Unmarshal(raw, &item); err != nil {
+		t.Fatalf("decode future wire: %v", err)
+	}
+	canonical, err := responseItemToCanonical(&item, raw, 3)
+	if err != nil || canonical == nil {
+		t.Fatalf("canonical future=%#v err=%v", canonical, err)
+	}
+	want := fmt.Sprintf("%x", sha256.Sum256(raw))
+	if canonical.ProtocolHints.SourceDigest != want || canonical.ProtocolHints.SourceBytes != uint32(len(raw)) {
+		t.Fatalf("exact input evidence=%#v want=%s", canonical.ProtocolHints, want)
+	}
+
+	var event StreamEvent
+	streamRaw := []byte(`{"type":"response.output_item.added","output_index":0,"item":` + string(raw) + `}`)
+	if err := json.Unmarshal(streamRaw, &event); err != nil {
+		t.Fatalf("decode stream snapshot: %v", err)
+	}
+	streamItem, err := canonicalStreamItem(event.Item, event.ItemRaw, 0, true)
+	if err != nil || streamItem == nil || streamItem.ProtocolHints.SourceDigest != want || streamItem.ProtocolHints.SourceBytes != uint32(len(raw)) {
+		t.Fatalf("exact stream evidence=%#v err=%v", streamItem, err)
+	}
+}
+
+func TestResponsesContextCompactionTypedUnionRoundTripsAndPreservesEvidence(t *testing.T) {
+	t.Parallel()
+	raw := json.RawMessage(`{"id":"ctx_1","type":"context_compaction","encrypted_content":"opaque","future_context":{"version":1}}`)
+	var wire Item
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatalf("decode context wire: %v", err)
+	}
+	canonical, err := responseItemToCanonical(&wire, raw, 2)
+	if err != nil || canonical == nil || canonical.Kind != llm.ItemKindContextCompaction || canonical.ContextCompaction == nil || canonical.ContextCompaction.EncryptedContent == nil {
+		t.Fatalf("decode context canonical=%#v err=%v", canonical, err)
+	}
+	wantDigest := fmt.Sprintf("%x", sha256.Sum256(raw))
+	if *canonical.ContextCompaction.EncryptedContent != "opaque" || canonical.ProtocolHints.SourceBytes != uint32(len(raw)) || canonical.ProtocolHints.SourceDigest != wantDigest ||
+		!bytes.Contains(canonical.ProtocolHints.SourceResidual, []byte(`"future_context"`)) {
+		t.Fatalf("context evidence/residual=%#v", canonical)
+	}
+	restored, ok := canonicalItemToResponses(canonical)
+	if !ok {
+		t.Fatal("context union has no Responses encoder")
+	}
+	encoded, err := json.Marshal(restored)
+	if err != nil || !bytes.Contains(encoded, []byte(`"future_context":{"version":1}`)) || !bytes.Contains(encoded, []byte(`"encrypted_content":"opaque"`)) {
+		t.Fatalf("context identity=%s err=%v", encoded, err)
+	}
+
+	var streamWire StreamEvent
+	if err := json.Unmarshal([]byte(`{"type":"response.output_item.added","output_index":0,"item":`+string(raw)+`}`), &streamWire); err != nil {
+		t.Fatalf("decode context stream snapshot: %v", err)
+	}
+	streamCanonical, err := canonicalStreamItem(streamWire.Item, streamWire.ItemRaw, 0, true)
+	if err != nil || streamCanonical == nil || streamCanonical.Kind != llm.ItemKindContextCompaction || streamCanonical.ProtocolHints.SourceDigest != wantDigest {
+		t.Fatalf("context stream canonical=%#v err=%v", streamCanonical, err)
+	}
+	clone := cloneCanonicalItem(streamCanonical)
+	if clone == nil || clone.ContextCompaction == nil || clone.ContextCompaction.EncryptedContent == streamCanonical.ContextCompaction.EncryptedContent || clone.ProtocolHints.SourceDigest != wantDigest {
+		t.Fatalf("context clone=%#v source=%#v", clone, streamCanonical)
+	}
+}
+
+func TestResponsesStatuslessTypedUnionsNeverEncodeInjectedCanonicalStatus(t *testing.T) {
+	t.Parallel()
+	for _, item := range []*llm.Item{
+		{Kind: llm.ItemKindAgentMessage, ID: "agent", Status: llm.ItemStatusCompleted, AgentMessage: &llm.AgentMessage{
+			Author: "/root", Recipient: "/root/worker", Content: []llm.AgentMessageContentPart{{Kind: llm.AgentMessageContentInputText, Text: "handoff"}},
+		}},
+		{Kind: llm.ItemKindContextCompaction, ID: "context", Status: llm.ItemStatusCompleted, ContextCompaction: &llm.ContextCompactionItem{}},
+		{Kind: llm.ItemKindCompaction, ID: "compact", Status: llm.ItemStatusCompleted, Compaction: &llm.CompactionItem{}},
+	} {
+		item := item
+		wire, ok := canonicalItemToResponses(item)
+		if !ok || wire.Status != nil {
+			t.Fatalf("statusless canonical item=%#v wire=%#v ok=%v", item, wire, ok)
+		}
+		encoded, err := json.Marshal(wire)
+		if err != nil || bytes.Contains(encoded, []byte(`"status"`)) {
+			t.Fatalf("statusless wire=%s err=%v", encoded, err)
+		}
+	}
+}
+
+func TestResponsesEvidenceHintHelpersStayPayloadFreeForEmptyInputs(t *testing.T) {
+	t.Parallel()
+
+	for _, set := range []func(*llm.ProtocolHints, json.RawMessage){setResponsesUnknownEvidenceHints, setResponsesRawEvidenceHints} {
+		set(nil, json.RawMessage(`{"type":"future"}`))
+		hints := llm.ProtocolHints{SourceBytes: 99, SourceDigest: "keep"}
+		set(&hints, nil)
+		if hints.SourceBytes != 99 || hints.SourceDigest != "keep" {
+			t.Fatalf("empty raw unexpectedly changed evidence hints: %#v", hints)
+		}
+	}
+
+	value := "opaque checkpoint"
+	clone := stringPointerClone(&value)
+	if clone == nil || clone == &value || *clone != value {
+		t.Fatalf("string pointer clone=%#v", clone)
+	}
+	*clone = "mutated"
+	if value != "opaque checkpoint" || stringPointerClone(nil) != nil {
+		t.Fatalf("string pointer clone aliases input: value=%q", value)
+	}
+}
+
+func TestCanonicalUnknownResponsesUsesFullRawIdentityOverTypedFields(t *testing.T) {
+	t.Parallel()
+	raw := json.RawMessage(`{ "type": "future_behavior", "id":"original", "tools": [], "content": null, "arguments": "", "status": null }`)
+	item := &llm.Item{Kind: llm.ItemKindUnknown, ID: "mutated", Status: llm.ItemStatusCompleted, Unknown: &llm.UnknownItem{Type: "future_behavior", Raw: raw, Behavioral: true}, ProtocolHints: llm.ProtocolHints{SourceFormat: llm.APIFormatOpenAIResponse}}
+	wire, ok := canonicalItemToResponses(item)
+	if !ok {
+		t.Fatal("future unknown has no same-protocol identity encoder")
+	}
+	if !bytes.Equal(wire.Raw, raw) {
+		t.Fatalf("unknown raw identity was reconstructed: wire=%s raw=%s", wire.Raw, raw)
+	}
+	encoded, err := json.Marshal(wire)
+	var encodedObject, rawObject any
+	if err != nil || json.Unmarshal(encoded, &encodedObject) != nil || json.Unmarshal(raw, &rawObject) != nil || !reflect.DeepEqual(encodedObject, rawObject) {
+		t.Fatalf("unknown full raw contract encoded=%s raw=%s err=%v", encoded, raw, err)
+	}
+}
 
 func TestInboundBuildsOrderedCanonicalDirectlyFromResponsesItems(t *testing.T) {
 	t.Parallel()
@@ -92,6 +266,117 @@ func TestInboundBuildsOrderedCanonicalDirectlyFromResponsesItems(t *testing.T) {
 	var unknownObject map[string]any
 	if err := json.Unmarshal(unknown.Unknown.Raw, &unknownObject); err != nil || unknownObject["mode"] != "must_preserve" {
 		t.Fatalf("unknown raw item was not preserved: raw=%s err=%v", unknown.Unknown.Raw, err)
+	}
+}
+
+func TestInboundAgentMessageUsesExactWireTypeAndTypedContentUnion(t *testing.T) {
+	t.Parallel()
+	plain := "visible handoff"
+	encrypted := "opaque"
+	tests := []struct {
+		name    string
+		input   *Input
+		wantErr string
+		known   bool
+		wantLen int
+	}{
+		{name: "nil input", wantErr: "non-empty typed item array"},
+		{name: "string input", input: &Input{Text: &plain}, wantErr: "non-empty typed item array"},
+		{name: "empty items", input: &Input{}, wantErr: "non-empty typed item array"},
+		{name: "input text missing text", input: &Input{Items: []Item{{Type: "input_text"}}}, wantErr: "requires text"},
+		{name: "input text mixed", input: &Input{Items: []Item{{Type: "input_text", Text: &plain, EncryptedContent: &encrypted}}}, wantErr: "cannot contain encrypted_content"},
+		{name: "encrypted missing value", input: &Input{Items: []Item{{Type: "encrypted_content"}}}, wantErr: "requires encrypted_content"},
+		{name: "encrypted empty", input: &Input{Items: []Item{{Type: "encrypted_content", EncryptedContent: new(string)}}}, wantErr: "requires encrypted_content"},
+		{name: "encrypted whitespace", input: &Input{Items: []Item{{Type: "encrypted_content", EncryptedContent: stringPointer(" ")}}}, wantErr: "requires encrypted_content"},
+		{name: "encrypted mixed", input: &Input{Items: []Item{{Type: "encrypted_content", Text: &plain, EncryptedContent: &encrypted}}}, wantErr: "cannot contain text"},
+		{name: "future type", input: &Input{Items: []Item{{Type: "future_agent_content"}}}, known: false},
+		{name: "future before malformed known", input: &Input{Items: []Item{{Type: "future_agent_content"}, {Type: "input_text", Text: &plain, EncryptedContent: &encrypted}}}, wantErr: "cannot contain encrypted_content"},
+		{name: "malformed known before future", input: &Input{Items: []Item{{Type: "input_text", Text: &plain, EncryptedContent: &encrypted}, {Type: "future_agent_content"}}}, wantErr: "cannot contain encrypted_content"},
+		{name: "typed union", input: &Input{Items: []Item{
+			{Type: "input_text", Text: &plain, Residual: json.RawMessage(`{"future":true}`)},
+			{Type: "encrypted_content", EncryptedContent: &encrypted},
+		}}, known: true, wantLen: 2},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			content, known, err := responseAgentMessageContent(test.input)
+			if test.wantErr != "" {
+				if err == nil || !known || !strings.Contains(err.Error(), test.wantErr) || content != nil {
+					t.Fatalf("agent content = %#v known=%v err=%v, want error containing %q", content, known, err, test.wantErr)
+				}
+				return
+			}
+			if !test.known {
+				if err != nil || known || content != nil {
+					t.Fatalf("future agent content = %#v known=%v err=%v", content, known, err)
+				}
+				return
+			}
+			if err != nil || !known || len(content) != test.wantLen || content[0].Kind != llm.AgentMessageContentInputText ||
+				content[0].Text != plain || string(content[0].SourceResidual) != `{"future":true}` ||
+				content[1].Kind != llm.AgentMessageContentEncryptedContent || content[1].EncryptedContent != encrypted {
+				t.Fatalf("agent content = %#v err=%v", content, err)
+			}
+		})
+	}
+
+	const futureChildWire = `{ "recipient":"/root/worker", "content":[{"payload":{"private":true},"type":"future_agent_content"}], "id":"am_future_child", "author":"/root", "type":"agent_message" }`
+	var futureChild Item
+	if err := json.Unmarshal([]byte(futureChildWire), &futureChild); err != nil {
+		t.Fatalf("decode future agent child wire: %v", err)
+	}
+	opaque, err := responseItemToCanonical(&futureChild, json.RawMessage(futureChildWire), 3)
+	if err != nil || opaque == nil || opaque.Kind != llm.ItemKindUnknown || opaque.Unknown == nil || !opaque.Unknown.Behavioral ||
+		opaque.Unknown.Type != "agent_message" || !bytes.Equal(opaque.Unknown.Raw, []byte(futureChildWire)) || opaque.ProtocolHints.SourceType != "agent_message" ||
+		opaque.ProtocolHints.SourceBytes != uint32(len(futureChildWire)) || len(opaque.ProtocolHints.SourceDigest) != 64 {
+		t.Fatalf("future agent child opaque canonical=%#v err=%v", opaque, err)
+	}
+
+	// A future outer type may contain all current agent-message-shaped fields,
+	// but exact type dispatch keeps it opaque rather than guessing its semantics.
+	request, err := NewInboundTransformer().TransformRequest(context.Background(), &httpclient.Request{
+		Method: http.MethodPost, URL: "/v1/responses", Headers: http.Header{"Content-Type": []string{"application/json"}},
+		Body: []byte(`{"model":"fixture-model","input":[{"id":"future_1","type":"future_agent_message","author":"/root","recipient":"/root/worker","content":[{"type":"input_text","text":"not typed yet"}]}]}`),
+	})
+	if err != nil || len(request.Input) != 1 || request.Input[0].Kind != llm.ItemKindUnknown || request.Input[0].AgentMessage != nil ||
+		request.Input[0].Unknown == nil || request.Input[0].Unknown.Type != "future_agent_message" {
+		t.Fatalf("future agent-like item classification = %#v err=%v", request, err)
+	}
+}
+
+func TestCanonicalAgentMessageResponsesIdentityKeepsOuterAndContentResiduals(t *testing.T) {
+	t.Parallel()
+	text := "typed handoff"
+	item := &llm.Item{
+		Kind: llm.ItemKindAgentMessage, ID: "am_1", Status: llm.ItemStatusCompleted,
+		AgentMessage: &llm.AgentMessage{Author: "/root", Recipient: "/root/worker", Content: []llm.AgentMessageContentPart{{
+			Kind: llm.AgentMessageContentInputText, Text: text,
+			ResidualOwnerType: "input_text", SourceResidual: json.RawMessage(`{"future_content":true}`),
+		}}},
+		ProtocolHints: llm.ProtocolHints{
+			SourceFormat: llm.APIFormatOpenAIResponse, SourceType: "agent_message", ResidualOwnerType: "agent_message",
+			SourceResidual: json.RawMessage(`{"future_outer":true}`),
+		},
+	}
+	wire, ok := canonicalItemToResponses(item)
+	if !ok {
+		t.Fatal("typed agent message has no Responses identity encoding")
+	}
+	encoded, err := json.Marshal(wire)
+	if err != nil || !bytes.Contains(encoded, []byte(`"future_outer":true`)) || !bytes.Contains(encoded, []byte(`"future_content":true`)) {
+		t.Fatalf("agent Responses identity encoding=%s err=%v", encoded, err)
+	}
+	var decoded Item
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("decode agent Responses identity wire: %v", err)
+	}
+	restored, err := responseItemToCanonical(&decoded, encoded, 1)
+	if err != nil || restored.Kind != llm.ItemKindAgentMessage || restored.AgentMessage == nil ||
+		string(restored.ProtocolHints.SourceResidual) != `{"future_outer":true}` || len(restored.AgentMessage.Content) != 1 ||
+		string(restored.AgentMessage.Content[0].SourceResidual) != `{"future_content":true}` {
+		t.Fatalf("agent Responses identity restoration=%#v err=%v", restored, err)
 	}
 }
 

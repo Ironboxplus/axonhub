@@ -2,6 +2,7 @@ package conversion
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -110,5 +111,99 @@ func TestCompactEmulationDoesNotMutateCallerRequest(t *testing.T) {
 	if !ok || debug == nil || len(debug.Actions) < 2 || debug.Actions[0].ObjectKind != string(ObjectCompaction) ||
 		debug.Actions[0].Strategy != string(StrategyCompactAsChat) {
 		t.Fatalf("compact conversion debug = %#v ok=%v", debug, ok)
+	}
+}
+
+func TestRestoreCompactEmulationFailsClosedWhenCanonicalOutputCannotBeProjected(t *testing.T) {
+	t.Parallel()
+	session := &Session{compactEmulation: &compactEmulationState{instructions: "preserve private state"}}
+	tests := []struct {
+		name     string
+		response *llm.Response
+	}{
+		{
+			name: "encrypted agent message",
+			response: &llm.Response{Output: []llm.Item{{
+				Kind: llm.ItemKindAgentMessage,
+				AgentMessage: &llm.AgentMessage{
+					Author: "/root", Recipient: "/root/worker",
+					Content: []llm.AgentMessageContentPart{{
+						Kind: llm.AgentMessageContentEncryptedContent, EncryptedContent: "PRIVATE_AGENT_FRAGMENT",
+					}},
+				},
+			}}},
+		},
+		{
+			name: "unknown provider item",
+			response: &llm.Response{Output: []llm.Item{{
+				Kind:    llm.ItemKindUnknown,
+				Unknown: &llm.UnknownItem{Type: "future_compact_output", Raw: []byte(`{"secret":"PRIVATE_AGENT_FRAGMENT"}`), Behavioral: true},
+			}}},
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			// A compact response cannot safely fall back to an ordinary response:
+			// the compact inbound transformer will reject it later, after provider
+			// completion. It must neither flatten encryption nor drop unknown output.
+			restored, err := restoreCompactEmulation(test.response, session)
+			if !errors.Is(err, ErrIncompletePlan) || restored != nil || strings.Contains(err.Error(), "PRIVATE_AGENT_FRAGMENT") {
+				t.Fatalf("unsafe compact restoration response=%#v err=%v", restored, err)
+			}
+		})
+	}
+}
+
+func TestRestoreCompactEmulationRehydratesOnlySafeContinuationState(t *testing.T) {
+	t.Parallel()
+	session := &Session{compactEmulation: &compactEmulationState{instructions: "keep decisions"}}
+	response := &llm.Response{
+		ID: "compact_1", Created: 42,
+		Output: []llm.Item{{
+			Kind: llm.ItemKindMessage, Role: llm.RoleAssistant,
+			Content: []llm.ContentBlock{{Kind: llm.ContentKindText, Text: "state"}},
+		}},
+	}
+	restored, err := restoreCompactEmulation(response, session)
+	if err != nil || restored != response || restored.RequestType != llm.RequestTypeCompact ||
+		restored.APIFormat != llm.APIFormatOpenAIResponseCompact || restored.Object != "response.compaction" ||
+		restored.Compact == nil || restored.Compact.ID != "compact_1" || restored.Compact.CreatedAt != 42 ||
+		restored.Compact.Instructions != "keep decisions" || len(restored.Compact.Output) != 1 ||
+		restored.Compact.Output[0].Content.Content == nil || *restored.Compact.Output[0].Content.Content != "state" {
+		t.Fatalf("safe compact restoration = %#v err=%v", restored, err)
+	}
+
+	legacyContent := "choice fallback"
+	fallback := &llm.Response{Choices: []llm.Choice{{Message: &llm.Message{
+		Role: "assistant", Content: llm.MessageContent{Content: &legacyContent},
+	}}}}
+	restored, err = restoreCompactEmulation(fallback, session)
+	if err != nil || restored.Compact == nil || len(restored.Compact.Output) != 1 ||
+		restored.Compact.Output[0].Content.Content == nil || *restored.Compact.Output[0].Content.Content != legacyContent {
+		t.Fatalf("legacy compact fallback = %#v err=%v", restored, err)
+	}
+
+	unchanged := &llm.Response{ID: "ordinary"}
+	restored, err = restoreCompactEmulation(unchanged, nil)
+	if err != nil || restored != unchanged || restored.RequestType == llm.RequestTypeCompact {
+		t.Fatalf("non-emulated response changed = %#v err=%v", restored, err)
+	}
+}
+
+func TestRestoreCompactEmulationRejectsPlaintextAgentOutput(t *testing.T) {
+	t.Parallel()
+	session := &Session{compactEmulation: &compactEmulationState{}}
+	response := &llm.Response{Output: []llm.Item{{
+		Kind: llm.ItemKindAgentMessage,
+		AgentMessage: &llm.AgentMessage{Author: "/root", Recipient: "/root/worker", Content: []llm.AgentMessageContentPart{
+			{Kind: llm.AgentMessageContentInputText, Text: "output first"},
+			{Kind: llm.AgentMessageContentInputText, Text: "output second"},
+		}},
+	}}}
+	restored, err := restoreCompactEmulation(response, session)
+	if !errors.Is(err, ErrIncompletePlan) || restored != nil || strings.Contains(err.Error(), "output first") || strings.Contains(err.Error(), "output second") {
+		t.Fatalf("compact plaintext agent output=%#v err=%v", restored, err)
 	}
 }

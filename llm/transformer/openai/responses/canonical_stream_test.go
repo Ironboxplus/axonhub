@@ -314,6 +314,107 @@ func TestCanonicalResponsesStreamPreservesFutureFieldsOnKnownOutputObjects(t *te
 	require.JSONEq(t, `{"confidence":0.75}`, string(content[0]["future_content"]))
 }
 
+func TestCanonicalResponsesStreamKeepsStatuslessOpaqueSnapshotsUntouched(t *testing.T) {
+	t.Parallel()
+
+	fixtures := []string{
+		`{"id":"am_statusless","type":"agent_message","author":"/root","recipient":"/root/worker","content":[{"type":"input_text","text":"handoff"}]}`,
+		`{"id":"ctx_statusless","type":"context_compaction","encrypted_content":"opaque"}`,
+		`{"id":"future_statusless","type":"future_behavior","content":null,"tools":[]}`,
+	}
+	for _, rawItem := range fixtures {
+		rawItem := rawItem
+		t.Run(rawItem, func(t *testing.T) {
+			t.Parallel()
+			decoder := newCanonicalStreamDecoder()
+			created, err := decoder.decode(&StreamEvent{Type: StreamEventTypeResponseCreated})
+			require.NoError(t, err)
+			var addedWire StreamEvent
+			require.NoError(t, json.Unmarshal([]byte(`{"type":"response.output_item.added","output_index":0,"item":`+rawItem+`}`), &addedWire))
+			added, err := decoder.decode(&addedWire)
+			require.NoError(t, err)
+			require.Len(t, added, 1)
+
+			encoder := newCanonicalStreamEncoder()
+			source := &responsesInboundStream{ctx: context.Background(), transformerMetadata: make(map[string]any), aggregator: newStreamAggregator()}
+			require.NoError(t, encoder.encode(source, created[0]))
+			require.NoError(t, encoder.encode(source, added[0]))
+			require.Len(t, source.eventQueue, 2)
+			var encoded struct {
+				Item json.RawMessage `json:"item"`
+			}
+			require.NoError(t, json.Unmarshal(source.eventQueue[1].Data, &encoded))
+			require.JSONEq(t, rawItem, string(encoded.Item))
+		})
+	}
+}
+
+func TestCanonicalResponsesStreamStatuslessMessageAddedKeepsIdentityAndDoneOwnsFinalStatus(t *testing.T) {
+	t.Parallel()
+	// Codex's current ev_message_item_added fixture omits status entirely. Its
+	// response_item.done snapshot is the authoritative terminal update.
+	const addedItem = `{"id":"msg_statusless","type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}`
+	const doneItem = `{"id":"msg_statusless","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello"}]}`
+	decoder := newCanonicalStreamDecoder()
+	var canonicalEvents []llm.Event
+	for _, raw := range []string{
+		`{"type":"response.created","response":{"id":"resp_statusless","object":"response","model":"fixture","status":"in_progress","output":[]}}`,
+		`{"type":"response.output_item.added","output_index":0,"item":` + addedItem + `}`,
+		`{"type":"response.output_item.done","output_index":0,"item":` + doneItem + `}`,
+		`{"type":"response.completed","response":{"id":"resp_statusless","object":"response","model":"fixture","status":"completed","output":[]}}`,
+	} {
+		var wire StreamEvent
+		require.NoError(t, json.Unmarshal([]byte(raw), &wire))
+		events, err := decoder.decode(&wire)
+		require.NoError(t, err)
+		canonicalEvents = append(canonicalEvents, events...)
+	}
+
+	encoder := newCanonicalStreamEncoder()
+	source := &responsesInboundStream{ctx: context.Background(), transformerMetadata: make(map[string]any), aggregator: newStreamAggregator()}
+	for index := range canonicalEvents {
+		require.NoError(t, encoder.encode(source, canonicalEvents[index]))
+	}
+	var added, completed struct {
+		Item   json.RawMessage `json:"item"`
+		Output []Item          `json:"response"`
+	}
+	for _, event := range source.eventQueue {
+		var envelope struct {
+			Type     StreamEventType `json:"type"`
+			Item     json.RawMessage `json:"item"`
+			Response *Response       `json:"response"`
+		}
+		require.NoError(t, json.Unmarshal(event.Data, &envelope))
+		switch envelope.Type {
+		case StreamEventTypeOutputItemAdded:
+			added.Item = envelope.Item
+		case StreamEventTypeResponseCompleted:
+			if envelope.Response != nil {
+				completed.Output = envelope.Response.Output
+			}
+		}
+	}
+	require.JSONEq(t, addedItem, string(added.Item))
+	require.Len(t, completed.Output, 1)
+	require.NotNil(t, completed.Output[0].Status)
+	require.Equal(t, "completed", *completed.Output[0].Status)
+}
+
+func TestResponsesItemHasLifecycleStatusIsClosed(t *testing.T) {
+	t.Parallel()
+	for _, itemType := range []string{"message", "function_call", "mcp_call"} {
+		if !responsesItemHasLifecycleStatus(itemType) {
+			t.Fatalf("%s unexpectedly has no lifecycle status", itemType)
+		}
+	}
+	for _, itemType := range []string{"agent_message", "compaction", "context_compaction", "future_behavior"} {
+		if responsesItemHasLifecycleStatus(itemType) {
+			t.Fatalf("%s unexpectedly has lifecycle status", itemType)
+		}
+	}
+}
+
 func TestCanonicalResponsesStreamAttachesEventResidualOnlyToMatchingWireEvent(t *testing.T) {
 	t.Parallel()
 	decoder := newCanonicalStreamDecoder()
@@ -571,7 +672,10 @@ func TestCanonicalStreamItemCloneCoversOptionalLifecycleBranches(t *testing.T) {
 		MCPApprovalResponse: &llm.MCPApprovalResponse{Reason: "approved"},
 		MCPCall:             &llm.MCPCall{ArgumentsJSON: json.RawMessage(`{"call":1}`)},
 		Compaction:          &llm.CompactionItem{EncryptedContent: "encrypted"},
-		Unknown:             &llm.UnknownItem{Raw: json.RawMessage(`{"unknown":1}`)},
+		AgentMessage: &llm.AgentMessage{Author: "/root", Recipient: "/root/worker", Content: []llm.AgentMessageContentPart{{
+			Kind: llm.AgentMessageContentInputText, Text: "handoff", SourceResidual: json.RawMessage(`{"agent_part":1}`),
+		}}},
+		Unknown: &llm.UnknownItem{Raw: json.RawMessage(`{"unknown":1}`)},
 	}
 	clone := cloneCanonicalItem(item)
 	require.NotNil(t, clone)
@@ -587,6 +691,7 @@ func TestCanonicalStreamItemCloneCoversOptionalLifecycleBranches(t *testing.T) {
 	clone.HostedCall.Result.DiscoveredTools[0].ProtocolHints.SourceResidual[0] = '['
 	clone.MCPApprovalRequest.ArgumentsJSON[0] = '['
 	clone.MCPCall.ArgumentsJSON[0] = '['
+	clone.AgentMessage.Content[0].SourceResidual[0] = '['
 	clone.Unknown.Raw[0] = '['
 
 	require.JSONEq(t, `{"x":1}`, string(item.HostedCall.Invocation.ArgumentsJSON))
@@ -597,6 +702,7 @@ func TestCanonicalStreamItemCloneCoversOptionalLifecycleBranches(t *testing.T) {
 	require.JSONEq(t, `{"future":1}`, string(item.HostedCall.Result.DiscoveredTools[0].ProtocolHints.SourceResidual))
 	require.JSONEq(t, `{"approve":1}`, string(item.MCPApprovalRequest.ArgumentsJSON))
 	require.JSONEq(t, `{"call":1}`, string(item.MCPCall.ArgumentsJSON))
+	require.JSONEq(t, `{"agent_part":1}`, string(item.AgentMessage.Content[0].SourceResidual))
 	require.JSONEq(t, `{"unknown":1}`, string(item.Unknown.Raw))
 }
 

@@ -160,6 +160,9 @@ func (encoder *canonicalChatEncoder) encode(event llm.Event) ([]*llm.Response, e
 		emitRole()
 		key, _ := event.ItemRef.StableKey()
 		encoder.itemKinds[key] = event.Snapshot.Kind
+		if event.Snapshot.Kind == llm.ItemKindAgentMessage || event.Snapshot.Kind == llm.ItemKindCompaction || event.Snapshot.Kind == llm.ItemKindContextCompaction || event.Snapshot.Kind == llm.ItemKindUnknown {
+			return nil, fmt.Errorf("Chat cannot encode canonical stream item kind %q", event.Snapshot.Kind)
+		}
 		if event.Snapshot.Kind != llm.ItemKindToolCall {
 			return responses, nil
 		}
