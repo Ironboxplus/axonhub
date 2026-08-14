@@ -62,7 +62,8 @@ func (p *Planner) profileFor(request *llm.Request, targetFormat llm.APIFormat) (
 }
 
 const (
-	responsesLiteProfileSuffix = "+responses-lite-namespace-function-only"
+	responsesLiteProfileSuffix           = "+responses-lite-namespace-function-only"
+	codexMultiAgentV2CompatProfileSuffix = "+codex-multi-agent-v2-compat"
 )
 
 // effectiveRequestCapabilityProfile applies a known final-wire restriction to
@@ -74,7 +75,21 @@ const (
 // lowering run before encoding; a final wire validator can then fail closed
 // if raw mutation somehow reintroduces a non-function child.
 func effectiveRequestCapabilityProfile(profile CapabilityProfile, request *llm.Request) CapabilityProfile {
-	if profile.APIFormat != llm.APIFormatOpenAIResponse || !llm.UsesResponsesLiteWireProfile(request) {
+	usesResponsesLite := llm.UsesResponsesLiteWireProfile(request)
+	// CPA's is-compat configuration is a two-sided contract. The host's exact
+	// target channel/model admission says that this provider accepts the
+	// MultiAgentV2 conversion; the Lite source profile says this request came
+	// from the Codex client path that declares encrypted_content portable as
+	// ordinary user input text. Either fact alone is insufficient.
+	if profile.CodexMultiAgentV2Compat {
+		if !usesResponsesLite {
+			profile.CodexMultiAgentV2Compat = false
+			profile.ID = strings.TrimSuffix(profile.ID, codexMultiAgentV2CompatProfileSuffix)
+		} else if !strings.Contains(profile.ID, codexMultiAgentV2CompatProfileSuffix) {
+			profile.ID += codexMultiAgentV2CompatProfileSuffix
+		}
+	}
+	if profile.APIFormat != llm.APIFormatOpenAIResponse || !usesResponsesLite {
 		return profile
 	}
 	profile.NamespaceChildNativeTools = CapabilityFunctionTool
@@ -297,7 +312,7 @@ func (p *Planner) plan(request *llm.Request, targetFormat llm.APIFormat, trace b
 			case llm.ItemKindReasoning:
 				plan.Actions = append(plan.Actions, actionForReasoningItem(request.APIFormat, profile.APIFormat, itemIndex))
 			case llm.ItemKindAgentMessage:
-				plan.Actions = append(plan.Actions, actionForAgentMessage(request.APIFormat, profile.APIFormat, item, itemIndex))
+				plan.Actions = append(plan.Actions, actionForAgentMessageWithProfile(request.APIFormat, profile, item, itemIndex))
 			case llm.ItemKindHostedCall:
 				plan.Actions = append(plan.Actions, actionForHostedCall(request.APIFormat, profile, item, itemIndex))
 			case llm.ItemKindCompaction:
@@ -511,7 +526,20 @@ func appendInlineCompactionCheckpointBlockers(plan *Plan, request *llm.Request, 
 	}
 }
 
+// actionForAgentMessage keeps the default capability profile for small
+// planner-focused callers. Production planning always uses the profile-aware
+// variant below, so operator admission cannot be accidentally inferred from
+// target wire format alone.
 func actionForAgentMessage(source, target llm.APIFormat, item *llm.Item, itemIndex int) Action {
+	profile, ok := ProfileFor(target)
+	if !ok {
+		profile = CapabilityProfile{APIFormat: target}
+	}
+	return actionForAgentMessageWithProfile(source, profile, item, itemIndex)
+}
+
+func actionForAgentMessageWithProfile(source llm.APIFormat, profile CapabilityProfile, item *llm.Item, itemIndex int) Action {
+	target := profile.APIFormat
 	action := itemEvidenceAction(item, itemIndex, ObjectAgentMessage, "agent_message", "agent_message")
 	if item == nil || item.AgentMessage == nil {
 		action.Kind, action.Strategy, action.Reason = ActionUnknown, StrategyUnavailable, ReasonNoStrategy
@@ -522,15 +550,30 @@ func actionForAgentMessage(source, target llm.APIFormat, item *llm.Item, itemInd
 		action.Kind, action.Strategy, action.Reason, action.Reversible = ActionNative, StrategyNative, ReasonTargetNative, true
 		return action
 	}
+	semantic := agentMessageSemanticClass(item.AgentMessage)
+	if semantic == "agent_message_encrypted" || semantic == "agent_message_mixed" {
+		if source == llm.APIFormatOpenAIResponse &&
+			(target == llm.APIFormatOpenAIChatCompletion || target == llm.APIFormatAnthropicMessage) &&
+			profile.CodexMultiAgentV2Compat {
+			if _, err := codexMultiAgentV2UserInputBlocks(item.AgentMessage); err == nil {
+				action.Kind, action.Strategy, action.Reason, action.Reversible = ActionLower, StrategyAgentMessageMultiAgentV2UserInput, ReasonSemanticProjection, false
+				action.SemanticClass = semantic
+				return action
+			}
+		}
+		action.Kind, action.Strategy, action.Reason = ActionUnknown, StrategyUnavailable, ReasonProviderPrivate
+		action.SemanticClass = semantic
+		return action
+	}
 	if _, err := item.AgentMessage.LegacyInterAgentMessageJSON(); err != nil {
 		action.Kind, action.Strategy, action.Reason = ActionUnknown, StrategyUnavailable, ReasonProviderPrivate
-		action.SemanticClass = agentMessageSemanticClass(item.AgentMessage)
+		action.SemanticClass = semantic
 		return action
 	}
 	// The legacy JSON adds trigger_turn because typed Responses agent_message
 	// has no equivalent field. The lowering is intentionally lossy.
 	action.Kind, action.Strategy, action.Reason, action.Reversible = ActionLower, StrategyAgentMessageLegacyInput, ReasonSemanticProjection, false
-	action.SemanticClass = "agent_message_plaintext"
+	action.SemanticClass = semantic
 	return action
 }
 

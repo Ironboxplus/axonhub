@@ -8,10 +8,11 @@ import (
 	"github.com/looplj/axonhub/llm"
 )
 
-// PlanVersion 7 adds explicit inline-compaction execution ownership. A
-// Responses-shaped target is no longer assumed to understand provider-private
-// remote-compaction checkpoints just because its wire format is Responses.
-const PlanVersion uint32 = 7
+// PlanVersion 8 adds the two-gated Codex MultiAgentV2 message/user projection.
+// A target channel/model declaration alone cannot make an encrypted agent
+// payload portable: the source must also carry the Responses Lite wire profile
+// that identifies the declared Codex client compatibility path.
+const PlanVersion uint32 = 8
 
 var ErrIncompletePlan = errors.New("semantic conversion plan is incomplete")
 
@@ -64,7 +65,13 @@ const (
 	StrategyInlineCompactionGateway    StrategyID = "inline_compaction_gateway"
 	StrategyInlineCompactionHydrate    StrategyID = "inline_compaction_hydrate"
 	StrategyAgentMessageLegacyInput    StrategyID = "agent_message_legacy_input"
-	StrategyUnavailable                StrategyID = "unavailable"
+	// StrategyAgentMessageMultiAgentV2UserInput is deliberately separate from
+	// the plaintext legacy-envelope projection. It mirrors the explicit CPA
+	// OptimizeMultiAgentV2 compatibility mode and may only be selected by a
+	// host-supplied, target-specific capability after the complete typed Codex
+	// agent-message grammar has been validated.
+	StrategyAgentMessageMultiAgentV2UserInput StrategyID = "agent_message_multi_agent_v2_user_input"
+	StrategyUnavailable                       StrategyID = "unavailable"
 )
 
 type ReasonCode string
@@ -115,6 +122,13 @@ type CapabilityProfile struct {
 	NativeTools               ToolCapabilitySet
 	EmulatedTools             ToolCapabilitySet
 	NamespaceChildNativeTools ToolCapabilitySet
+	// CodexMultiAgentV2Compat is an operator-admitted target capability. It does
+	// not decrypt encrypted_content or make it universally portable. For the one
+	// complete typed Codex agent-message grammar, it authorizes CPA's documented
+	// MultiAgentV2 is-compat projection: known content parts become ordered
+	// input_text blocks inside a message/user item. It defaults to false for
+	// every profile.
+	CodexMultiAgentV2Compat bool
 }
 
 type ToolCapabilitySet uint32

@@ -116,7 +116,7 @@ func (o *Outbound) TransformRequest(ctx context.Context, request *llm.Request) (
 		recordInlineCompactionFailure(plan, "summary_projection", err)
 		return nil, &ConversionPlanError{Cause: err, Plan: plan}
 	}
-	projected, err := projectCanonical(prepared, o.wrapped.APIFormat())
+	projected, err := projectCanonicalWithPlan(prepared, o.wrapped.APIFormat(), plan)
 	if err != nil {
 		return nil, err
 	}

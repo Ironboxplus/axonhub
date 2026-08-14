@@ -11,6 +11,14 @@ import (
 // protocol encoders. Canonical remains authoritative; this projector is a
 // migration boundary and contains no source-protocol parsing.
 func projectCanonical(request *llm.Request, target llm.APIFormat) (*llm.Request, error) {
+	return projectCanonicalWithPlan(request, target, nil)
+}
+
+// projectCanonicalWithPlan is the only production projection path. The plan
+// has already completed at this point; keeping it attached to projection
+// makes receiver-specific legacy capabilities checked once at preflight and
+// consumed once at serialization.
+func projectCanonicalWithPlan(request *llm.Request, target llm.APIFormat, plan *Plan) (*llm.Request, error) {
 	if request == nil || len(request.Input) == 0 && len(request.ToolDefinitions) == 0 {
 		return request, nil
 	}
@@ -23,6 +31,10 @@ func projectCanonical(request *llm.Request, target llm.APIFormat) (*llm.Request,
 	}
 	projected := request.Clone()
 	var err error
+	projected.Input, err = projectAgentMessagesForPlan(projected.Input, plan)
+	if err != nil {
+		return nil, err
+	}
 	projected.Messages, err = canonicalItemsToMessages(projected.Input)
 	if err != nil {
 		return nil, err

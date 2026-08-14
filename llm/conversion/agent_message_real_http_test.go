@@ -38,6 +38,28 @@ const codexAgentMessageWireFixture = `{
   "future_agent_field":"identity-residual"
 }`
 
+// codexMultiAgentV2AgentMessageWireFixture freezes the current Codex 0.147
+// to_model_input_item shape for a routed agent message: the routing header is
+// an input_text part and the opaque continuation follows as an
+// encrypted_content part. The bytes are deliberately not inferred from a
+// marker; only an explicit Codex MultiAgentV2 compatibility capability may
+// select CPA's portable user/input_text projection.
+const codexMultiAgentV2AgentMessageWireFixture = `{
+  "id":"am_multi_agent_v2_2",
+  "type":"agent_message",
+  "author":"/root",
+  "recipient":"/root/worker",
+  "content":[
+    {"type":"input_text","text":"Message Type: NEW_TASK\nTask name: /root/worker\nSender: /root\nPayload:\n"},
+    {"type":"encrypted_content","encrypted_content":"codex-agent-payload-v2"}
+  ]
+}`
+
+var codexMultiAgentV2UserInputTextParts = []string{
+	"Message Type: NEW_TASK\nTask name: /root/worker\nSender: /root\nPayload:\n",
+	"codex-agent-payload-v2",
+}
+
 func TestResponsesAgentMessagePlaintextLowersOverRealHTTP(t *testing.T) {
 	t.Parallel()
 
@@ -105,6 +127,145 @@ func TestResponsesAgentMessagePlaintextLowersOverRealHTTP(t *testing.T) {
 			}
 			if result == nil || result.Response == nil || hits.Load() != 1 {
 				t.Fatalf("agent-message result=%#v provider_hits=%d", result, hits.Load())
+			}
+		})
+	}
+}
+
+func TestResponsesAgentMessageExplicitCodexMultiAgentV2CapabilityLowersOverRealHTTP(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name        string
+		path        string
+		newOutbound func(string) (transformer.Outbound, error)
+		response    string
+	}{
+		{
+			name: "chat", path: "/v1/chat/completions",
+			newOutbound: func(baseURL string) (transformer.Outbound, error) {
+				return openai.NewOutboundTransformer(baseURL, "fixture-key")
+			},
+			response: `{"id":"chat_opaque_agent_message","object":"chat.completion","model":"fixture-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`,
+		},
+		{
+			name: "anthropic", path: "/v1/messages",
+			newOutbound: func(baseURL string) (transformer.Outbound, error) {
+				return anthropic.NewOutboundTransformer(baseURL, "fixture-key")
+			},
+			response: `{"id":"msg_opaque_agent_message","type":"message","role":"assistant","model":"fixture-model","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`,
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			var hits atomic.Int32
+			provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				if request.URL.Path != test.path {
+					http.Error(writer, "unexpected provider path", http.StatusNotFound)
+					return
+				}
+				hits.Add(1)
+				body, err := io.ReadAll(request.Body)
+				if err != nil {
+					http.Error(writer, "read provider request", http.StatusBadRequest)
+					return
+				}
+				if !providerHasUserTextParts(body, codexMultiAgentV2UserInputTextParts) {
+					http.Error(writer, "agent message was not projected as the explicitly admitted Codex MultiAgentV2 user input_text message", http.StatusBadRequest)
+					return
+				}
+				writer.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(writer, test.response)
+			}))
+			t.Cleanup(provider.Close)
+
+			target, err := test.newOutbound(provider.URL)
+			if err != nil {
+				t.Fatalf("create outbound: %v", err)
+			}
+			profile, ok := conversion.ProfileFor(target.APIFormat())
+			if !ok {
+				t.Fatalf("target %q has no capability profile", target.APIFormat())
+			}
+			profile.CodexMultiAgentV2Compat = true
+			executor := httpclient.NewHttpClientWithClient(provider.Client())
+			t.Cleanup(executor.CloseIdleConnections)
+			requestBody := strings.Replace(codexAgentMessageRequestBody(), codexAgentMessageWireFixture, codexMultiAgentV2AgentMessageWireFixture, 1)
+			result, err := pipeline.NewFactory(executor).
+				Pipeline(responses.NewInboundTransformer(), conversion.NewOutbound(target, conversion.WithCapabilityProfile(profile))).
+				Process(context.Background(), responsesLiteRequestFromBody(requestBody))
+			if err != nil {
+				t.Fatalf("run explicitly admitted Codex MultiAgentV2 agent-message conversion: %v", err)
+			}
+			if result == nil || result.Response == nil || hits.Load() != 1 {
+				t.Fatalf("Codex MultiAgentV2 agent-message result=%#v provider_hits=%d", result, hits.Load())
+			}
+		})
+	}
+}
+
+func TestResponsesCodexMultiAgentV2CapabilityRequiresLiteSourceOverRealHTTP(t *testing.T) {
+	t.Parallel()
+	var hits atomic.Int32
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		http.Error(writer, "non-Lite source must not reach configured CPA-compatible target", http.StatusInternalServerError)
+	}))
+	t.Cleanup(provider.Close)
+	target, err := openai.NewOutboundTransformer(provider.URL, "fixture-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, ok := conversion.ProfileFor(target.APIFormat())
+	if !ok {
+		t.Fatalf("target %q has no capability profile", target.APIFormat())
+	}
+	profile.CodexMultiAgentV2Compat = true
+	executor := httpclient.NewHttpClientWithClient(provider.Client())
+	t.Cleanup(executor.CloseIdleConnections)
+	requestBody := strings.Replace(codexAgentMessageRequestBody(), codexAgentMessageWireFixture, codexMultiAgentV2AgentMessageWireFixture, 1)
+	_, err = pipeline.NewFactory(executor).
+		Pipeline(responses.NewInboundTransformer(), conversion.NewOutbound(target, conversion.WithCapabilityProfile(profile))).
+		Process(context.Background(), responsesRequestFromBody(requestBody))
+	if !errors.Is(err, conversion.ErrIncompletePlan) || hits.Load() != 0 {
+		t.Fatalf("non-Lite Codex MultiAgentV2 source error=%v provider_hits=%d", err, hits.Load())
+	}
+}
+
+func TestResponsesCodexMultiAgentV2InputBlocksUnconfiguredLegacyTargetsOverRealHTTP(t *testing.T) {
+	t.Parallel()
+	for _, targetFormat := range []llm.APIFormat{llm.APIFormatOpenAIChatCompletion, llm.APIFormatAnthropicMessage} {
+		targetFormat := targetFormat
+		t.Run(string(targetFormat), func(t *testing.T) {
+			t.Parallel()
+			var hits atomic.Int32
+			provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				hits.Add(1)
+				http.Error(writer, "unconfigured Codex MultiAgentV2 target must not receive a request", http.StatusInternalServerError)
+			}))
+			t.Cleanup(provider.Close)
+			var (
+				target transformer.Outbound
+				err    error
+			)
+			if targetFormat == llm.APIFormatOpenAIChatCompletion {
+				target, err = openai.NewOutboundTransformer(provider.URL, "fixture-key")
+			} else {
+				target, err = anthropic.NewOutboundTransformer(provider.URL, "fixture-key")
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			executor := httpclient.NewHttpClientWithClient(provider.Client())
+			t.Cleanup(executor.CloseIdleConnections)
+			requestBody := strings.Replace(codexAgentMessageRequestBody(), codexAgentMessageWireFixture, codexMultiAgentV2AgentMessageWireFixture, 1)
+			_, err = pipeline.NewFactory(executor).
+				Pipeline(responses.NewInboundTransformer(), conversion.NewOutbound(target)).
+				Process(context.Background(), responsesRequestFromBody(requestBody))
+			if !errors.Is(err, conversion.ErrIncompletePlan) || hits.Load() != 0 {
+				t.Fatalf("unconfigured Codex MultiAgentV2 %s error=%v provider_hits=%d", targetFormat, err, hits.Load())
 			}
 		})
 	}
@@ -301,6 +462,43 @@ func TestResponsesAgentMessageSameProtocolPreservesFrozenWireOverRealHTTP(t *tes
 	}
 	if result == nil || result.Response == nil || hits.Load() != 1 {
 		t.Fatalf("same-protocol result=%#v provider_hits=%d", result, hits.Load())
+	}
+}
+
+func TestResponsesCodexMultiAgentV2InputKeepsSameProtocolIdentityOverRealHTTP(t *testing.T) {
+	t.Parallel()
+	var hits atomic.Int32
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/responses" {
+			http.Error(writer, "unexpected provider path", http.StatusNotFound)
+			return
+		}
+		hits.Add(1)
+		body, err := io.ReadAll(request.Body)
+		var payload struct {
+			Input []json.RawMessage `json:"input"`
+		}
+		if err != nil || json.Unmarshal(body, &payload) != nil || len(payload.Input) != 2 ||
+			!semanticJSONEqual(payload.Input[1], []byte(codexMultiAgentV2AgentMessageWireFixture)) {
+			http.Error(writer, "same-protocol Codex MultiAgentV2 input changed", http.StatusBadRequest)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(writer, `{"id":"resp_compat_identity","object":"response","created_at":1,"status":"completed","model":"fixture-model","output":[]}`)
+	}))
+	t.Cleanup(provider.Close)
+	target, err := responses.NewOutboundTransformer(provider.URL, "fixture-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := httpclient.NewHttpClientWithClient(provider.Client())
+	t.Cleanup(executor.CloseIdleConnections)
+	requestBody := strings.Replace(codexAgentMessageRequestBody(), codexAgentMessageWireFixture, codexMultiAgentV2AgentMessageWireFixture, 1)
+	result, err := pipeline.NewFactory(executor).
+		Pipeline(responses.NewInboundTransformer(), conversion.NewOutbound(target)).
+		Process(context.Background(), responsesRequestFromBody(requestBody))
+	if err != nil || result == nil || result.Response == nil || hits.Load() != 1 {
+		t.Fatalf("same-protocol Codex MultiAgentV2 result=%#v provider_hits=%d err=%v", result, hits.Load(), err)
 	}
 }
 
@@ -750,6 +948,12 @@ func responsesRequestFromBody(body string) *httpclient.Request {
 		Method: http.MethodPost, URL: "/v1/responses",
 		Headers: http.Header{"Content-Type": []string{"application/json"}}, Body: []byte(body),
 	}
+}
+
+func responsesLiteRequestFromBody(body string) *httpclient.Request {
+	request := responsesRequestFromBody(body)
+	request.Headers.Set(responses.ResponsesLiteHeader, "true")
+	return request
 }
 
 func codexAgentMessageRequestBody() string {
@@ -1293,4 +1497,44 @@ func providerMessageTexts(content json.RawMessage) []string {
 		}
 	}
 	return texts
+}
+
+// providerHasUserTextParts asserts the actual target-wire contract emitted by
+// CPA's explicit OptimizeMultiAgentV2 is-compat path: the typed agent message
+// becomes a user message and each source content part is represented as an
+// ordered input-text payload. It intentionally does not inspect headers or
+// provider identity; authorization was proven before the encoder ran.
+func providerHasUserTextParts(body []byte, want []string) bool {
+	var payload struct {
+		Messages []struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if json.Unmarshal(body, &payload) != nil {
+		return false
+	}
+	for index := range payload.Messages {
+		message := &payload.Messages[index]
+		if message.Role != "user" {
+			continue
+		}
+		parts := providerMessageTexts(message.Content)
+		if containsTextSequence(parts, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsTextSequence(parts, want []string) bool {
+	if len(want) == 0 || len(parts) < len(want) {
+		return false
+	}
+	for start := 0; start+len(want) <= len(parts); start++ {
+		if reflect.DeepEqual(parts[start:start+len(want)], want) {
+			return true
+		}
+	}
+	return false
 }
