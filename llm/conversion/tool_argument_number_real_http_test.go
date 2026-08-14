@@ -22,6 +22,9 @@ import (
 
 const numericToolArguments = `{"timeout_ms":1000.0,"scientific":1e3,"negative_zero":-0.0,"nested":{"array":[1000.0,1e3,-0.0,9007199254740993.0]},"fraction":12.5,"tiny":1e-3,"string":"1000.0","1000.0":"key"}`
 const numericToolArgumentsWant = `{"timeout_ms":1000,"scientific":1000,"negative_zero":0,"nested":{"array":[1000,1000,0,9007199254740993]},"fraction":12.5,"tiny":1e-3,"string":"1000.0","1000.0":"key"}`
+const unchangedToolArguments = `{"query":"hello"}`
+const unchangedToolArgumentsFirst = `{"query":"hel`
+const unchangedToolArgumentsSecond = `lo"}`
 
 type numericToolProtocol struct {
 	name        string
@@ -111,6 +114,50 @@ func TestFunctionToolIntegralNumbersAreCanonicalAcrossRealSSE3x3(t *testing.T) {
 				assertNumericToolClientWire(t, clientCase.name, aggregated)
 			})
 		}
+	}
+}
+
+func TestUnchangedFunctionArgumentsReplayOriginalFragmentsOverRealSSE(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/responses" {
+			http.Error(writer, "unexpected provider endpoint", http.StatusNotFound)
+			return
+		}
+		writer.Header().Set("Content-Type", "text/event-stream")
+		serveUnchangedToolSSE(t, writer, request)
+	}))
+	t.Cleanup(provider.Close)
+	target, err := responses.NewOutboundTransformer(provider.URL, "fixture-key")
+	if err != nil {
+		t.Fatalf("create Responses provider: %v", err)
+	}
+	executor := httpclient.NewHttpClientWithClient(provider.Client())
+	t.Cleanup(executor.CloseIdleConnections)
+	client := numericToolProtocols(true)[1]
+	result, err := pipeline.NewFactory(executor).Pipeline(client.newInbound(), conversion.NewOutbound(target)).Process(context.Background(), numericToolRequest(client))
+	if err != nil || result == nil || result.EventStream == nil {
+		t.Fatalf("start unchanged function SSE fixture: result=%#v err=%v", result, err)
+	}
+	defer result.EventStream.Close()
+	var fragments []string
+	for result.EventStream.Next() {
+		event := result.EventStream.Current()
+		if event == nil || event.Type != "response.function_call_arguments.delta" {
+			continue
+		}
+		var frame struct {
+			Delta string `json:"delta"`
+		}
+		if err := json.Unmarshal(event.Data, &frame); err != nil {
+			t.Fatalf("decode emitted Responses function delta: %v body=%s", err, event.Data)
+		}
+		fragments = append(fragments, frame.Delta)
+	}
+	if err := result.EventStream.Err(); err != nil {
+		t.Fatalf("consume unchanged function SSE fixture: %v", err)
+	}
+	if len(fragments) != 2 || fragments[0] != unchangedToolArgumentsFirst || fragments[1] != unchangedToolArgumentsSecond {
+		t.Fatalf("unchanged function arguments must retain original SSE fragments: %#v", fragments)
 	}
 }
 
@@ -538,6 +585,25 @@ func serveNumericToolHTTP(t *testing.T, provider string, writer http.ResponseWri
 		_, _ = fmt.Fprintf(writer, `{"id":"msg_numeric","type":"message","role":"assistant","model":"numeric-model","content":[{"type":"tool_use","id":"call_numeric","name":"record_numbers","input":%s}],"stop_reason":"tool_use","usage":{"input_tokens":1,"output_tokens":1}}`, numericToolArguments)
 	default:
 		t.Fatalf("unknown numeric provider %q", provider)
+	}
+}
+
+func serveUnchangedToolSSE(t *testing.T, writer http.ResponseWriter, request *http.Request) {
+	t.Helper()
+	defer request.Body.Close()
+	if _, err := io.ReadAll(request.Body); err != nil {
+		t.Fatalf("read unchanged tool stream request: %v", err)
+	}
+	for _, event := range []map[string]any{
+		{"type": "response.created", "sequence_number": 0, "response": map[string]any{"id": "resp_unchanged", "object": "response", "model": "numeric-model", "status": "in_progress", "output": []any{}}},
+		{"type": "response.output_item.added", "sequence_number": 1, "output_index": 0, "item": map[string]any{"id": "fc_unchanged", "type": "function_call", "status": "in_progress", "call_id": "call_unchanged", "name": "record_numbers", "arguments": "", "execution": "client"}},
+		{"type": "response.function_call_arguments.delta", "sequence_number": 2, "output_index": 0, "item_id": "fc_unchanged", "delta": unchangedToolArgumentsFirst},
+		{"type": "response.function_call_arguments.delta", "sequence_number": 3, "output_index": 0, "item_id": "fc_unchanged", "delta": unchangedToolArgumentsSecond},
+		{"type": "response.function_call_arguments.done", "sequence_number": 4, "output_index": 0, "item_id": "fc_unchanged", "call_id": "call_unchanged", "name": "record_numbers", "arguments": unchangedToolArguments},
+		{"type": "response.output_item.done", "sequence_number": 5, "output_index": 0, "item": map[string]any{"id": "fc_unchanged", "type": "function_call", "status": "completed", "call_id": "call_unchanged", "name": "record_numbers", "arguments": unchangedToolArguments, "execution": "client"}},
+		{"type": "response.completed", "sequence_number": 6, "response": map[string]any{"id": "resp_unchanged", "object": "response", "model": "numeric-model", "status": "completed", "output": []any{}}},
+	} {
+		writeNamedSSEJSON(t, writer, event["type"].(string), event)
 	}
 }
 
