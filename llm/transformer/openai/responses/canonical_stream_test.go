@@ -352,8 +352,10 @@ func TestCanonicalResponsesStreamKeepsStatuslessOpaqueSnapshotsUntouched(t *test
 func TestCanonicalResponsesStreamStatuslessMessageAddedKeepsIdentityAndDoneOwnsFinalStatus(t *testing.T) {
 	t.Parallel()
 	// Codex's current ev_message_item_added fixture omits status entirely. Its
-	// response_item.done snapshot is the authoritative terminal update.
+	// response_item.done snapshot is the authoritative terminal update. Required
+	// empty output_text annotations are a wire repair, not a lifecycle mutation.
 	const addedItem = `{"id":"msg_statusless","type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}`
+	const repairedAddedItem = `{"id":"msg_statusless","type":"message","role":"assistant","content":[{"type":"output_text","text":"hello","annotations":[]}]}`
 	const doneItem = `{"id":"msg_statusless","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello"}]}`
 	decoder := newCanonicalStreamDecoder()
 	var canonicalEvents []llm.Event
@@ -395,7 +397,7 @@ func TestCanonicalResponsesStreamStatuslessMessageAddedKeepsIdentityAndDoneOwnsF
 			}
 		}
 	}
-	require.JSONEq(t, addedItem, string(added.Item))
+	require.JSONEq(t, repairedAddedItem, string(added.Item))
 	require.Len(t, completed.Output, 1)
 	require.NotNil(t, completed.Output[0].Status)
 	require.Equal(t, "completed", *completed.Output[0].Status)

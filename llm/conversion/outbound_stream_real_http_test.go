@@ -21,6 +21,99 @@ import (
 	"github.com/looplj/axonhub/llm/transformer/openai/responses"
 )
 
+func TestResponsesIdentityRepairsRequiredOutputTextAnnotationsOverRealHTTP(t *testing.T) {
+	t.Parallel()
+
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/responses" {
+			http.Error(writer, "unexpected provider path", http.StatusNotFound)
+			return
+		}
+		writer.Header().Set("Content-Type", "text/event-stream")
+		writeNamedSSEJSON(t, writer, "response.created", map[string]any{
+			"type": "response.created", "sequence_number": 0,
+			"response": map[string]any{"id": "resp_annotations", "object": "response", "model": "grok-4.5", "status": "in_progress", "output": []any{}},
+		})
+		// This is the exact malformed shape observed from the production upstream:
+		// output_text exists in output_item.added but omits required annotations.
+		writeNamedSSEJSON(t, writer, "response.output_item.added", map[string]any{
+			"type": "response.output_item.added", "sequence_number": 1, "output_index": 0,
+			"item": map[string]any{"id": "msg_annotations", "type": "message", "role": "assistant", "content": []any{
+				map[string]any{"type": "output_text", "text": "hello"},
+			}},
+		})
+		writeNamedSSEJSON(t, writer, "response.output_item.done", map[string]any{
+			"type": "response.output_item.done", "sequence_number": 2, "output_index": 0,
+			"item": map[string]any{"id": "msg_annotations", "type": "message", "role": "assistant", "status": "completed", "content": []any{
+				map[string]any{"type": "output_text", "text": "hello"},
+			}},
+		})
+		writeNamedSSEJSON(t, writer, "response.completed", map[string]any{
+			"type": "response.completed", "sequence_number": 3,
+			"response": map[string]any{"id": "resp_annotations", "object": "response", "model": "grok-4.5", "status": "completed", "output": []any{
+				map[string]any{"id": "msg_annotations", "type": "message", "role": "assistant", "status": "completed", "content": []any{
+					map[string]any{"type": "output_text", "text": "hello"},
+				}},
+			}},
+		})
+		_, _ = io.WriteString(writer, "data: [DONE]\n\n")
+	}))
+	t.Cleanup(provider.Close)
+
+	target, err := responses.NewOutboundTransformer(provider.URL, "fixture-provider-key")
+	if err != nil {
+		t.Fatalf("create Responses outbound: %v", err)
+	}
+	executor := httpclient.NewHttpClientWithClient(provider.Client())
+	t.Cleanup(executor.CloseIdleConnections)
+	result, err := pipeline.NewFactory(executor).
+		Pipeline(responses.NewInboundTransformer(), conversion.NewOutbound(target)).
+		Process(context.Background(), responsesRequestFromBody(`{"model":"grok-4.5","stream":true,"input":"hello"}`))
+	if err != nil {
+		t.Fatalf("run Responses identity stream: %v", err)
+	}
+	if result == nil || !result.Stream || result.EventStream == nil {
+		t.Fatalf("unexpected Responses identity stream result: %#v", result)
+	}
+	defer result.EventStream.Close()
+
+	seen := map[string]bool{}
+	for result.EventStream.Next() {
+		event := result.EventStream.Current()
+		if event == nil || len(event.Data) == 0 || bytes.Equal(event.Data, []byte("[DONE]")) {
+			continue
+		}
+		var envelope struct {
+			Type     string          `json:"type"`
+			Item     json.RawMessage `json:"item"`
+			Response json.RawMessage `json:"response"`
+		}
+		if err := json.Unmarshal(event.Data, &envelope); err != nil {
+			t.Fatalf("decode Responses identity event: %v", err)
+		}
+		switch envelope.Type {
+		case "response.output_item.added", "response.output_item.done":
+			if !bytes.Contains(envelope.Item, []byte(`"annotations":[]`)) {
+				t.Fatalf("%s omitted required output_text annotations: %s", envelope.Type, envelope.Item)
+			}
+			seen[envelope.Type] = true
+		case "response.completed":
+			if !bytes.Contains(envelope.Response, []byte(`"annotations":[]`)) {
+				t.Fatalf("response.completed omitted required output_text annotations: %s", envelope.Response)
+			}
+			seen[envelope.Type] = true
+		}
+	}
+	if err := result.EventStream.Err(); err != nil {
+		t.Fatalf("consume Responses identity stream: %v", err)
+	}
+	for _, eventType := range []string{"response.output_item.added", "response.output_item.done", "response.completed"} {
+		if !seen[eventType] {
+			t.Fatalf("missing %s", eventType)
+		}
+	}
+}
+
 func TestResponsesCustomToolStreamRoundTripOverRealHTTP(t *testing.T) {
 	t.Parallel()
 

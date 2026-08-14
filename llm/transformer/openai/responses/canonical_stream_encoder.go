@@ -196,6 +196,11 @@ func (encoder *canonicalStreamEncoder) addItem(source *responsesInboundStream, e
 	if event.Snapshot == nil || event.Snapshot.ProtocolHints.SourceFormat != llm.APIFormatOpenAIResponse {
 		markResponsesWireItemInProgress(&wire)
 	}
+	// Same-protocol identity preserves provider-owned values and lifecycle
+	// omissions, but it must not forward a structurally invalid Responses
+	// output item. Strict SDKs require annotations on every output_text part,
+	// including the item snapshot carried by output_item.added.
+	ensureResponsesOutputAnnotations(&wire)
 	encoder.items[key] = wire
 	if event.Snapshot.Kind == llm.ItemKindToolCall || event.Snapshot.Kind == llm.ItemKindMCPCall {
 		encoder.arguments[key] = &strings.Builder{}
