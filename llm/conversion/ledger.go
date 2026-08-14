@@ -35,6 +35,12 @@ type providerArgumentRecordKey struct {
 	name   string
 }
 
+type toolArgumentCanonicalizationKey struct {
+	direction llm.ConversionDirection
+	callID    string
+	ref       ObjectRef
+}
+
 type compactEmulationState struct {
 	instructions string
 }
@@ -42,33 +48,35 @@ type compactEmulationState struct {
 type Session struct {
 	plan *Plan
 
-	bySourceName          map[string]string
-	bySyntheticName       map[string]toolIdentity
-	byWireIdentity        map[toolWireIdentityKey]toolIdentity
-	occupiedNames         map[string]struct{}
-	targetToolNames       map[string]*identifierLedger
-	targetCallIDs         *identifierLedger
-	sourceCallIDs         *identifierLedger
-	schemaRestorations    map[toolWireIdentityKey]schemaRestoration
-	providerArgumentBytes map[providerArgumentRecordKey]json.RawMessage
-	continuation          ContinuationBinding
-	lowerNanos            atomic.Int64
-	restoreNanos          atomic.Int64
-	restoreMiss           atomic.Uint32
-	customInputsRepaired  atomic.Uint32
-	customInputRepairSeen sync.Map
-	customInputRawSeen    sync.Map
-	identifiersNormalized atomic.Uint32
-	schemasNormalized     atomic.Uint32
-	streamViolations      atomic.Uint32
-	lastStreamViolation   atomic.Value
-	lastStreamEvent       atomic.Value
-	terminalEvent         atomic.Value
-	traceEnabled          bool
-	debugMu               sync.Mutex
-	outputBlockers        map[string]struct{}
-	compactEmulation      *compactEmulationState
-	inlineCompaction      *inlineCompactionState
+	bySourceName                  map[string]string
+	bySyntheticName               map[string]toolIdentity
+	byWireIdentity                map[toolWireIdentityKey]toolIdentity
+	occupiedNames                 map[string]struct{}
+	targetToolNames               map[string]*identifierLedger
+	targetCallIDs                 *identifierLedger
+	sourceCallIDs                 *identifierLedger
+	schemaRestorations            map[toolWireIdentityKey]schemaRestoration
+	providerArgumentBytes         map[providerArgumentRecordKey]json.RawMessage
+	continuation                  ContinuationBinding
+	lowerNanos                    atomic.Int64
+	restoreNanos                  atomic.Int64
+	restoreMiss                   atomic.Uint32
+	customInputsRepaired          atomic.Uint32
+	customInputRepairSeen         sync.Map
+	customInputRawSeen            sync.Map
+	identifiersNormalized         atomic.Uint32
+	schemasNormalized             atomic.Uint32
+	toolArgumentsCanonicalized    atomic.Uint32
+	toolArgumentCanonicalizedSeen sync.Map
+	streamViolations              atomic.Uint32
+	lastStreamViolation           atomic.Value
+	lastStreamEvent               atomic.Value
+	terminalEvent                 atomic.Value
+	traceEnabled                  bool
+	debugMu                       sync.Mutex
+	outputBlockers                map[string]struct{}
+	compactEmulation              *compactEmulationState
+	inlineCompaction              *inlineCompactionState
 }
 
 func newSession(plan *Plan, request *llm.Request, traceEnabled bool) *Session {
@@ -267,6 +275,7 @@ func (s *Session) Summary() llm.ConversionTraceSummary {
 	summary.CustomInputsRepaired = s.customInputsRepaired.Load()
 	summary.IdentifiersNormalized = s.identifiersNormalized.Load()
 	summary.SchemasNormalized = s.schemasNormalized.Load()
+	summary.ToolArgumentsCanonicalized = s.toolArgumentsCanonicalized.Load()
 	summary.StreamViolations = s.streamViolations.Load()
 	if value := s.lastStreamViolation.Load(); value != nil {
 		summary.LastStreamViolation, _ = value.(string)
@@ -302,6 +311,24 @@ func (s *Session) recordSchemaNormalization(ref ObjectRef, reversible bool) {
 	}
 	s.schemasNormalized.Add(1)
 	s.recordDebug(llm.ConversionDirectionRequest, ref, "normalize", StrategySchemaNormalize, ReasonProtocolConstraint, reversible)
+}
+
+func (s *Session) recordToolArgumentCanonicalization(direction llm.ConversionDirection, ref ObjectRef, callID string) {
+	if s == nil {
+		return
+	}
+	// The same provider call can be present in the canonical Output lifecycle
+	// and legacy Choice compatibility projection. Count and evidence it once,
+	// while retaining the structural ref of the first (canonical) observation.
+	key := toolArgumentCanonicalizationKey{direction: direction, callID: callID}
+	if callID == "" {
+		key.ref = ref
+	}
+	if _, loaded := s.toolArgumentCanonicalizedSeen.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	s.toolArgumentsCanonicalized.Add(1)
+	s.recordDebug(direction, ref, "normalize", StrategyToolArgumentCanonicalize, ReasonProtocolConstraint, true)
 }
 
 func (s *Session) recordCustomInputRepair(callID string, direction llm.ConversionDirection, ref ObjectRef) {

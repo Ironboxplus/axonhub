@@ -1,7 +1,9 @@
 package conversion
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
 
 	"github.com/looplj/axonhub/llm"
 )
@@ -14,22 +16,29 @@ func restoreInvocationSchemaArguments(call *llm.ToolInvocation, session *Session
 	// later Responses continuation can replay unmodified arguments.
 	session.recordProviderArgumentBytes(call.CallID, call.LogicalName, call.ArgumentsJSON, call.ArgumentsText)
 	paths := session.schemaRestoration(call.LogicalName, call.Namespace)
-	if len(paths) == 0 {
-		return
-	}
 	if len(call.ArgumentsJSON) > 0 {
-		if restored, changed := stripOptionalNullArguments(call.ArgumentsJSON, paths); changed {
+		if restored, schemaChanged, numberChanged := normalizeToolArgumentJSON(call.ArgumentsJSON, paths); schemaChanged || numberChanged {
 			call.ArgumentsJSON = restored
-			session.recordDebug(direction, ref, "restore", StrategySchemaNormalize, ReasonSemanticProjection, true)
+			if schemaChanged {
+				session.recordDebug(direction, ref, "restore", StrategySchemaNormalize, ReasonSemanticProjection, true)
+			}
+			if numberChanged {
+				session.recordToolArgumentCanonicalization(direction, ref, call.CallID)
+			}
 		}
 		return
 	}
 	if call.ArgumentsText == "" {
 		return
 	}
-	if restored, changed := stripOptionalNullArguments([]byte(call.ArgumentsText), paths); changed {
+	if restored, schemaChanged, numberChanged := normalizeToolArgumentJSON([]byte(call.ArgumentsText), paths); schemaChanged || numberChanged {
 		call.ArgumentsText = string(restored)
-		session.recordDebug(direction, ref, "restore", StrategySchemaNormalize, ReasonSemanticProjection, true)
+		if schemaChanged {
+			session.recordDebug(direction, ref, "restore", StrategySchemaNormalize, ReasonSemanticProjection, true)
+		}
+		if numberChanged {
+			session.recordToolArgumentCanonicalization(direction, ref, call.CallID)
+		}
 	}
 }
 
@@ -39,21 +48,44 @@ func restoreLegacySchemaArguments(call *llm.ToolCall, session *Session, directio
 	}
 	session.recordProviderArgumentBytes(call.ID, call.Function.Name, nil, call.Function.Arguments)
 	paths := session.schemaRestoration(call.Function.Name, call.Function.Namespace)
-	if len(paths) == 0 {
-		return
-	}
-	if restored, changed := stripOptionalNullArguments([]byte(call.Function.Arguments), paths); changed {
+	if restored, schemaChanged, numberChanged := normalizeToolArgumentJSON([]byte(call.Function.Arguments), paths); schemaChanged || numberChanged {
 		call.Function.Arguments = string(restored)
-		session.recordDebug(direction, ref, "restore", StrategySchemaNormalize, ReasonSemanticProjection, true)
+		if schemaChanged {
+			session.recordDebug(direction, ref, "restore", StrategySchemaNormalize, ReasonSemanticProjection, true)
+		}
+		if numberChanged {
+			session.recordToolArgumentCanonicalization(direction, ref, call.ID)
+		}
 	}
+}
+
+// normalizeToolArgumentJSON composes semantic schema restoration with the
+// protocol-independent exact-number spelling required by typed tool clients.
+// Provider raw bytes are recorded before this function is reached.
+func normalizeToolArgumentJSON(raw []byte, paths []schemaOptionalPath) (json.RawMessage, bool, bool) {
+	restored := json.RawMessage(raw)
+	schemaChanged := false
+	if len(paths) > 0 {
+		if candidate, changed := stripOptionalNullArguments(restored, paths); changed {
+			restored, schemaChanged = candidate, true
+		}
+	}
+	canonical, numberChanged := canonicalizeIntegralJSONNumbers(restored)
+	return canonical, schemaChanged, numberChanged
 }
 
 func stripOptionalNullArguments(raw []byte, paths []schemaOptionalPath) (json.RawMessage, bool) {
 	if len(raw) == 0 || len(paths) == 0 {
 		return raw, false
 	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
 	var value any
-	if json.Unmarshal(raw, &value) != nil {
+	if decoder.Decode(&value) != nil {
+		return raw, false
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
 		return raw, false
 	}
 	changed := false

@@ -221,6 +221,8 @@ func objectEvidenceLocation(direction llm.ConversionDirection, ref ObjectRef, st
 	switch strategy {
 	case StrategySchemaNormalize:
 		fieldPath += ".parameters"
+	case StrategyToolArgumentCanonicalize:
+		fieldPath += ".arguments"
 	case StrategyRequestControl:
 		fieldPath += ".position"
 	case StrategyRequestControlMultiplicity:

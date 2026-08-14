@@ -91,6 +91,12 @@ var targets = []target{
 	{File: "conversion/planner.go", Function: "actionForHostedCall"},
 	{File: "conversion/planner.go", Function: "actionForToolDefinition"},
 	{File: "conversion/ledger.go", Receiver: "Session", Function: "recordDebug"},
+	// Tool arguments cross every protocol boundary. Their exact numeric spelling
+	// is a client-safety contract, so parser, normalization, and payload-free
+	// evidence must remain fully covered when this code changes.
+	{File: "conversion/tool_argument_number.go"},
+	{File: "conversion/schema_restore.go", Function: "normalizeToolArgumentJSON"},
+	{File: "conversion/ledger.go", Receiver: "Session", Function: "recordToolArgumentCanonicalization"},
 	// Inline compaction is one security/state-machine boundary. Every production
 	// source file in this family is a whole-file target: adding a new union,
 	// sanitization, token, projection, or restore branch cannot lower the gate.

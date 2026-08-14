@@ -24,8 +24,9 @@ type streamToolState struct {
 	args           jsonValueAccumulator
 	input          string
 	finished       bool
+	arguments      jsonValueAccumulator
+	argumentsDone  bool
 	schemaPaths    []schemaOptionalPath
-	schemaArgs     jsonValueAccumulator
 	schemaFinished bool
 }
 
@@ -61,6 +62,7 @@ func (r *streamRestorer) restore(response *llm.Response) *llm.Response {
 	if response == nil || r == nil || r.session == nil {
 		return response
 	}
+	hadCanonicalEvents := len(response.Events) > 0
 	startedAt := time.Time{}
 	if r.session.traceEnabled {
 		startedAt = time.Now()
@@ -76,6 +78,14 @@ func (r *streamRestorer) restore(response *llm.Response) *llm.Response {
 		}
 	}
 	r.restoreEvents(response)
+	// A decoder's Choices are a compatibility projection of its canonical
+	// Events. When an integral argument spans chunks, restoreEvents deliberately
+	// withholds the only ToolInputDelta until the complete value is available.
+	// Do not then fall back to the matching partial Choice projection. Chunks
+	// that retain canonical events keep their historical Choice behavior.
+	if hadCanonicalEvents && len(response.Events) == 0 {
+		response.Choices = nil
+	}
 	r.recordCrossProtocolOutputBlockers(response)
 	if r.session.traceEnabled {
 		r.session.addRestoreNanos(time.Since(startedAt).Nanoseconds())
@@ -149,16 +159,19 @@ func (r *streamRestorer) restoreEvents(response *llm.Response) {
 			providerNamespace := event.Snapshot.ToolCall.Namespace
 			identity, hasIdentity := r.session.identity(providerName, providerNamespace)
 			schemaPaths := r.session.schemaRestoration(providerName, providerNamespace)
-			if !hasIdentity && len(schemaPaths) == 0 {
-				restored = append(restored, event)
-				continue
-			}
 			state := &streamToolState{
 				identity: identity, hasIdentity: hasIdentity, callID: event.Snapshot.ToolCall.CallID, providerCallID: event.Snapshot.ToolCall.CallID,
 				providerName: providerName,
 				ref:          ref, schemaPaths: schemaPaths,
 			}
 			r.eventTools[key] = state
+			// A complete item may arrive without argument deltas. Normalize it at
+			// the canonical function-argument boundary before client projection;
+			// malformed values stay opaque in restoreInvocationSchemaArguments.
+			restoreInvocationSchemaArguments(event.Snapshot.ToolCall, r.session, llm.ConversionDirectionStream, ref)
+			if len(event.Snapshot.ToolCall.ArgumentsJSON) > 0 || event.Snapshot.ToolCall.ArgumentsText != "" {
+				state.argumentsDone = true
+			}
 			if hasIdentity {
 				restoreCanonicalToolSnapshot(event.Snapshot, state, "")
 				recordIdentityRestore(r.session, llm.ConversionDirectionStream, state.ref, identity, true)
@@ -171,20 +184,25 @@ func (r *streamRestorer) restoreEvents(response *llm.Response) {
 				restored = append(restored, event)
 				continue
 			}
-			if len(state.schemaPaths) > 0 && !state.schemaFinished {
+			if !state.hasIdentity || state.identity.SourceKind == llm.ToolKindFunction {
 				fragment := event.Delta.ArgumentsJSON
-				if fragment == "" || !state.schemaArgs.Add(fragment) {
-					// Optional-field restoration needs the complete JSON value. Buffer
-					// only affected strict calls; unrelated streams stay zero-copy.
+				if fragment == "" || state.argumentsDone || !state.arguments.Add(fragment) {
+					// Emit a function argument only after its entire JSON value is
+					// available. A later integer spelling cannot retract a fragment
+					// already delivered to Chat, Responses, or Anthropic clients.
 					continue
 				}
-				rawArguments := []byte(state.schemaArgs.String())
+				rawArguments := []byte(state.arguments.String())
 				r.session.recordProviderArgumentBytes(state.providerCallID, state.providerName, rawArguments, "")
-				restoredArguments, changed := stripOptionalNullArguments(rawArguments, state.schemaPaths)
+				restoredArguments, schemaChanged, numberChanged := normalizeToolArgumentJSON(rawArguments, state.schemaPaths)
+				state.argumentsDone = true
 				state.schemaFinished = true
 				event.Delta.ArgumentsJSON = string(restoredArguments)
-				if changed {
+				if schemaChanged {
 					r.session.recordDebug(llm.ConversionDirectionStream, state.ref, "restore", StrategySchemaNormalize, ReasonSemanticProjection, true)
+				}
+				if numberChanged {
+					r.session.recordToolArgumentCanonicalization(llm.ConversionDirectionStream, state.ref, state.callID)
 				}
 				restored = append(restored, event)
 				continue
@@ -216,9 +234,22 @@ func (r *streamRestorer) restoreEvents(response *llm.Response) {
 
 		case llm.EventKindToolInputDone:
 			if state := r.eventTools[key]; state != nil {
-				if len(state.schemaPaths) > 0 && !state.schemaFinished && state.schemaArgs.Len() > 0 {
-					r.session.addRestoreMiss()
-					r.session.recordDebug(llm.ConversionDirectionStream, state.ref, "restore_miss", StrategySchemaNormalize, ReasonNoStrategy, false)
+				if (!state.hasIdentity || state.identity.SourceKind == llm.ToolKindFunction) && !state.argumentsDone && state.arguments.Len() > 0 {
+					// Invalid/incomplete JSON must retain the legacy opaque contract.
+					// We withheld fragments for lexical safety, so publish their exact
+					// bytes once at the terminal boundary instead of silently dropping.
+					if !detached {
+						copyOfRestored := make([]llm.Event, len(restored), len(source)+1)
+						copy(copyOfRestored, restored)
+						restored = copyOfRestored
+						detached = true
+					}
+					rawArguments := state.arguments.String()
+					r.session.recordProviderArgumentBytes(state.providerCallID, state.providerName, []byte(rawArguments), "")
+					restored = append(restored, llm.Event{Kind: llm.EventKindToolInputDelta, Sequence: event.Sequence, ItemRef: event.ItemRef, Delta: llm.Delta{ArgumentsJSON: rawArguments}})
+					event.Sequence++
+					r.sequenceOffset++
+					state.argumentsDone = true
 				}
 				if !state.finished && state.args.Len() > 0 {
 					state.finished = true
@@ -331,7 +362,10 @@ func (r *streamRestorer) restoreMessage(choiceIndex int, message *llm.Message) {
 		providerNamespace := call.Function.Namespace
 		identity, hasIdentity := r.session.identity(providerName, providerNamespace)
 		schemaPaths := r.session.schemaRestoration(providerName, providerNamespace)
-		if hasIdentity || len(schemaPaths) > 0 {
+		// Native function calls require the same complete-value boundary as
+		// lowered calls: a numeric spelling in a later SSE chunk must be able to
+		// replace an earlier chunk before any client protocol observes it.
+		if hasIdentity || len(schemaPaths) > 0 || providerName != "" {
 			if state == nil {
 				state = &streamToolState{
 					identity: identity, hasIdentity: hasIdentity, ref: ref, schemaPaths: schemaPaths, providerCallID: providerCallID, providerName: providerName,
@@ -349,17 +383,25 @@ func (r *streamRestorer) restoreMessage(choiceIndex int, message *llm.Message) {
 		if call.ID != "" {
 			state.callID = call.ID
 		}
-		if len(state.schemaPaths) > 0 && call.Function.Arguments != "" && !state.schemaFinished {
+		if (!state.hasIdentity || state.identity.SourceKind == llm.ToolKindFunction) && call.Function.Arguments != "" && !state.argumentsDone {
 			fragment := call.Function.Arguments
 			call.Function.Arguments = ""
-			if state.schemaArgs.Add(fragment) {
-				rawArguments := []byte(state.schemaArgs.String())
-				r.session.recordProviderArgumentBytes(state.providerCallID, call.Function.Name, rawArguments, "")
-				restoredArguments, changed := stripOptionalNullArguments(rawArguments, state.schemaPaths)
+			if state.arguments.Add(fragment) {
+				rawArguments := []byte(state.arguments.String())
+				providerName := state.providerName
+				if providerName == "" {
+					providerName = call.Function.Name
+				}
+				r.session.recordProviderArgumentBytes(state.providerCallID, providerName, rawArguments, "")
+				restoredArguments, schemaChanged, numberChanged := normalizeToolArgumentJSON(rawArguments, state.schemaPaths)
+				state.argumentsDone = true
 				state.schemaFinished = true
 				call.Function.Arguments = string(restoredArguments)
-				if changed {
+				if schemaChanged {
 					r.session.recordDebug(llm.ConversionDirectionStream, state.ref, "restore", StrategySchemaNormalize, ReasonSemanticProjection, true)
+				}
+				if numberChanged {
+					r.session.recordToolArgumentCanonicalization(llm.ConversionDirectionStream, state.ref, state.callID)
 				}
 			}
 		}
@@ -423,7 +465,27 @@ func (r *streamRestorer) flushIncomplete(choiceIndex int, choice *llm.Choice) {
 	// terminal chunks nondeterministic when more than one call was incomplete.
 	for _, key := range r.order {
 		state := r.tools[key]
-		if key.choice != choiceIndex || state == nil || state.finished || state.args.Len() == 0 {
+		if key.choice != choiceIndex || state == nil {
+			continue
+		}
+		if (!state.hasIdentity || state.identity.SourceKind == llm.ToolKindFunction) && !state.argumentsDone && state.arguments.Len() > 0 {
+			if choice.Delta == nil {
+				choice.Delta = &llm.Message{Role: "assistant"}
+			}
+			name, namespace := state.providerName, ""
+			if state.hasIdentity {
+				name, namespace = state.identity.SourceName, state.identity.SourceNamespace
+			}
+			raw := state.arguments.String()
+			r.session.recordProviderArgumentBytes(state.providerCallID, state.providerName, []byte(raw), "")
+			choice.Delta.ToolCalls = append(choice.Delta.ToolCalls, llm.ToolCall{
+				Index: key.tool, ID: state.callID, Type: llm.ToolTypeFunction,
+				Function: llm.FunctionCall{Name: name, Namespace: namespace, Arguments: raw},
+			})
+			state.argumentsDone = true
+			continue
+		}
+		if state.finished || state.args.Len() == 0 {
 			continue
 		}
 		if choice.Delta == nil {

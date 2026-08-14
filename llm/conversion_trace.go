@@ -333,15 +333,19 @@ type ConversionTraceSummary struct {
 	Opaque   uint32 `json:"opaque"`
 	Unknown  uint32 `json:"unknown"`
 
-	RestoreMiss           uint32    `json:"restore_miss"`
-	CustomInputsRepaired  uint32    `json:"custom_inputs_repaired"`
-	IdentifiersNormalized uint32    `json:"identifiers_normalized"`
-	SchemasNormalized     uint32    `json:"schemas_normalized"`
-	StreamViolations      uint32    `json:"stream_violations"`
-	LastStreamViolation   string    `json:"last_stream_violation,omitempty"`
-	LastStreamEvent       EventKind `json:"last_stream_event,omitempty"`
-	TerminalEvent         EventKind `json:"terminal_event,omitempty"`
-	Complete              bool      `json:"complete"`
+	RestoreMiss           uint32 `json:"restore_miss"`
+	CustomInputsRepaired  uint32 `json:"custom_inputs_repaired"`
+	IdentifiersNormalized uint32 `json:"identifiers_normalized"`
+	SchemasNormalized     uint32 `json:"schemas_normalized"`
+	// ToolArgumentsCanonicalized counts distinct tool-call objects whose valid
+	// JSON arguments required exact numeric spelling for a typed client. It
+	// contains no arguments, names, IDs, or payload-derived values.
+	ToolArgumentsCanonicalized uint32    `json:"tool_arguments_canonicalized"`
+	StreamViolations           uint32    `json:"stream_violations"`
+	LastStreamViolation        string    `json:"last_stream_violation,omitempty"`
+	LastStreamEvent            EventKind `json:"last_stream_event,omitempty"`
+	TerminalEvent              EventKind `json:"terminal_event,omitempty"`
+	Complete                   bool      `json:"complete"`
 
 	// Responses WebSocket transport evidence is counted once per logical
 	// request, never per delta. It contains no URL, session, tenant, header, or

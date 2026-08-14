@@ -58,6 +58,7 @@ const (
 	StrategyRequestControlMultiplicity StrategyID = "request_control_multiplicity"
 	StrategyIdentifierNormalize        StrategyID = "identifier_normalization"
 	StrategySchemaNormalize            StrategyID = "schema_normalization"
+	StrategyToolArgumentCanonicalize   StrategyID = "tool_argument_numeric_canonicalization"
 	StrategyOpaqueSidecar              StrategyID = "opaque_sidecar"
 	StrategyCompactAsChat              StrategyID = "compact_as_chat"
 	StrategyInlineCompactionGateway    StrategyID = "inline_compaction_gateway"

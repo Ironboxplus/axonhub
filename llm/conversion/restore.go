@@ -26,12 +26,16 @@ func RestoreResponseContext(ctx context.Context, response *llm.Response, session
 	if session.traceEnabled {
 		startedAt = time.Now()
 	}
+	// Canonical Output is the authoritative lifecycle whenever a provider has
+	// both it and the legacy Choice compatibility projection. Restore it first
+	// so payload-free evidence points at output[n].tool_call rather than a
+	// duplicate legacy representation of the same provider call.
+	restoreCanonicalOutput(response.Output, session, llm.ConversionDirectionResponse)
 	for choiceIndex := range response.Choices {
 		choice := &response.Choices[choiceIndex]
 		restoreMessage(choice.Message, session, llm.ConversionDirectionResponse, choice.Index)
 		restoreMessage(choice.Delta, session, llm.ConversionDirectionResponse, choice.Index)
 	}
-	restoreCanonicalOutput(response.Output, session, llm.ConversionDirectionResponse)
 	normalizeResponseIdentifiers(ctx, response, session, llm.ConversionDirectionResponse)
 	recordCrossProtocolOutputBlockers(session, llm.ConversionDirectionResponse, response.Output)
 	if session.traceEnabled {
