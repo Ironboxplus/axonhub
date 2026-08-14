@@ -623,6 +623,10 @@ func TestInlineCompactionContinuationAcceptsOnlyOneSafePlaintextOutput(t *testin
 	}{
 		{name: "nil"},
 		{name: "single assistant output", resp: &llm.Response{Output: []llm.Item{{Kind: llm.ItemKindMessage, Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Kind: llm.ContentKindText, Text: "output continuation"}}}}}, ok: true},
+		{name: "reasoning then assistant output", resp: &llm.Response{Output: []llm.Item{
+			{Kind: llm.ItemKindReasoning, Reasoning: &llm.ReasoningItem{Content: "PRIVATE_REASONING", Signature: "PRIVATE_SIGNATURE"}},
+			{Kind: llm.ItemKindMessage, Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Kind: llm.ContentKindText, Text: "output continuation"}}},
+		}}, ok: true},
 		{name: "legacy stopped choice remains valid", resp: &llm.Response{Choices: []llm.Choice{{FinishReason: stringPointer("stop"), Message: &llm.Message{Role: "assistant", Content: llm.MessageContent{Content: stringPointer("legacy summary")}}}}}, ok: true},
 		{name: "incomplete status", resp: &llm.Response{Status: llm.ResponseStatusIncomplete, Output: []llm.Item{{Kind: llm.ItemKindMessage, Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Kind: llm.ContentKindText, Text: "partial"}}}}}},
 		{name: "failed status", resp: &llm.Response{Status: llm.ResponseStatusFailed, Error: &llm.ResponseError{Detail: llm.ErrorDetail{Code: "failed", Message: "provider failed"}}, Output: []llm.Item{{Kind: llm.ItemKindMessage, Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Kind: llm.ContentKindText, Text: "partial"}}}}}},
@@ -630,7 +634,21 @@ func TestInlineCompactionContinuationAcceptsOnlyOneSafePlaintextOutput(t *testin
 		{name: "failed lifecycle event", resp: &llm.Response{Events: []llm.Event{{Kind: llm.EventKindResponseFailed, Error: &llm.ResponseError{Detail: llm.ErrorDetail{Code: "failed", Message: "provider failed"}}}}, Output: []llm.Item{{Kind: llm.ItemKindMessage, Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Kind: llm.ContentKindText, Text: "partial"}}}}}},
 		{name: "Chat length finish", resp: &llm.Response{Choices: []llm.Choice{{FinishReason: stringPointer("length"), Message: &llm.Message{Role: "assistant", Content: llm.MessageContent{Content: stringPointer("partial")}}}}}},
 		{name: "Anthropic max tokens finish", resp: &llm.Response{Choices: []llm.Choice{{FinishReason: stringPointer("max_tokens"), Message: &llm.Message{Role: "assistant", Content: llm.MessageContent{Content: stringPointer("partial")}}}}}},
-		{name: "output private", resp: &llm.Response{Output: []llm.Item{{Kind: llm.ItemKindMessage, Role: llm.RoleAssistant, ProtocolHints: llm.ProtocolHints{SourceResidual: []byte(`{"private":true}`)}, Content: []llm.ContentBlock{{Kind: llm.ContentKindText, Text: "unsafe"}}}}}},
+		{name: "output sidecar is stripped", resp: &llm.Response{Output: []llm.Item{{
+			Kind: llm.ItemKindMessage, Role: llm.RoleAssistant, ProtocolHints: llm.ProtocolHints{SourceResidual: []byte(`{"private":true}`)},
+			Content: []llm.ContentBlock{{Kind: llm.ContentKindText, Text: "safe"}},
+		}}}, ok: true},
+		{name: "multiple assistant outputs", resp: &llm.Response{Output: []llm.Item{
+			{Kind: llm.ItemKindMessage, Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Kind: llm.ContentKindText, Text: "first"}}},
+			{Kind: llm.ItemKindMessage, Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Kind: llm.ContentKindText, Text: "second"}}},
+		}}},
+		{name: "nontext assistant output", resp: &llm.Response{Output: []llm.Item{{Kind: llm.ItemKindMessage, Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Kind: llm.ContentKindImage, Image: &llm.ImageURL{URL: "data:image/png;base64,QUJD"}}}}}}},
+		{name: "tool output", resp: &llm.Response{Output: []llm.Item{{Kind: llm.ItemKindToolCall, ToolCall: &llm.ToolInvocation{Kind: llm.ToolKindFunction}}}}},
+		{name: "hosted output", resp: &llm.Response{Output: []llm.Item{{Kind: llm.ItemKindHostedCall, HostedCall: &llm.HostedToolCall{Invocation: llm.ToolInvocation{Kind: llm.ToolKindWebSearch}}}}}},
+		{name: "agent output", resp: &llm.Response{Output: []llm.Item{{Kind: llm.ItemKindAgentMessage, AgentMessage: &llm.AgentMessage{Author: "/root", Recipient: "/root/child", Content: []llm.AgentMessageContentPart{{Kind: llm.AgentMessageContentInputText, Text: "route"}}}}}}},
+		{name: "compaction output", resp: &llm.Response{Output: []llm.Item{{Kind: llm.ItemKindCompaction, Compaction: &llm.CompactionItem{EncryptedContent: "provider-private"}}}}},
+		{name: "context compaction output", resp: &llm.Response{Output: []llm.Item{{Kind: llm.ItemKindContextCompaction, ContextCompaction: &llm.ContextCompactionItem{EncryptedContent: stringPointer("provider-private")}}}}},
+		{name: "unknown output", resp: &llm.Response{Output: []llm.Item{{Kind: llm.ItemKindUnknown, Unknown: &llm.UnknownItem{Type: "future", Raw: json.RawMessage(`{"private":true}`), Behavioral: true}}}}},
 		{name: "legacy choice", resp: &llm.Response{Choices: []llm.Choice{{Message: &llm.Message{Role: "assistant", Content: llm.MessageContent{Content: &text}}}}}, ok: true},
 		{name: "legacy choice with tool", resp: &llm.Response{Choices: []llm.Choice{{Message: &llm.Message{Role: "assistant", Content: llm.MessageContent{Content: &text}, ToolCalls: []llm.ToolCall{{}}}}}}},
 	}

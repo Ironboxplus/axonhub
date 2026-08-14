@@ -452,6 +452,57 @@ func TestInlineCompactionRejectsNonterminalSummaryAcrossRealTargets(t *testing.T
 	}
 }
 
+func TestInlineCompactionAcceptsResponsesReasoningAndSanitizedAssistantMessageOverRealHTTP(t *testing.T) {
+	t.Parallel()
+	const reasoningSecret = "PROVIDER_REASONING_PRIVATE"
+	const messageSecret = "PROVIDER_MESSAGE_PRIVATE"
+	const contentSecret = "PROVIDER_CONTENT_PRIVATE"
+	var hits atomic.Int32
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		defer request.Body.Close()
+		if request.URL.Path != "/v1/responses" {
+			http.Error(w, "unexpected summary path", http.StatusNotFound)
+			return
+		}
+		body, err := io.ReadAll(request.Body)
+		if err != nil || !strings.Contains(string(body), "Create a concise continuation summary") {
+			http.Error(w, "missing gateway summary input", http.StatusBadRequest)
+			return
+		}
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"responses-terminal","object":"response","created_at":1,"model":"fixture","status":"completed","output":[
+{"id":"reasoning_1","type":"reasoning","status":"completed","encrypted_content":"PROVIDER_REASONING_PRIVATE","summary":[{"type":"summary_text","text":"private reasoning","future_summary":"PROVIDER_REASONING_PRIVATE"}],"future_reasoning":"PROVIDER_REASONING_PRIVATE"},
+{"id":"message_1","type":"message","role":"assistant","status":"completed","future_message":"PROVIDER_MESSAGE_PRIVATE","content":[{"type":"output_text","text":"SAFE_RESPONSES_SUMMARY","future_content":"PROVIDER_CONTENT_PRIVATE","annotations":[{"type":"url_citation","start_index":0,"end_index":4,"url_citation":{"url":"https://example.test/private","title":"private annotation"}}]}]}]}`)
+	}))
+	t.Cleanup(provider.Close)
+	target, err := responses.NewOutboundTransformer(provider.URL, "fixture-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	codec := newDurableReferenceCodec(t, t.TempDir(), []byte("responses-terminal-reasoning"))
+	executor := httpclient.NewHttpClientWithClient(provider.Client())
+	t.Cleanup(executor.CloseIdleConnections)
+	result, err := pipeline.NewFactory(executor).Pipeline(responses.NewInboundTransformer(), conversion.NewOutbound(target, conversion.WithCompactionStateCodec(codec))).Process(context.Background(), &httpclient.Request{
+		Method: http.MethodPost, URL: "/v1/responses", Headers: http.Header{"Content-Type": []string{"application/json"}},
+		Body: []byte(`{"model":"fixture","input":[{"role":"user","content":"RETAINED_TERMINAL_CONTEXT"},{"type":"compaction_trigger"}]}`),
+	})
+	if err != nil || result == nil || result.Stream || result.Response == nil || hits.Load() != 1 {
+		t.Fatalf("terminal compact result=%#v err=%v provider_hits=%d", result, err, hits.Load())
+	}
+	if body := string(result.Response.Body); !strings.Contains(body, `"type":"compaction"`) || strings.Contains(body, reasoningSecret) || strings.Contains(body, messageSecret) || strings.Contains(body, contentSecret) || strings.Contains(body, "SAFE_RESPONSES_SUMMARY") {
+		t.Fatalf("public checkpoint=%s", body)
+	}
+	entries, err := os.ReadDir(codec.dir)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("durable checkpoint entries=%#v err=%v", entries, err)
+	}
+	checkpoint, err := os.ReadFile(filepath.Join(codec.dir, entries[0].Name()))
+	if err != nil || strings.Contains(string(checkpoint), reasoningSecret) || strings.Contains(string(checkpoint), messageSecret) || strings.Contains(string(checkpoint), contentSecret) || strings.Contains(string(checkpoint), "private annotation") || !strings.Contains(string(checkpoint), "SAFE_RESPONSES_SUMMARY") {
+		t.Fatalf("durable checkpoint leaked terminal provider data err=%v body=%s", err, checkpoint)
+	}
+}
+
 func inlineCompactionClientRequest(token string, generation int) []byte {
 	if token == "" {
 		return []byte(`{"model":"fixture","stream":true,"include":["reasoning.encrypted_content"],"truncation":"auto","user":"LEAK_USER","metadata":{"unsafe":"LEAK_METADATA"},"input":[
