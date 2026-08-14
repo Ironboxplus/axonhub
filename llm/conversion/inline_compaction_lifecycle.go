@@ -34,14 +34,16 @@ func classifyInlineCompactionItemForTarget(item llm.Item, target llm.APIFormat) 
 	}
 	switch item.Kind {
 	case llm.ItemKindMessage:
-		if item.Role != llm.RoleSystem && item.Role != llm.RoleDeveloper && item.Role != llm.RoleUser && item.Role != llm.RoleAssistant {
-			return reject(ReasonProtocolConstraint, "inline_history_unsupported_message_role")
+		projection, err := projectInlineCompactionKnownMessage(item)
+		if err != nil {
+			var messageErr *inlineCompactionKnownMessageError
+			if errors.As(err, &messageErr) {
+				return reject(ReasonNoStrategy, messageErr.semantic)
+			}
+			return reject(ReasonNoStrategy, "inline_history_invalid_message")
 		}
-		if hasInlinePrivateItemData(item) {
-			return reject(ReasonProviderPrivate, "inline_history_private_message")
-		}
-		for index := range item.Content {
-			content := item.Content[index]
+		for index := range projection.item.Content {
+			content := projection.item.Content[index]
 			switch content.Kind {
 			case llm.ContentKindText, llm.ContentKindRefusal:
 			case llm.ContentKindImage:

@@ -189,7 +189,7 @@ func TestClassifyInlineCompactionItemForTargetUsesClosedProjectionMatrix(t *test
 		{name: "assistant history", item: llm.Item{Kind: llm.ItemKindMessage, Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Kind: llm.ContentKindText, Text: "assistant history"}}}, target: llm.APIFormatOpenAIResponse, kind: inlineCompactionProjectionSummarize},
 		{name: "unsupported message role", item: llm.Item{Kind: llm.ItemKindMessage, Role: "future", Content: []llm.ContentBlock{{Kind: llm.ContentKindText, Text: "future"}}}, target: llm.APIFormatOpenAIResponse, kind: inlineCompactionProjectionBlock, semantic: "inline_history_unsupported_message_role"},
 		{name: "message refusal", item: llm.Item{Kind: llm.ItemKindMessage, Role: llm.RoleUser, Content: []llm.ContentBlock{{Kind: llm.ContentKindRefusal, Text: "no"}}}, target: llm.APIFormatOpenAIResponse, kind: inlineCompactionProjectionSummarize},
-		{name: "message private", item: llm.Item{Kind: llm.ItemKindMessage, Role: llm.RoleUser, ProtocolHints: llm.ProtocolHints{SourceResidual: []byte(`{"private":true}`)}}, target: llm.APIFormatOpenAIResponse, kind: inlineCompactionProjectionBlock, semantic: "inline_history_private_message"},
+		{name: "message residual sidecar is stripped", item: llm.Item{Kind: llm.ItemKindMessage, Role: llm.RoleUser, ProtocolHints: llm.ProtocolHints{SourceResidual: []byte(`{"private":true}`)}, Content: []llm.ContentBlock{{Kind: llm.ContentKindText, Text: "visible"}}}, target: llm.APIFormatOpenAIResponse, kind: inlineCompactionProjectionSummarize, semantic: "inline_history_message"},
 		{name: "message empty image", item: llm.Item{Kind: llm.ItemKindMessage, Role: llm.RoleUser, Content: []llm.ContentBlock{{Kind: llm.ContentKindImage}}}, target: llm.APIFormatOpenAIResponse, kind: inlineCompactionProjectionBlock, semantic: "inline_history_oversize_image"},
 		{name: "message valid image", item: llm.Item{Kind: llm.ItemKindMessage, Role: llm.RoleUser, Content: []llm.ContentBlock{{Kind: llm.ContentKindImage, Image: &llm.ImageURL{URL: "data:image/png;base64,SAFE"}}}}, target: llm.APIFormatOpenAIResponse, kind: inlineCompactionProjectionSummarize},
 		{name: "message image beyond summary cap", item: llm.Item{Kind: llm.ItemKindMessage, Role: llm.RoleUser, Content: []llm.ContentBlock{{Kind: llm.ContentKindImage, Image: &llm.ImageURL{URL: strings.Repeat("i", maxInlineCompactionSummaryVisibleBytes+1)}}}}, target: llm.APIFormatOpenAIResponse, kind: inlineCompactionProjectionBlock, semantic: "inline_history_oversize_image"},
@@ -409,7 +409,6 @@ func TestInlineCompactionProjectionBlocksEveryPreProviderInvalidState(t *testing
 		{name: "no history", request: triggerRequest(nil), codec: &recordingInlineCompactionCodec{}, code: InlineCompactionInvalidState},
 		{name: "unretainable history", request: triggerRequest([]llm.Item{{Kind: llm.ItemKindToolDeclaration, ToolDeclaration: &llm.ToolDeclarationItem{}}}), codec: &recordingInlineCompactionCodec{}, code: InlineCompactionUnsafeInput},
 		{name: "unsafe retained image", request: triggerRequest([]llm.Item{{Kind: llm.ItemKindMessage, Role: llm.RoleUser, Content: []llm.ContentBlock{{Kind: llm.ContentKindImage, Image: &llm.ImageURL{URL: strings.Repeat("i", maxInlineCompactionRetainedItemBytes+1)}}}}}), codec: &recordingInlineCompactionCodec{}, code: InlineCompactionOversize},
-		{name: "unsafe summary history", request: triggerRequest([]llm.Item{{Kind: llm.ItemKindMessage, Role: llm.RoleUser, ProtocolHints: llm.ProtocolHints{SourceResidual: []byte(`{"private":true}`)}, Content: []llm.ContentBlock{{Kind: llm.ContentKindText, Text: "private"}}}}), codec: &recordingInlineCompactionCodec{}, code: InlineCompactionUnsafeInput},
 	}
 	for _, test := range tests {
 		test := test
@@ -539,8 +538,8 @@ func TestInlineCompactionSummaryMessageProjectsTypedHistoryWithoutPrivateSidecar
 			t.Fatalf("unsafe summary history was projected: %#v", item)
 		}
 	}
-	if message, err := inlineCompactionSummaryMessage(llm.Item{Kind: llm.ItemKindMessage, Role: llm.RoleUser}, llm.APIFormatOpenAIResponse, &drops); err != nil || message != nil {
-		t.Fatalf("empty typed message must not create empty provider context: message=%#v err=%v", message, err)
+	if message, err := inlineCompactionSummaryMessage(llm.Item{Kind: llm.ItemKindMessage, Role: llm.RoleUser}, llm.APIFormatOpenAIResponse, &drops); err == nil || message != nil {
+		t.Fatalf("empty typed message must fail before provider context: message=%#v err=%v", message, err)
 	}
 	if message, err := inlineCompactionSummaryMessage(llm.Item{Kind: llm.ItemKindReasoning}, llm.APIFormatOpenAIResponse, &drops); err != nil || message != nil || drops.Reasoning == 0 {
 		t.Fatalf("reasoning was not explicitly dropped: message=%#v drops=%#v err=%v", message, drops, err)
@@ -578,6 +577,32 @@ func TestInlineCompactionSummaryMessageProjectsTypedHistoryWithoutPrivateSidecar
 	hosted, err := inlineCompactionSummaryMessage(llm.Item{Kind: llm.ItemKindHostedCall, HostedCall: &llm.HostedToolCall{Invocation: llm.ToolInvocation{Kind: llm.ToolKindWebSearch}}}, llm.APIFormatOpenAIResponse, &drops)
 	if err != nil || hosted == nil || !inlineSummaryMessageContains(*hosted, "hosted web operation") {
 		t.Fatalf("hosted history=%#v err=%v", hosted, err)
+	}
+}
+
+func TestInlineCompactionKnownMessageProjectionStripsResidualSidecarsAndRejectsSecondArms(t *testing.T) {
+	item := llm.Item{
+		Kind: llm.ItemKindMessage, Role: llm.RoleUser,
+		ProtocolHints: llm.ProtocolHints{ResidualOwnerType: "message", SourceResidual: json.RawMessage(`{"future_item":"ITEM_SIDECAR_SECRET"}`)},
+		Content: []llm.ContentBlock{{
+			Kind: llm.ContentKindText, ID: "text_1", Text: "VISIBLE_HISTORY", ResidualOwnerType: "input_text",
+			SourceResidual: json.RawMessage(`{"future_content":"CONTENT_SIDECAR_SECRET"}`), UnknownRaw: json.RawMessage(`{"unknown":"UNKNOWN_SIDECAR_SECRET"}`),
+		}},
+	}
+	drops := inlineCompactionDrops{}
+	message, err := inlineCompactionSummaryMessage(item, llm.APIFormatOpenAIResponse, &drops)
+	if err != nil || message == nil || !inlineSummaryMessageContains(*message, "VISIBLE_HISTORY") || inlineSummaryMessageContains(*message, "SIDECAR_SECRET") || drops.SourceSidecars != 2 {
+		t.Fatalf("known message projection=%#v drops=%#v err=%v", message, drops, err)
+	}
+	retained, err := retainedInlineCompactionItem(item)
+	if err != nil || !inlineCompactionEmptyProtocolHints(retained.ProtocolHints) || retained.ID != "" || len(retained.Content) != 1 || retained.Content[0].ID != "" || len(retained.Content[0].SourceResidual) != 0 || len(retained.Content[0].UnknownRaw) != 0 || retained.Content[0].ResidualOwnerType != "" || retained.Content[0].Text != "VISIBLE_HISTORY" {
+		t.Fatalf("known message retention=%#v err=%v", retained, err)
+	}
+
+	secondArm := llm.Item{Kind: llm.ItemKindMessage, Role: llm.RoleUser, Content: []llm.ContentBlock{{Kind: llm.ContentKindText, Text: "visible", Image: &llm.ImageURL{URL: "data:image/png;base64,QUJD"}}}}
+	decision := classifyInlineCompactionItemForTarget(secondArm, llm.APIFormatOpenAIResponse)
+	if decision.kind != inlineCompactionProjectionBlock || decision.semantic != "inline_history_message_second_content_arm" {
+		t.Fatalf("second content arm decision=%#v", decision)
 	}
 }
 
@@ -892,8 +917,8 @@ func TestInlineCompactionClosedHelperFailurePaths(t *testing.T) {
 	if item, err := retainedInlineCompactionItem(llm.Item{Kind: llm.ItemKindMessage, Role: llm.RoleUser, Content: []llm.ContentBlock{{Kind: llm.ContentKindDocument, Document: &llm.DocumentURL{SourceType: llm.DocumentSourceText, Data: "document only"}}}}); !errors.Is(err, errInlineCompactionNotRetained) || item.Kind != "" {
 		t.Fatalf("document-only retained item=%#v err=%v", item, err)
 	}
-	if _, err := retainedInlineCompactionItem(llm.Item{Kind: llm.ItemKindMessage, Role: llm.RoleUser, Content: []llm.ContentBlock{{Kind: llm.ContentKindText, Text: "safe", SourceResidual: json.RawMessage(`{"private":true}`)}}}); err == nil {
-		t.Fatal("retained source residual was accepted")
+	if item, err := retainedInlineCompactionItem(llm.Item{Kind: llm.ItemKindMessage, Role: llm.RoleUser, Content: []llm.ContentBlock{{Kind: llm.ContentKindText, Text: "safe", SourceResidual: json.RawMessage(`{"private":true}`)}}}); err != nil || len(item.Content) != 1 || item.Content[0].Text != "safe" || len(item.Content[0].SourceResidual) != 0 {
+		t.Fatalf("retained source residual was not safely stripped: item=%#v err=%v", item, err)
 	}
 	large := make([]llm.ContentBlock, 0, 70)
 	for index := 0; index < 70; index++ {

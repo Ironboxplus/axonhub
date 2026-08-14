@@ -72,9 +72,16 @@ func inlineCompactionSummaryMessageWithProjectors(item llm.Item, target llm.APIF
 		if decision.kind != inlineCompactionProjectionSummarize {
 			return reject()
 		}
-		content := make([]llm.MessageContentPart, 0, len(item.Content))
-		for index := range item.Content {
-			block := item.Content[index]
+		projection, err := projectInlineCompactionKnownMessage(item)
+		if err != nil {
+			return nil, &InlineCompactionError{Code: InlineCompactionUnsafeInput, Err: err}
+		}
+		if drops != nil {
+			drops.SourceSidecars += projection.sourceSidecars
+		}
+		content := make([]llm.MessageContentPart, 0, len(projection.item.Content))
+		for index := range projection.item.Content {
+			block := projection.item.Content[index]
 			switch block.Kind {
 			case llm.ContentKindText, llm.ContentKindRefusal:
 				text := block.Text
@@ -99,8 +106,8 @@ func inlineCompactionSummaryMessageWithProjectors(item llm.Item, target llm.APIF
 		if len(content) == 0 {
 			return nil, nil
 		}
-		role := string(item.Role)
-		if item.Role == llm.RoleAssistant {
+		role := string(projection.item.Role)
+		if projection.item.Role == llm.RoleAssistant {
 			role = string(llm.RoleUser)
 		}
 		return &llm.Message{Role: role, Content: llm.MessageContent{MultipleContent: content}}, nil

@@ -224,6 +224,99 @@ func truncateRetainedInlineItem(item llm.Item, budget int) (llm.Item, int) {
 
 var errInlineCompactionNotRetained = errors.New("not retained")
 
+// inlineCompactionKnownMessageProjection is the sole closed projection for a
+// typed message that is allowed into either the summary request or a durable
+// checkpoint. Responses keeps source residuals on known typed objects so an
+// identity route can replay them. Gateway compaction is not an identity route:
+// it rebuilds only the model-visible union and records every stripped source
+// sidecar without ever serializing it upstream or into retained state.
+type inlineCompactionKnownMessageProjection struct {
+	item           llm.Item
+	sourceSidecars uint32
+}
+
+type inlineCompactionKnownMessageError struct {
+	semantic string
+}
+
+func (err *inlineCompactionKnownMessageError) Error() string {
+	if err == nil {
+		return "inline compaction known message is invalid"
+	}
+	return err.semantic
+}
+
+func rejectInlineCompactionKnownMessage(semantic string) (inlineCompactionKnownMessageProjection, error) {
+	return inlineCompactionKnownMessageProjection{}, &inlineCompactionKnownMessageError{semantic: semantic}
+}
+
+func projectInlineCompactionKnownMessage(item llm.Item) (inlineCompactionKnownMessageProjection, error) {
+	if item.Kind != llm.ItemKindMessage {
+		return rejectInlineCompactionKnownMessage("inline_history_invalid_message")
+	}
+	if item.Role != llm.RoleSystem && item.Role != llm.RoleDeveloper && item.Role != llm.RoleUser && item.Role != llm.RoleAssistant {
+		return rejectInlineCompactionKnownMessage("inline_history_unsupported_message_role")
+	}
+	if len(item.Content) == 0 || !inlineCompactionMessageHasOnlyContentArm(item) {
+		return rejectInlineCompactionKnownMessage("inline_history_invalid_message_union")
+	}
+
+	projection := inlineCompactionKnownMessageProjection{item: llm.Item{Kind: llm.ItemKindMessage, Role: item.Role, Content: make([]llm.ContentBlock, 0, len(item.Content))}}
+	if inlineCompactionProtocolHintsHaveSidecar(item.ProtocolHints) {
+		projection.sourceSidecars++
+	}
+	for index := range item.Content {
+		block, sidecar, err := projectInlineCompactionKnownMessageContent(item.Content[index])
+		if err != nil {
+			return inlineCompactionKnownMessageProjection{}, err
+		}
+		if sidecar {
+			projection.sourceSidecars++
+		}
+		projection.item.Content = append(projection.item.Content, block)
+	}
+	return projection, nil
+}
+
+func inlineCompactionMessageHasOnlyContentArm(item llm.Item) bool {
+	return item.ToolCall == nil && item.ToolResult == nil && item.HostedCall == nil && item.MCPListTools == nil && item.MCPApprovalRequest == nil && item.MCPApprovalResponse == nil && item.MCPCall == nil && item.Reasoning == nil && item.AgentMessage == nil && item.Compaction == nil && item.ContextCompaction == nil && item.CompactionTrigger == nil && item.ToolDeclaration == nil && item.Unknown == nil
+}
+
+func inlineCompactionProtocolHintsHaveSidecar(hints llm.ProtocolHints) bool {
+	return hints.ResidualOwnerType != "" || len(hints.SourceResidual) > 0
+}
+
+func projectInlineCompactionKnownMessageContent(block llm.ContentBlock) (llm.ContentBlock, bool, error) {
+	sidecar := block.ID != "" || block.StartIndex != nil || block.EndIndex != nil || block.ResidualOwnerType != "" || len(block.SourceResidual) > 0 || len(block.UnknownRaw) > 0
+	switch block.Kind {
+	case llm.ContentKindText, llm.ContentKindRefusal:
+		if block.Image != nil || block.Audio != nil || block.Document != nil || block.Citation != nil {
+			return llm.ContentBlock{}, false, &inlineCompactionKnownMessageError{semantic: "inline_history_message_second_content_arm"}
+		}
+		return llm.ContentBlock{Kind: block.Kind, Text: block.Text}, sidecar, nil
+	case llm.ContentKindImage:
+		if block.Image == nil {
+			return llm.ContentBlock{}, false, &inlineCompactionKnownMessageError{semantic: "inline_history_oversize_image"}
+		}
+		if block.Text != "" || block.Audio != nil || block.Document != nil || block.Citation != nil {
+			return llm.ContentBlock{}, false, &inlineCompactionKnownMessageError{semantic: "inline_history_message_second_content_arm"}
+		}
+		image := *block.Image
+		return llm.ContentBlock{Kind: llm.ContentKindImage, Image: &image}, sidecar, nil
+	case llm.ContentKindDocument:
+		if block.Text != "" || block.Image != nil || block.Audio != nil || block.Document == nil || block.Citation != nil {
+			return llm.ContentBlock{}, false, &inlineCompactionKnownMessageError{semantic: "inline_history_message_second_content_arm"}
+		}
+		if err := block.Document.Validate(); err != nil {
+			return llm.ContentBlock{}, false, &inlineCompactionKnownMessageError{semantic: "inline_history_unsupported_document"}
+		}
+		document := *block.Document
+		return llm.ContentBlock{Kind: llm.ContentKindDocument, Document: &document}, sidecar, nil
+	default:
+		return llm.ContentBlock{}, false, &inlineCompactionKnownMessageError{semantic: "inline_history_unsupported_content"}
+	}
+}
+
 func retainedInlineCompactionItem(item llm.Item) (llm.Item, error) {
 	return retainedInlineCompactionItemWithMarshal(item, json.Marshal)
 }
@@ -235,12 +328,13 @@ func retainedInlineCompactionItemWithMarshal(item llm.Item, marshal inlineCompac
 	if item.Kind != llm.ItemKindMessage || (item.Role != llm.RoleUser && item.Role != llm.RoleDeveloper && item.Role != llm.RoleSystem) {
 		return llm.Item{}, errInlineCompactionNotRetained
 	}
-	if hasInlinePrivateItemData(item) {
-		return llm.Item{}, &InlineCompactionError{Code: InlineCompactionUnsafeInput, Err: errors.New("retained message contains source-private data")}
+	projection, err := projectInlineCompactionKnownMessage(item)
+	if err != nil {
+		return llm.Item{}, &InlineCompactionError{Code: InlineCompactionUnsafeInput, Err: err}
 	}
-	content := make([]llm.ContentBlock, 0, len(item.Content))
-	for index := range item.Content {
-		block := item.Content[index]
+	content := make([]llm.ContentBlock, 0, len(projection.item.Content))
+	for index := range projection.item.Content {
+		block := projection.item.Content[index]
 		switch block.Kind {
 		case llm.ContentKindText, llm.ContentKindRefusal:
 			content = append(content, llm.ContentBlock{Kind: block.Kind, Text: block.Text})

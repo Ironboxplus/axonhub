@@ -471,6 +471,172 @@ func inlineCompactionClientRequest(token string, generation int) []byte {
 	return []byte(fmt.Sprintf(`{"model":"fixture","stream":true,"input":[{"type":"compaction","encrypted_content":%q},{"role":"user","content":"CURRENT_USER_%d"},{"type":"compaction_trigger"}]}`, token, generation))
 }
 
+// inlineCompactionCodex147ResidualRequest freezes the Responses item shape
+// emitted by Codex 0.147 for compact history. Each known message and
+// input_text arm carries an unknown future field; the Responses decoder keeps
+// those fields as source residuals so same-Responses identity can replay them.
+// Gateway compaction must instead use only the typed visible fields.
+func inlineCompactionCodex147ResidualRequest() []byte {
+	return []byte(`{"model":"fixture","input":[
+{"id":"msg_dev","type":"message","role":"developer","content":[{"type":"input_text","text":"SIDE_VISIBLE_DEVELOPER","future_content":"SIDE_CONTENT_SECRET"}],"future_message":"SIDE_ITEM_SECRET"},
+{"id":"msg_user","type":"message","role":"user","content":[{"type":"input_text","text":"SIDE_VISIBLE_USER","future_content":"SIDE_CONTENT_SECRET"}],"future_message":"SIDE_ITEM_SECRET"},
+{"id":"msg_assistant","type":"message","role":"assistant","content":[{"type":"output_text","text":"SIDE_VISIBLE_ASSISTANT","future_content":"SIDE_CONTENT_SECRET"}],"future_message":"SIDE_ITEM_SECRET"},
+{"type":"function_call","call_id":"side_tool","name":"side_tool","arguments":"{}","status":"completed"},
+{"type":"function_call_output","call_id":"side_tool","output":"SIDE_TOOL"},
+{"id":"side_mcp","type":"mcp_call","server_label":"audit","name":"lookup","arguments":"{}","output":"SIDE_MCP","status":"completed"},
+{"id":"side_agent","type":"agent_message","author":"/root","recipient":"/root/worker","content":[{"type":"input_text","text":"SIDE_AGENT"}]},
+{"type":"compaction_trigger"}]}`)
+}
+
+func TestInlineCompactionProjectsKnownCodexMessagesWithResidualSidecarsOverRealHTTP(t *testing.T) {
+	t.Parallel()
+	raw := inlineCompactionCodex147ResidualRequest()
+	canonical, err := responses.NewInboundTransformer().TransformRequest(context.Background(), &httpclient.Request{
+		Method: http.MethodPost, URL: "/v1/responses", Headers: http.Header{"Content-Type": []string{"application/json"}}, Body: raw,
+	})
+	if err != nil || len(canonical.Input) < 3 {
+		t.Fatalf("decode Codex 0.147 residual fixture=%#v err=%v", canonical, err)
+	}
+	for index := 0; index < 3; index++ {
+		item := canonical.Input[index]
+		if item.Kind != llm.ItemKindMessage || len(item.ProtocolHints.SourceResidual) == 0 || !strings.Contains(string(item.ProtocolHints.SourceResidual), "SIDE_ITEM_SECRET") || len(item.Content) != 1 || len(item.Content[0].SourceResidual) == 0 || !strings.Contains(string(item.Content[0].SourceResidual), "SIDE_CONTENT_SECRET") {
+			t.Fatalf("Codex 0.147 known message residual %d was not preserved canonically: %#v", index, item)
+		}
+	}
+	targets := []struct {
+		name        string
+		path        string
+		newOutbound func(string) (transformer.Outbound, error)
+		response    string
+	}{
+		{
+			name: "chat", path: "/v1/chat/completions",
+			newOutbound: func(rawURL string) (transformer.Outbound, error) {
+				return openai.NewOutboundTransformer(rawURL, "fixture-key")
+			},
+			response: `{"id":"side-chat","object":"chat.completion","created":1,"model":"fixture","choices":[{"index":0,"message":{"role":"assistant","content":"SUMMARY_SIDECAR"},"finish_reason":"stop"}]}`,
+		},
+		{
+			name: "anthropic", path: "/v1/messages",
+			newOutbound: func(rawURL string) (transformer.Outbound, error) {
+				return anthropic.NewOutboundTransformer(rawURL, "fixture-key")
+			},
+			response: `{"id":"side-anthropic","type":"message","role":"assistant","model":"fixture","content":[{"type":"text","text":"SUMMARY_SIDECAR"}],"stop_reason":"end_turn"}`,
+		},
+		{
+			name: "responses", path: "/v1/responses",
+			newOutbound: func(rawURL string) (transformer.Outbound, error) {
+				return responses.NewOutboundTransformer(rawURL, "fixture-key")
+			},
+			response: `{"id":"side-responses","object":"response","created_at":1,"model":"fixture","status":"completed","output":[{"id":"side-message","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"SUMMARY_SIDECAR","annotations":[]}]}]}`,
+		},
+	}
+	for _, targetCase := range targets {
+		targetCase := targetCase
+		t.Run(targetCase.name, func(t *testing.T) {
+			t.Parallel()
+			var hits atomic.Int32
+			provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				defer request.Body.Close()
+				if request.URL.Path != targetCase.path {
+					http.Error(w, "unexpected provider path", http.StatusNotFound)
+					return
+				}
+				body, err := io.ReadAll(request.Body)
+				if err != nil {
+					http.Error(w, "read provider body", http.StatusBadRequest)
+					return
+				}
+				payload := string(body)
+				if strings.Contains(payload, "SIDE_ITEM_SECRET") || strings.Contains(payload, "SIDE_CONTENT_SECRET") ||
+					!strings.Contains(payload, "SIDE_VISIBLE_DEVELOPER") || !strings.Contains(payload, "SIDE_VISIBLE_USER") || !strings.Contains(payload, "SIDE_VISIBLE_ASSISTANT") ||
+					!strings.Contains(payload, "SIDE_TOOL") || !strings.Contains(payload, "SIDE_MCP") || !strings.Contains(payload, "SIDE_AGENT") {
+					http.Error(w, "unsafe or incomplete compact projection", http.StatusBadRequest)
+					return
+				}
+				hits.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, targetCase.response)
+			}))
+			t.Cleanup(provider.Close)
+
+			target, err := targetCase.newOutbound(provider.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			codec := newDurableReferenceCodec(t, t.TempDir(), []byte("codex-147-sidecar"))
+			executor := httpclient.NewHttpClientWithClient(provider.Client())
+			t.Cleanup(executor.CloseIdleConnections)
+			result, err := pipeline.NewFactory(executor).Pipeline(responses.NewInboundTransformer(), conversion.NewOutbound(target, conversion.WithCompactionStateCodec(codec))).Process(context.Background(), &httpclient.Request{
+				Method: http.MethodPost, URL: "/v1/responses", Headers: http.Header{"Content-Type": []string{"application/json"}}, Body: raw,
+			})
+			if err != nil || result == nil || result.Stream || result.Response == nil || hits.Load() != 1 {
+				t.Fatalf("compact result=%#v err=%v provider_hits=%d", result, err, hits.Load())
+			}
+			if body := string(result.Response.Body); !strings.Contains(body, `"type":"compaction"`) || strings.Contains(body, "SIDE_ITEM_SECRET") || strings.Contains(body, "SIDE_CONTENT_SECRET") {
+				t.Fatalf("public checkpoint leaked sidecar or was missing: %s", body)
+			}
+			entries, err := os.ReadDir(codec.dir)
+			if err != nil || len(entries) != 1 {
+				t.Fatalf("durable checkpoint entries=%#v err=%v", entries, err)
+			}
+			checkpoint, err := os.ReadFile(filepath.Join(codec.dir, entries[0].Name()))
+			if err != nil || strings.Contains(string(checkpoint), "SIDE_ITEM_SECRET") || strings.Contains(string(checkpoint), "SIDE_CONTENT_SECRET") {
+				t.Fatalf("durable checkpoint leaked source sidecar err=%v body=%s", err, checkpoint)
+			}
+		})
+	}
+}
+
+func TestInlineCompactionRejectsPrivateOnlyAndUnknownResponsesHistoryBeforeProvider(t *testing.T) {
+	t.Parallel()
+	targets := []struct {
+		name string
+		new  func(string) (transformer.Outbound, error)
+	}{
+		{name: "chat", new: func(rawURL string) (transformer.Outbound, error) {
+			return openai.NewOutboundTransformer(rawURL, "fixture-key")
+		}},
+		{name: "anthropic", new: func(rawURL string) (transformer.Outbound, error) {
+			return anthropic.NewOutboundTransformer(rawURL, "fixture-key")
+		}},
+		{name: "responses", new: func(rawURL string) (transformer.Outbound, error) {
+			return responses.NewOutboundTransformer(rawURL, "fixture-key")
+		}},
+	}
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "private only known message", body: `{"model":"fixture","input":[{"type":"message","role":"user","content":[],"future_private":"PRIVATE_ONLY"},{"type":"compaction_trigger"}]}`},
+		{name: "unknown content union", body: `{"model":"fixture","input":[{"type":"message","role":"user","content":[{"type":"future_content","secret":"UNKNOWN_CONTENT"}]},{"type":"compaction_trigger"}]}`},
+	}
+	for _, targetCase := range targets {
+		targetCase := targetCase
+		for _, test := range tests {
+			test := test
+			t.Run(targetCase.name+"/"+test.name, func(t *testing.T) {
+				var hits atomic.Int32
+				provider := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { hits.Add(1) }))
+				t.Cleanup(provider.Close)
+				target, err := targetCase.new(provider.URL)
+				if err != nil {
+					t.Fatal(err)
+				}
+				executor := httpclient.NewHttpClientWithClient(provider.Client())
+				t.Cleanup(executor.CloseIdleConnections)
+				result, err := pipeline.NewFactory(executor).Pipeline(responses.NewInboundTransformer(), conversion.NewOutbound(target, conversion.WithCompactionStateCodec(newDurableReferenceCodec(t, t.TempDir(), []byte("reject-sidecar-history"))))).Process(context.Background(), &httpclient.Request{
+					Method: http.MethodPost, URL: "/v1/responses", Headers: http.Header{"Content-Type": []string{"application/json"}}, Body: []byte(test.body),
+				})
+				var inlineErr *conversion.InlineCompactionError
+				if result != nil || !errors.As(err, &inlineErr) || inlineErr == nil || inlineErr.Code != conversion.InlineCompactionUnsafeInput || hits.Load() != 0 {
+					t.Fatalf("result=%#v err=%v inline=%#v provider_hits=%d", result, err, inlineErr, hits.Load())
+				}
+			})
+		}
+	}
+}
+
 type inlineCompactionCheckpoint struct {
 	Token      string
 	ResponseID string
