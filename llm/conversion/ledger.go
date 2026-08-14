@@ -3,6 +3,7 @@ package conversion
 import (
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"strings"
@@ -67,6 +68,7 @@ type Session struct {
 	debugMu               sync.Mutex
 	outputBlockers        map[string]struct{}
 	compactEmulation      *compactEmulationState
+	inlineCompaction      *inlineCompactionState
 }
 
 func newSession(plan *Plan, request *llm.Request, traceEnabled bool) *Session {
@@ -360,6 +362,98 @@ func (s *Session) recordDebug(
 	if trace != nil {
 		trace.Append(evidence, objectRefBytes(ref))
 	}
+}
+
+func (s *Session) recordInlineCompactionEvidence(
+	direction llm.ConversionDirection,
+	stage string,
+	action string,
+	strategy StrategyID,
+	reason ReasonCode,
+	rawBytes uint32,
+	digest string,
+	generation uint32,
+	stateBytes uint32,
+	retained uint32,
+	drops inlineCompactionDrops,
+	reversible bool,
+) {
+	if s == nil || s.plan == nil {
+		return
+	}
+	evidence := runtimeActionEvidence(
+		direction,
+		ObjectRef{Kind: ObjectRequestControl, ToolIndex: -1, ItemIndex: -1, ContentIndex: -1, MessageIndex: -1, ToolCallIndex: -1},
+		action, strategy, reason, reversible,
+	)
+	evidence.SourceType = "gateway_compaction_checkpoint"
+	evidence.SemanticClass = "gateway_owned"
+	evidence.RawBytes = rawBytes
+	evidence.SourceDigest = safeEvidenceSourceDigest(digest)
+	evidence.CompactionOwner = "gateway"
+	evidence.CompactionStage = stage
+	evidence.CompactionGeneration = generation
+	evidence.CompactionStateBytes = stateBytes
+	evidence.CompactionRetainedItems = retained
+	evidence.CompactionDroppedReasoning = drops.Reasoning
+	evidence.CompactionHostedProjected = drops.HostedProjected
+	evidence.CompactionDroppedPrivate = drops.Private
+	evidence.CompactionDroppedStructured = drops.Structured
+	evidence.CompactionRetainedTruncated = drops.RetainedTruncated
+	evidence.CompactionRetainedTrimmed = drops.RetainedTruncatedBytes
+	evidence.CompactionSummaryTruncated = drops.SummaryTruncated
+	evidence.CompactionSummaryTrimmed = drops.SummaryTruncatedBytes
+	evidence.CompactionDocumentsProjected = drops.DocumentProjected
+	evidence.CompactionDocumentsTruncated = drops.DocumentTruncated
+	evidence.CompactionDocumentTrimmed = drops.DocumentTruncatedBytes
+	evidence.CompactionDocumentSidecars = drops.DocumentSidecars
+	evidence.CompactionSourceSidecars = drops.SourceSidecars
+	s.debugMu.Lock()
+	trace := s.plan.Debug
+	if trace == nil {
+		trace = llm.NewRequiredConversionDebugTrace(1)
+		s.plan.Debug = trace
+	}
+	s.debugMu.Unlock()
+	trace.Append(evidence, objectRefBytes(ObjectRef{Kind: ObjectRequestControl, ToolIndex: -1, ItemIndex: -1, ContentIndex: -1, MessageIndex: -1, ToolCallIndex: -1}))
+}
+
+// recordInlineCompactionFailure appends a required, payload-free critical
+// object-level failure. It is usable before a Session exists (plan/open/
+// projection) and after it exists (summary output/seal), so a red top-level
+// diagnostic can never leave every protocol-conversion object green.
+func recordInlineCompactionFailure(plan *Plan, stage string, err error) {
+	if plan == nil || err == nil {
+		return
+	}
+	var inlineErr *InlineCompactionError
+	if !errors.As(err, &inlineErr) || inlineErr == nil || inlineErr.SafeDiagnostic().Code == "" {
+		return
+	}
+	ref := ObjectRef{Kind: ObjectRequestControl, ToolIndex: -1, ItemIndex: -1, ContentIndex: -1, MessageIndex: -1, ToolCallIndex: -1}
+	if stage == "open" {
+		ref.Kind = ObjectCompaction
+	}
+	direction := llm.ConversionDirectionRequest
+	if stage == "seal" || stage == "summary_output" || stage == "restore" {
+		direction = llm.ConversionDirectionResponse
+	}
+	evidence := runtimeActionEvidence(direction, ref, string(ActionUnknown), StrategyInlineCompactionGateway, ReasonCode(inlineErr.Code), false)
+	evidence.SourceType = "gateway_compaction_checkpoint"
+	evidence.SemanticClass = "gateway_inline_compaction_" + stage
+	evidence.CompactionOwner = "gateway"
+	evidence.CompactionStage = stage
+	evidence.CompactionErrorCode = string(inlineErr.Code)
+	switch stage {
+	case "open":
+		evidence.Stage = llm.ConversionStageRequestTransform
+	case "seal", "summary_output":
+		evidence.Stage = llm.ConversionStageResponseRestore
+	}
+	if plan.Debug == nil {
+		plan.Debug = llm.NewRequiredConversionDebugTrace(1)
+	}
+	plan.Debug.Append(evidence, objectRefBytes(ref))
 }
 
 // recordOutputBlocker appends one payload-free critical runtime action for an

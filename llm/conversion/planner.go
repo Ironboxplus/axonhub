@@ -145,9 +145,33 @@ func (p *Planner) plan(request *llm.Request, targetFormat llm.APIFormat, trace b
 	if request.RequestType == llm.RequestTypeCompact {
 		plan.Actions = append(plan.Actions, actionForCompactRequest(request, profile))
 	}
+	if checkpointErr := inlineCompactionCheckpointStructuralError(request); checkpointErr != nil {
+		appendInlineCompactionCheckpointBlockers(plan, request, checkpointErr)
+		plan.Summary = summarizePlan(plan.Source, profile, plan.Actions, startedAt)
+		return plan, &ConversionPlanError{Cause: checkpointErr, Plan: plan}
+	}
 	if err := llm.ValidateItemStructure(request.Input); err != nil {
 		plan.Actions = append(plan.Actions, unknownItemAction(-1, ReasonNoStrategy))
 		plan.Summary = summarizePlan(plan.Source, profile, plan.Actions, startedAt)
+		return plan, plan.Validate()
+	}
+	// A final inline compaction trigger changes execution ownership for the
+	// whole request: all prior history is consumed by the gateway's safe,
+	// tool-free summary projection and is never encoded directly to this target.
+	// Planning the original MCP/agent/private unions against Chat or Anthropic
+	// here would therefore reject a request that is intentionally not sent on
+	// that wire. Structural validation above still guards malformed input; the
+	// execution projector performs the stricter secret/private-state checks.
+	if _, _, inline := inlineCompactionTrigger(request); inline {
+		inlineErr := planGatewayInlineCompaction(plan, request)
+		plan.Summary = summarizePlan(plan.Source, profile, plan.Actions, startedAt)
+		if inlineErr != nil {
+			// Preserve the whole object plan (including every unsafe item) but
+			// carry a stable, payload-free cause through the error chain. Without
+			// this, callers see only ErrIncompletePlan even though the evidence
+			// already identifies a closed inline-compaction safety failure.
+			return plan, &ConversionPlanError{Cause: inlineErr, Plan: plan}
+		}
 		return plan, plan.Validate()
 	}
 	for toolIndex := range request.ToolDefinitions {
@@ -278,10 +302,15 @@ func (p *Planner) plan(request *llm.Request, targetFormat llm.APIFormat, trace b
 				plan.Actions = append(plan.Actions, actionForHostedCall(request.APIFormat, profile, item, itemIndex))
 			case llm.ItemKindCompaction:
 				action := itemEvidenceAction(item, itemIndex, ObjectCompaction, "compaction", "compaction_checkpoint")
-				if request.APIFormat == profile.APIFormat && profile.APIFormat == llm.APIFormatOpenAIResponse {
-					action.Kind, action.Strategy, action.Reason, action.Reversible = ActionNative, StrategyNative, ReasonTargetNative, true
+				// A normal compaction item is provider opaque. It has exactly one
+				// portable route: same Responses identity, including any known-union
+				// residual fields. A gateway codec may still claim/restore one of its
+				// own references at attempt time; a foreign checkpoint is never
+				// lowered across protocols or sent to a provider.
+				if request.APIFormat == llm.APIFormatOpenAIResponse && profile.APIFormat == llm.APIFormatOpenAIResponse {
+					action.Kind, action.Strategy, action.Reason, action.Reversible = ActionOpaque, StrategyOpaqueSidecar, ReasonSameProtocolOpaque, true
 				} else {
-					action.Kind, action.Strategy, action.Reason = ActionUnknown, StrategyUnavailable, ReasonProviderPrivate
+					action.Kind, action.Strategy, action.Reason, action.Reversible = ActionEmulate, StrategyInlineCompactionHydrate, ReasonGatewayCheckpoint, true
 				}
 				plan.Actions = append(plan.Actions, action)
 			case llm.ItemKindContextCompaction:
@@ -293,13 +322,7 @@ func (p *Planner) plan(request *llm.Request, targetFormat llm.APIFormat, trace b
 				}
 				plan.Actions = append(plan.Actions, action)
 			case llm.ItemKindCompactionTrigger:
-				action := itemEvidenceAction(item, itemIndex, ObjectRequestControl, "compaction_trigger", "compaction_trigger_request_control")
-				if request.APIFormat == profile.APIFormat && profile.APIFormat == llm.APIFormatOpenAIResponse {
-					action.Kind, action.Strategy, action.Reason, action.Reversible = ActionNative, StrategyNative, ReasonTargetNative, true
-				} else {
-					action.Kind, action.Strategy, action.Reason = ActionUnknown, StrategyUnavailable, ReasonProviderPrivate
-				}
-				plan.Actions = append(plan.Actions, action)
+				plan.Actions = append(plan.Actions, actionForInlineCompactionTrigger(item, itemIndex))
 			case llm.ItemKindToolDeclaration:
 				if request.APIFormat == profile.APIFormat && profile.APIFormat == llm.APIFormatOpenAIResponse {
 					plan.Actions = append(plan.Actions, nativeItemAction(itemIndex))
@@ -379,6 +402,115 @@ func (p *Planner) plan(request *llm.Request, targetFormat llm.APIFormat, trace b
 	return plan, plan.Validate()
 }
 
+func planGatewayInlineCompaction(plan *Plan, request *llm.Request) error {
+	if plan == nil || request == nil {
+		return &InlineCompactionError{Code: InlineCompactionInvalidState, Err: errors.New("inline compaction has no request plan")}
+	}
+	var firstErr *InlineCompactionError
+	checkpointCount := 0
+	for index := range request.Input {
+		if request.Input[index].Kind == llm.ItemKindCompaction {
+			checkpointCount++
+		}
+	}
+	for itemIndex := range request.Input {
+		item := &request.Input[itemIndex]
+		if item.Kind == llm.ItemKindCompactionTrigger {
+			plan.Actions = append(plan.Actions, actionForInlineCompactionTrigger(item, itemIndex))
+			continue
+		}
+		decision := classifyInlineCompactionItemForTarget(*item, plan.Target.APIFormat)
+		if item.Kind == llm.ItemKindCompaction && checkpointCount > 1 {
+			decision = inlineCompactionProjectionDecision{kind: inlineCompactionProjectionBlock, reason: ReasonCheckpointInvalid, semantic: "inline_multiple_gateway_checkpoints"}
+		}
+		kind, fallback := ObjectInputItem, "canonical_item"
+		if item.Kind == llm.ItemKindCompaction {
+			kind, fallback = ObjectCompaction, "compaction"
+		}
+		action := itemEvidenceAction(item, itemIndex, kind, fallback, decision.semantic)
+		switch decision.kind {
+		case inlineCompactionProjectionBlock:
+			action.Kind, action.Strategy, action.Reason, action.Reversible = ActionUnknown, StrategyUnavailable, decision.reason, false
+			if firstErr == nil {
+				firstErr = inlineCompactionPlanError(decision)
+			}
+		case inlineCompactionProjectionDrop, inlineCompactionProjectionStrip:
+			action.Kind, action.Strategy, action.Reason, action.Reversible = ActionLower, StrategyInlineCompactionGateway, decision.reason, false
+		default:
+			strategy := StrategyInlineCompactionGateway
+			if item.Kind == llm.ItemKindCompaction {
+				strategy = StrategyInlineCompactionHydrate
+			}
+			action.Kind, action.Strategy, action.Reason, action.Reversible = ActionEmulate, strategy, decision.reason, false
+		}
+		plan.Actions = append(plan.Actions, action)
+	}
+	for toolIndex := range request.ToolDefinitions {
+		plan.Actions = append(plan.Actions, Action{
+			Ref:  ObjectRef{Kind: ObjectToolDefinition, ToolIndex: toolIndex, ItemIndex: -1, ContentIndex: -1, MessageIndex: -1, ToolCallIndex: -1},
+			Kind: ActionLower, Strategy: StrategyInlineCompactionGateway, Reason: ReasonGatewayCompaction, Reversible: false,
+		})
+	}
+	history := make([]llm.Item, 0, len(request.Input))
+	for index := range request.Input {
+		if request.Input[index].Kind != llm.ItemKindCompactionTrigger {
+			history = append(history, request.Input[index])
+		}
+	}
+	retained, err := retainedInlineCompactionItems(history)
+	if err != nil || len(retained) == 0 {
+		plan.Actions = append(plan.Actions, Action{
+			Ref:  ObjectRef{Kind: ObjectRequestControl, ToolIndex: -1, ItemIndex: -1, ContentIndex: -1, MessageIndex: -1, ToolCallIndex: -1},
+			Kind: ActionUnknown, Strategy: StrategyUnavailable, Reason: ReasonNoStrategy, Reversible: false,
+			SemanticClass: "inline_compaction_no_safe_retained_context",
+		})
+		if firstErr == nil {
+			var inlineErr *InlineCompactionError
+			if errors.As(err, &inlineErr) {
+				firstErr = inlineErr
+			} else {
+				firstErr = &InlineCompactionError{Code: InlineCompactionUnsafeInput, Err: errors.New("inline compaction has no safe retained context")}
+			}
+		}
+	}
+	if firstErr != nil {
+		return firstErr
+	}
+	return nil
+}
+
+func inlineCompactionPlanError(decision inlineCompactionProjectionDecision) *InlineCompactionError {
+	code := InlineCompactionUnsafeInput
+	if decision.reason == ReasonProtocolConstraint {
+		code = InlineCompactionOversize
+	}
+	if decision.reason == ReasonCheckpointInvalid {
+		code = InlineCompactionInvalidToken
+	}
+	return &InlineCompactionError{Code: code, Err: errors.New(decision.semantic)}
+}
+
+func appendInlineCompactionCheckpointBlockers(plan *Plan, request *llm.Request, err *InlineCompactionError) {
+	if plan == nil || request == nil || err == nil {
+		return
+	}
+	for itemIndex := range request.Input {
+		item := &request.Input[itemIndex]
+		if item.Kind != llm.ItemKindCompaction {
+			continue
+		}
+		reason := ReasonCheckpointInvalid
+		semantic := "inline_checkpoint_invalid"
+		if err.Code == InlineCompactionOversize {
+			reason = ReasonProtocolConstraint
+			semantic = "inline_checkpoint_token_oversize"
+		}
+		action := itemEvidenceAction(item, itemIndex, ObjectCompaction, "compaction", semantic)
+		action.Kind, action.Strategy, action.Reason, action.Reversible = ActionUnknown, StrategyUnavailable, reason, false
+		plan.Actions = append(plan.Actions, action)
+	}
+}
+
 func actionForAgentMessage(source, target llm.APIFormat, item *llm.Item, itemIndex int) Action {
 	action := itemEvidenceAction(item, itemIndex, ObjectAgentMessage, "agent_message", "agent_message")
 	if item == nil || item.AgentMessage == nil {
@@ -446,6 +578,18 @@ func actionForCompactRequest(request *llm.Request, profile CapabilityProfile) Ac
 		return Action{Ref: ref, Kind: ActionEmulate, Strategy: StrategyCompactAsChat, Reason: ReasonTargetNoCompact}
 	}
 	return Action{Ref: ref, Kind: ActionUnknown, Strategy: StrategyUnavailable, Reason: ReasonNoStrategy}
+}
+
+// actionForInlineCompactionTrigger plans the final compaction_trigger item
+// that current Codex sends inside an ordinary, optionally streaming
+// POST /v1/responses request. It intentionally does not reuse
+// RequestTypeCompact: that endpoint has different request and response
+// contracts. Inline triggers are gateway-owned until a future design can
+// durably bind a provider-private token to one channel/key identity.
+func actionForInlineCompactionTrigger(item *llm.Item, itemIndex int) Action {
+	action := itemEvidenceAction(item, itemIndex, ObjectRequestControl, "compaction_trigger", "compaction_trigger_request_control")
+	action.Kind, action.Strategy, action.Reason, action.Reversible = ActionEmulate, StrategyInlineCompactionGateway, ReasonGatewayCompaction, true
+	return action
 }
 
 func nativeItemAction(itemIndex int) Action {

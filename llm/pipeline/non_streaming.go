@@ -9,6 +9,7 @@ import (
 
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/httpclient"
+	"github.com/looplj/axonhub/llm/streams"
 )
 
 // Process executes the non-streaming LLM pipeline
@@ -42,6 +43,23 @@ func (p *pipeline) notStreamRound(
 	executor Executor,
 	request *httpclient.Request,
 ) (*nonStreamRound, error) {
+	httpResp, err := p.notStreamProviderExchange(ctx, executor, request)
+	if err != nil {
+		return nil, err
+	}
+	return p.transformNotStreamProviderResponse(ctx, httpResp)
+}
+
+// notStreamProviderExchange owns the only provider-facing portion of a
+// non-streaming round. Gateway callers may put a deadline around this exchange
+// without accidentally cancelling response decoding, durable checkpoint Seal,
+// client middleware, or lazy client SSE consumption after the provider has
+// returned successfully.
+func (p *pipeline) notStreamProviderExchange(
+	ctx context.Context,
+	executor Executor,
+	request *httpclient.Request,
+) (*httpclient.Response, error) {
 	startedAt := observationStart(ctx)
 	httpResp, err := executor.Do(ctx, request)
 	statusCode := 0
@@ -65,12 +83,21 @@ func (p *pipeline) notStreamRound(
 
 		return nil, WrapUpstreamError(fmt.Errorf("failed to do request: %w", err))
 	}
+	return httpResp, nil
+}
 
+// transformNotStreamProviderResponse runs the post-exchange provider response
+// transforms. It deliberately accepts the original request context for forced
+// inline-compaction streams: the provider timeout has ended, while response
+// restore and durable gateway state persistence must still be cancellable only
+// by the client request itself.
+func (p *pipeline) transformNotStreamProviderResponse(ctx context.Context, httpResp *httpclient.Response) (*nonStreamRound, error) {
 	// Apply raw response middlewares
-	startedAt = observationStart(ctx)
+	startedAt := observationStart(ctx)
+	var err error
 	httpResp, err = p.applyRawResponseMiddlewares(ctx, httpResp)
-	statusCode = 0
-	outputBytes = 0
+	statusCode := 0
+	outputBytes := int64(0)
 	if httpResp != nil {
 		statusCode = httpResp.StatusCode
 		outputBytes = int64(len(httpResp.Body))
@@ -178,6 +205,70 @@ func (p *pipeline) finalizeNotStream(ctx context.Context, llmResp *llm.Response)
 	}
 
 	return finalResp, nil
+}
+
+// processForcedNonStreamingStream is the narrow bridge used by gateway-owned
+// inline compaction. The provider sees an ordinary non-streaming summary
+// request, while the original client stream contract is preserved by rendering
+// the completed canonical compaction response through the client's normal SSE
+// transformer. This path deliberately does not buffer an upstream SSE stream.
+func (p *pipeline) processForcedNonStreamingStream(ctx context.Context, request *llm.Request) (*Result, error) {
+	round, err := p.prepareProviderRound(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	timeoutCtx, cancel := p.withNonStreamTimeout(ctx)
+	httpResponse, err := p.notStreamProviderExchange(timeoutCtx, round.executor, round.request)
+	timedOut := p.isNonStreamTimeout(timeoutCtx)
+	// The provider exchange is complete. Do not let its timeout context escape
+	// into decoding, codec Seal, or the lazy client EventStream: callers consume
+	// that stream after this function returns and must still receive
+	// response.completed.
+	cancel()
+	if err != nil {
+		if timedOut {
+			return nil, ErrNonStreamResponseTimeout
+		}
+		return nil, err
+	}
+	providerRound, err := p.transformNotStreamProviderResponse(ctx, httpResponse)
+	if err != nil {
+		return nil, err
+	}
+	if providerRound == nil || providerRound.passthrough != nil || providerRound.response == nil {
+		if providerRound != nil && providerRound.passthrough != nil {
+			_ = providerRound.passthrough.Close()
+		}
+		return nil, fmt.Errorf("gateway inline compaction requires a materialized provider response")
+	}
+
+	// Preserve the normal non-stream response middleware boundary before the
+	// response is rendered as client SSE. The restored response is then a single
+	// canonical compaction output, never the provider's draft summary.
+	startedAt := observationStart(ctx)
+	response, err := p.applyLlmResponseMiddlewares(ctx, providerRound.response)
+	observeStage(ctx, StageUnifiedResponseMiddleware, startedAt, err, observationData{})
+	if err != nil {
+		p.applyRawErrorResponseMiddlewares(ctx, err)
+		return nil, fmt.Errorf("failed to apply llm response middlewares: %w", err)
+	}
+	if p.emptyResponseDetection && !hasResponseContent(response) {
+		observeStage(ctx, StageResponseValidation, observationStart(ctx), ErrEmptyResponse, observationData{})
+		p.applyRawErrorResponseMiddlewares(ctx, ErrEmptyResponse)
+		return nil, ErrEmptyResponse
+	}
+	events, err := llm.CanonicalEventsFromResponse(response)
+	if err != nil {
+		p.applyRawErrorResponseMiddlewares(ctx, err)
+		return nil, fmt.Errorf("render inline compaction stream: %w", err)
+	}
+	streamResponse := *response
+	streamResponse.Events = events
+	clientStream, err := p.finalizeStream(ctx, streams.SliceStream([]*llm.Response{&streamResponse}))
+	if err != nil {
+		return nil, err
+	}
+	return &Result{Stream: true, EventStream: clientStream}, nil
 }
 
 func (p *pipeline) finalizePassthrough(ctx context.Context, response *httpclient.Response) (*httpclient.Response, error) {

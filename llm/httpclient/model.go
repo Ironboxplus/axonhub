@@ -82,6 +82,11 @@ type Request struct {
 	// SkipInboundQueryMerge when set to true, prevents query parameters from the original
 	// inbound request from being merged into this request during MergeInboundRequest.
 	SkipInboundQueryMerge bool `json:"-"`
+	// SkipInboundRequestMerge prevents both untrusted inbound headers and query
+	// parameters from being copied into a gateway-owned internal exchange. It
+	// is used by compact summary rounds, whose explicit request allowlist must
+	// not inherit client-side protocol extensions or routing controls.
+	SkipInboundRequestMerge bool `json:"-"`
 }
 
 // TransportStartHook observes the exact point at which HttpClient is about to

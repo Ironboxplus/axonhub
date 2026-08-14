@@ -66,6 +66,57 @@ func TestCanonicalResponseAccumulatorConsumesTerminalAttachedToDoneMarker(t *tes
 	}
 }
 
+func TestCanonicalResponseAccumulatorPreservesTerminalFailureErrorAndUsage(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		terminal EventKind
+		want     ResponseStatus
+		failed   bool
+	}{
+		{name: "completed", terminal: EventKindResponseCompleted, want: ResponseStatusCompleted},
+		{name: "incomplete", terminal: EventKindResponseIncomplete, want: ResponseStatusIncomplete},
+		{name: "cancelled", terminal: EventKindResponseCancelled, want: ResponseStatusCancelled},
+		{name: "failed", terminal: EventKindResponseFailed, want: ResponseStatusFailed, failed: true},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			accumulator := NewCanonicalResponseAccumulator()
+			failure := &ResponseError{Detail: ErrorDetail{Type: "server_error", Code: "upstream_failed", Message: "provider failed"}}
+			events := []Event{
+				{Kind: EventKindResponseStarted, Sequence: 0},
+				{Kind: EventKindUsage, Sequence: 1, Usage: &Usage{PromptTokens: 11, CompletionTokens: 3, TotalTokens: 14}},
+				{Kind: test.terminal, Sequence: 2, Error: failure},
+			}
+			if !test.failed {
+				events[2].Error = nil
+			}
+			if err := accumulator.Observe(&Response{ID: "resp_terminal", Model: "fixture", Events: events}); err != nil {
+				t.Fatalf("observe %s: %v", test.name, err)
+			}
+			snapshot := accumulator.Snapshot()
+			if snapshot == nil || snapshot.Status != test.want || snapshot.Usage == nil || snapshot.Usage.TotalTokens != 14 {
+				t.Fatalf("%s snapshot=%#v", test.name, snapshot)
+			}
+			if !test.failed {
+				if snapshot.Error != nil {
+					t.Fatalf("%s retained terminal error: %#v", test.name, snapshot.Error)
+				}
+				return
+			}
+			if snapshot.Error == nil || snapshot.Error.Detail.Code != "upstream_failed" || snapshot.Error.Detail.Message != "provider failed" {
+				t.Fatalf("failed snapshot lost structured terminal error: %#v", snapshot)
+			}
+			snapshot.Error.Detail.Message = "mutated client copy"
+			if again := accumulator.Snapshot(); again.Error == nil || again.Error.Detail.Message != "provider failed" {
+				t.Fatalf("snapshot error mutation leaked into accumulator: %#v", again)
+			}
+		})
+	}
+}
+
 func TestCanonicalTerminalReasonSurvivesMaterializeAndAggregate(t *testing.T) {
 	response := &Response{
 		ID: "provider_pause", Status: ResponseStatusIncomplete, TerminalReason: "pause_turn",

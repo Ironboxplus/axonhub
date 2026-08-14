@@ -163,6 +163,14 @@ func TestOutboundTransformer_StreamTransformation_ResponseFailedIsSemanticTermin
 		}
 	}
 	require.NotNil(t, terminal)
+	// A Responses response.failed remains a semantic stream terminal (the
+	// iterator must not return a transport error), but legacy relay consumers
+	// inspect the materialized chunk's top-level Error rather than Events.
+	// Keep both compatibility surfaces structurally identical.
+	require.Equal(t, llm.ResponseStatusFailed, terminal.Status)
+	require.NotNil(t, terminal.Error)
+	require.Equal(t, "stream_failed", terminal.Error.Detail.Code)
+	require.Equal(t, "matrix stream failed", terminal.Error.Detail.Message)
 	var usage *llm.Usage
 	var failed *llm.ResponseError
 	for index := range terminal.Events {

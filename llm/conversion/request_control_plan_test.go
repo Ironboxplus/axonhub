@@ -87,9 +87,10 @@ func TestPlannerNormalizesRequestControlBeforePlanningWithoutMutatingSource(t *t
 	if err != nil || plan == nil || !plan.Complete() || plan.Summary.Lowered != 1 {
 		t.Fatalf("normalized control plan = %#v, err=%v", plan, err)
 	}
-	if len(plan.Actions) != 4 || plan.Actions[3].Strategy != StrategyRequestControl || plan.Actions[3].Ref.ItemIndex != 0 ||
-		plan.Actions[3].DestinationPath != "input[1]" || plan.Debug == nil ||
-		plan.Debug.Actions[0].DestinationPath != "input[1]" {
+	if len(plan.Actions) != 3 || plan.Actions[0].Strategy != StrategyInlineCompactionGateway || plan.Actions[1].Strategy != StrategyInlineCompactionGateway ||
+		plan.Actions[2].Strategy != StrategyRequestControl || plan.Actions[2].Ref.ItemIndex != 0 ||
+		plan.Actions[2].DestinationPath != "input[1]" || plan.Debug == nil || len(plan.Debug.Actions) != 3 ||
+		plan.Debug.Actions[2].DestinationPath != "input[1]" {
 		t.Fatalf("normalized control actions = %#v", plan.Actions)
 	}
 	if request.Input[0].Kind != llm.ItemKindCompactionTrigger || request.Input[1].Kind != llm.ItemKindMessage {
@@ -122,6 +123,23 @@ func TestOutboundRejectsDuplicateRequestControlBeforeProviderEncoder(t *testing.
 	if !ok || transformPlan.Debug == nil || len(transformPlan.Debug.Actions) != 1 ||
 		transformPlan.Debug.Actions[0].FieldPath != "input[1].type" {
 		t.Fatalf("transform rejection evidence = %#v, ok=%v", transformPlan, ok)
+	}
+}
+
+func TestOutboundPreflightRejectsGatewayCompactionWithoutDurableCodec(t *testing.T) {
+	t.Parallel()
+	provider := &dispatchProbeOutbound{}
+	request := &llm.Request{
+		APIFormat: llm.APIFormatOpenAIResponse,
+		Input: []llm.Item{
+			{Kind: llm.ItemKindMessage, Role: llm.RoleUser, Content: []llm.ContentBlock{{Kind: llm.ContentKindText, Text: "retain this"}}},
+			{Kind: llm.ItemKindCompactionTrigger, CompactionTrigger: &llm.CompactionTriggerItem{}},
+		},
+	}
+	plan, err := NewOutbound(provider).Preflight(request)
+	var inlineErr *InlineCompactionError
+	if plan == nil || !errors.As(err, &inlineErr) || inlineErr == nil || inlineErr.Code != InlineCompactionCodecMissing || provider.called {
+		t.Fatalf("preflight plan=%#v err=%v inline=%#v provider_called=%v", plan, err, inlineErr, provider.called)
 	}
 }
 

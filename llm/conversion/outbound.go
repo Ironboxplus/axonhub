@@ -26,6 +26,7 @@ type Outbound struct {
 	wrapped      transformer.Outbound
 	planner      *Planner
 	continuation ContinuationBinding
+	compaction   CompactionStateCodec
 }
 
 var _ transformer.Outbound = (*Outbound)(nil)
@@ -53,13 +54,27 @@ func WithCapabilityProfile(profile CapabilityProfile) OutboundOption {
 	}
 }
 
+// WithCompactionStateCodec installs the host-owned persistent codec used only
+// for gateway inline compaction. The nil/default behavior is intentionally
+// fail-closed: unsupported upstreams must never receive a provider-private
+// trigger or a made-up opaque checkpoint.
+func WithCompactionStateCodec(codec CompactionStateCodec) OutboundOption {
+	return func(outbound *Outbound) { outbound.compaction = codec }
+}
+
 // Preflight proves that this concrete target has a complete plan before any
 // provider encoder is invoked. Orchestrators use it while filtering channel
 // candidates; TransformRequest repeats the plan on the attempt-local clone.
 func (o *Outbound) Preflight(request *llm.Request) (*Plan, error) {
 	plan, err := o.planner.Plan(request, o.wrapped.APIFormat())
+	if err == nil && planRequiresGatewayInlineCompactionCodec(plan) && o.compaction == nil {
+		err = &ConversionPlanError{Cause: &InlineCompactionError{Code: InlineCompactionCodecMissing}, Plan: plan}
+	}
 	if err == nil && plan != nil {
 		err = plan.Validate()
+	}
+	if err != nil {
+		recordInlineCompactionFailure(plan, "plan", err)
 	}
 	return plan, err
 }
@@ -79,7 +94,27 @@ func (o *Outbound) TransformRequest(ctx context.Context, request *llm.Request) (
 		plan.Debug = buildConversionDebugTrace(ctx, plan.Actions)
 	}
 	if err != nil {
+		recordInlineCompactionFailure(plan, "plan", err)
 		return nil, err
+	}
+	// TransformRequest repeats the static codec admission because callers may
+	// invoke a pipeline directly without an orchestrator-level Preflight.
+	// It remains pure (no Open/Seal I/O) and keeps a missing codec red before a
+	// candidate/provider exchange is considered.
+	if planRequiresGatewayInlineCompactionCodec(plan) && o.compaction == nil {
+		inlineErr := &InlineCompactionError{Code: InlineCompactionCodecMissing}
+		recordInlineCompactionFailure(plan, "plan", inlineErr)
+		return nil, &ConversionPlanError{Cause: inlineErr, Plan: plan}
+	}
+	prepared, _, err = hydrateGatewayInlineCompaction(ctx, prepared, plan, o.compaction)
+	if err != nil {
+		recordInlineCompactionFailure(plan, "open", err)
+		return nil, &ConversionPlanError{Cause: err, Plan: plan}
+	}
+	prepared, inlineState, err := projectInlineCompactionExecution(prepared, plan, o.compaction)
+	if err != nil {
+		recordInlineCompactionFailure(plan, "summary_projection", err)
+		return nil, &ConversionPlanError{Cause: err, Plan: plan}
 	}
 	projected, err := projectCanonical(prepared, o.wrapped.APIFormat())
 	if err != nil {
@@ -91,6 +126,7 @@ func (o *Outbound) TransformRequest(ctx context.Context, request *llm.Request) (
 	if err != nil {
 		return nil, err
 	}
+	armInlineCompaction(session, inlineState)
 	lowered, err = prepareCompactEmulation(lowered, session)
 	if err != nil {
 		return nil, err
@@ -99,9 +135,27 @@ func (o *Outbound) TransformRequest(ctx context.Context, request *llm.Request) (
 	if err != nil {
 		return nil, err
 	}
+	if inlineState != nil {
+		httpRequest.SkipInboundRequestMerge = true
+	}
 	session.continuation = o.continuation
 	setRequestSession(httpRequest, session)
 	return httpRequest, nil
+}
+
+// ForceNonStreaming tells the generic pipeline that a client-side SSE inline
+// compaction request must use a non-streaming gateway-owned provider summary
+// round. The pipeline then renders the restored gateway checkpoint back as
+// Responses SSE; ordinary requests retain their provider streaming behavior.
+func (o *Outbound) ForceNonStreaming(ctx context.Context, request *llm.Request) bool {
+	if request == nil || request.Stream == nil || !*request.Stream {
+		return false
+	}
+	_, _, found := inlineCompactionTrigger(request)
+	if !found {
+		return false
+	}
+	return true
 }
 
 func normalizeRequestControlRequest(request *llm.Request) (*llm.Request, []llm.RequestControlAdjustment, error) {
@@ -144,6 +198,10 @@ func (o *Outbound) TransformResponse(ctx context.Context, response *httpclient.R
 		session.continuation = o.continuation
 	}
 	unified = RestoreResponseContext(ctx, unified, session)
+	unified, err = restoreInlineCompaction(ctx, unified, session)
+	if err != nil {
+		return nil, err
+	}
 	return restoreCompactEmulation(unified, session)
 }
 

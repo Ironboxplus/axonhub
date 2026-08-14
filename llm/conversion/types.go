@@ -8,9 +8,10 @@ import (
 	"github.com/looplj/axonhub/llm"
 )
 
-// PlanVersion 6 adds typed context-compaction decisions and stable selected
-// union source digests to payload-free conversion evidence.
-const PlanVersion uint32 = 6
+// PlanVersion 7 adds explicit inline-compaction execution ownership. A
+// Responses-shaped target is no longer assumed to understand provider-private
+// remote-compaction checkpoints just because its wire format is Responses.
+const PlanVersion uint32 = 7
 
 var ErrIncompletePlan = errors.New("semantic conversion plan is incomplete")
 
@@ -59,6 +60,8 @@ const (
 	StrategySchemaNormalize            StrategyID = "schema_normalization"
 	StrategyOpaqueSidecar              StrategyID = "opaque_sidecar"
 	StrategyCompactAsChat              StrategyID = "compact_as_chat"
+	StrategyInlineCompactionGateway    StrategyID = "inline_compaction_gateway"
+	StrategyInlineCompactionHydrate    StrategyID = "inline_compaction_hydrate"
 	StrategyAgentMessageLegacyInput    StrategyID = "agent_message_legacy_input"
 	StrategyUnavailable                StrategyID = "unavailable"
 )
@@ -75,6 +78,9 @@ const (
 	ReasonProtocolConstraint      ReasonCode = "protocol_constraint"
 	ReasonDuplicateRequestControl ReasonCode = "duplicate_request_control"
 	ReasonTargetNoCompact         ReasonCode = "target_no_compact"
+	ReasonGatewayCompaction       ReasonCode = "gateway_compaction"
+	ReasonGatewayCheckpoint       ReasonCode = "gateway_checkpoint"
+	ReasonCheckpointInvalid       ReasonCode = "checkpoint_invalid"
 	ReasonNoStrategy              ReasonCode = "no_strategy"
 )
 

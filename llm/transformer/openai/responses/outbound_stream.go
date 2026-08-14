@@ -607,8 +607,12 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 		// response.failed is a valid Responses terminal payload, not a transport
 		// failure. Keep its canonical terminal event (including usage and the
 		// structured error) available to the client encoder instead of aborting
-		// before pendingCanonical can be enqueued.
+		// before pendingCanonical can be enqueued. Mirror the terminal state and
+		// error at the chunk level for compatibility consumers that have not yet
+		// migrated from Response.Error to canonical Events.
 		s.responseCompleted = true
+		resp.Status = llm.ResponseStatusFailed
+		resp.Error = responsesStreamError(&streamEvent)
 
 	case StreamEventTypeResponseIncomplete:
 		// Response incomplete (e.g., max tokens)

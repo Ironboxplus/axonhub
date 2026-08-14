@@ -316,6 +316,9 @@ func RegisterMergeWithAppendHeaders(headers ...string) {
 }
 
 func MergeInboundRequest(dest, src *Request) *Request {
+	if dest != nil && dest.SkipInboundRequestMerge {
+		return dest
+	}
 	if src == nil || len(src.Headers) == 0 && len(src.Query) == 0 {
 		return dest
 	}

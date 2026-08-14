@@ -24,6 +24,58 @@ func TestHasResponseContent_ReasoningSignature(t *testing.T) {
 	}))
 }
 
+func TestHasResponseContent_ResponseFailedIsClientVisibleTerminal(t *testing.T) {
+	responseErr := &llm.ResponseError{StatusCode: 429, Detail: llm.ErrorDetail{Code: "rate_limited", Message: "provider rejected request"}}
+	require.True(t, hasResponseContent(&llm.Response{
+		Status: llm.ResponseStatusFailed,
+		Error:  responseErr,
+		Events: []llm.Event{{Kind: llm.EventKindResponseFailed, Error: responseErr}, {Kind: llm.EventKindUsage, Usage: &llm.Usage{TotalTokens: 7}}},
+	}))
+	require.True(t, hasResponseContent(&llm.Response{Events: []llm.Event{{Kind: llm.EventKindResponseFailed, Error: responseErr}}}))
+	require.True(t, hasResponseContent(&llm.Response{Events: []llm.Event{{Kind: llm.EventKindResponseIncomplete}}}))
+	require.True(t, hasResponseContent(&llm.Response{Events: []llm.Event{{Kind: llm.EventKindResponseCancelled}}}))
+	require.False(t, hasResponseContent(&llm.Response{Status: llm.ResponseStatusFailed}))
+	require.True(t, hasResponseContent(&llm.Response{Status: llm.ResponseStatusIncomplete, Usage: &llm.Usage{TotalTokens: 7}}))
+	require.True(t, hasResponseContent(&llm.Response{Status: llm.ResponseStatusCancelled, Usage: &llm.Usage{TotalTokens: 7}}))
+}
+
+func TestPreReadLlmStreamPreservesStructuredResponseFailedWithoutEmptyRetry(t *testing.T) {
+	responseErr := &llm.ResponseError{StatusCode: 429, Detail: llm.ErrorDetail{Code: "rate_limited", Message: "provider rejected request"}}
+	failed := &llm.Response{
+		Status: llm.ResponseStatusFailed,
+		Error:  responseErr,
+		Usage:  &llm.Usage{TotalTokens: 7},
+		Events: []llm.Event{{Kind: llm.EventKindResponseFailed, Error: responseErr}, {Kind: llm.EventKindUsage, Usage: &llm.Usage{TotalTokens: 7}}},
+	}
+	p := &pipeline{emptyResponseDetection: true, maxSameChannelRetries: 1}
+	stream, err := p.preReadLlmStream(context.Background(), streams.SliceStream([]*llm.Response{failed}), nil)
+	require.NoError(t, err)
+	responses, err := streams.All(stream)
+	require.NoError(t, err)
+	require.Len(t, responses, 1)
+	require.Same(t, failed, responses[0])
+	require.Equal(t, llm.EventKindResponseFailed, responses[0].Events[0].Kind)
+	require.Same(t, responseErr, responses[0].Events[0].Error)
+	require.Equal(t, int64(7), responses[0].Usage.TotalTokens)
+}
+
+func TestPreReadLlmStreamPreservesMaterializedIncompleteAndCancelledWithoutEmptyRetry(t *testing.T) {
+	for _, status := range []llm.ResponseStatus{llm.ResponseStatusIncomplete, llm.ResponseStatusCancelled} {
+		status := status
+		t.Run(string(status), func(t *testing.T) {
+			terminal := &llm.Response{Status: status, Usage: &llm.Usage{TotalTokens: 7}}
+			p := &pipeline{emptyResponseDetection: true, maxSameChannelRetries: 2}
+			stream, err := p.preReadLlmStream(context.Background(), streams.SliceStream([]*llm.Response{terminal}), nil)
+			require.NoError(t, err)
+			responses, err := streams.All(stream)
+			require.NoError(t, err)
+			require.Len(t, responses, 1)
+			require.Same(t, terminal, responses[0])
+			require.Equal(t, int64(7), responses[0].Usage.TotalTokens)
+		})
+	}
+}
+
 func TestHasResponseContent(t *testing.T) {
 	t.Run("empty response", func(t *testing.T) {
 		require.False(t, hasResponseContent(&llm.Response{}))
@@ -102,6 +154,51 @@ func TestHasResponseContent(t *testing.T) {
 				}},
 			},
 		}))
+	})
+
+	t.Run("rerank response results", func(t *testing.T) {
+		require.True(t, hasResponseContent(&llm.Response{Rerank: &llm.RerankResponse{Results: []llm.RerankResult{{Index: 0}}}}))
+	})
+
+	t.Run("image response data", func(t *testing.T) {
+		require.True(t, hasResponseContent(&llm.Response{Image: &llm.ImageResponse{Data: []llm.ImageData{{URL: "https://image.example/test.png"}}}}))
+	})
+
+	t.Run("image stream payload", func(t *testing.T) {
+		require.True(t, hasResponseContent(&llm.Response{ImageStreamEvent: &llm.ImageStreamEvent{B64JSON: "aW1hZ2U="}}))
+		require.True(t, hasResponseContent(&llm.Response{ImageStreamEvent: &llm.ImageStreamEvent{URL: "https://image.example/test.png"}}))
+	})
+
+	t.Run("video response lifecycle", func(t *testing.T) {
+		require.True(t, hasResponseContent(&llm.Response{Video: &llm.VideoResponse{ID: "video_1"}}))
+		require.True(t, hasResponseContent(&llm.Response{Video: &llm.VideoResponse{Status: "queued"}}))
+		require.True(t, hasResponseContent(&llm.Response{Video: &llm.VideoResponse{VideoURL: "https://video.example/test.mp4"}}))
+		require.True(t, hasResponseContent(&llm.Response{Video: &llm.VideoResponse{Error: &llm.VideoError{Code: "failed"}}}))
+	})
+
+	t.Run("compact response output", func(t *testing.T) {
+		require.True(t, hasResponseContent(&llm.Response{Compact: &llm.CompactResponse{Output: []llm.Message{{Role: "user"}}}}))
+	})
+
+	t.Run("streaming speech and transcription content", func(t *testing.T) {
+		require.True(t, hasResponseContent(&llm.Response{SpeechStreamEvent: &llm.SpeechStreamEvent{AudioBase64: "YXVkaW8="}}))
+		require.True(t, hasResponseContent(&llm.Response{SpeechAudioChunk: &llm.SpeechAudioChunk{Audio: []byte("audio")}}))
+		require.True(t, hasResponseContent(&llm.Response{TranscriptionStreamEvent: &llm.TranscriptionStreamEvent{Delta: "delta"}}))
+		require.True(t, hasResponseContent(&llm.Response{TranscriptionStreamEvent: &llm.TranscriptionStreamEvent{Text: "final"}}))
+		require.True(t, hasResponseContent(&llm.Response{TranscriptionStreamEvent: &llm.TranscriptionStreamEvent{Type: "transcript.text.done"}}))
+	})
+
+	t.Run("completion response text", func(t *testing.T) {
+		require.True(t, hasResponseContent(&llm.Response{Completion: &llm.CompletionResponse{Choices: []llm.CompletionChoice{{Text: "completion"}}}}))
+	})
+
+	t.Run("valid gateway compaction is client-visible", func(t *testing.T) {
+		require.True(t, hasResponseContent(&llm.Response{Output: []llm.Item{{Kind: llm.ItemKindCompaction, Compaction: &llm.CompactionItem{EncryptedContent: "gateway-owned-opaque"}}}}))
+	})
+
+	t.Run("malformed gateway compaction remains empty", func(t *testing.T) {
+		require.False(t, hasResponseContent(&llm.Response{Output: []llm.Item{{Kind: llm.ItemKindCompaction}}}))
+		require.False(t, hasResponseContent(&llm.Response{Output: []llm.Item{{Kind: llm.ItemKindCompaction, Compaction: &llm.CompactionItem{}}}}))
 	})
 }
 

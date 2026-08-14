@@ -93,6 +93,33 @@ func hasResponseContent(resp *llm.Response) bool {
 		return true
 	}
 
+	// A materialized incomplete/cancelled Responses terminal is client-visible
+	// even with output=[]. Retrying it would create another provider attempt and
+	// discard the explicit terminal state, usage, and incomplete_details. Failed
+	// remains stricter: a bare failed status is malformed/empty unless it carries
+	// the structured provider Error.
+	switch resp.Status {
+	case llm.ResponseStatusIncomplete, llm.ResponseStatusCancelled:
+		return true
+	case llm.ResponseStatusFailed:
+		if resp.Error != nil {
+			return true
+		}
+	}
+	for index := range resp.Events {
+		switch resp.Events[index].Kind {
+		case llm.EventKindResponseFailed:
+			if resp.Events[index].Error != nil {
+				return true
+			}
+		case llm.EventKindResponseIncomplete, llm.EventKindResponseCancelled:
+			// These are also client-visible lifecycle terminals. Retrying them
+			// would manufacture another provider attempt after an explicit
+			// incomplete/cancelled result rather than preserving its semantics.
+			return true
+		}
+	}
+
 	if resp.Speech != nil && len(resp.Speech.Audio) > 0 {
 		return true
 	}
@@ -126,6 +153,18 @@ func hasResponseContent(resp *llm.Response) bool {
 
 	for _, choice := range resp.Choices {
 		if hasMessageContent(choice.Delta) || hasMessageContent(choice.Message) {
+			return true
+		}
+	}
+
+	// A gateway-owned Responses compaction is a complete, client-visible
+	// continuation checkpoint even though it has no display text. Treat only the
+	// fully typed opaque output as meaningful; a nil or empty checkpoint still
+	// remains empty so retry/empty-response detection cannot bless malformed
+	// lifecycle output.
+	for index := range resp.Output {
+		item := resp.Output[index]
+		if item.Kind == llm.ItemKindCompaction && item.Compaction != nil && item.Compaction.EncryptedContent != "" {
 			return true
 		}
 	}

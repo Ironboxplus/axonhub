@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 
 	"github.com/klauspost/compress/zstd"
@@ -385,4 +386,34 @@ func TestMergeHTTPHeaders_AcceptNotOverridden(t *testing.T) {
 	merged := MergeHTTPHeaders(dest, src)
 	assert.Equal(t, "*/*", merged.Get("Accept"))
 	assert.Equal(t, "client-value", merged.Get("X-Custom"))
+}
+
+func TestMergeInboundRequestHonorsInlineCompactionSkipBoundary(t *testing.T) {
+	blocked := &Request{
+		SkipInboundRequestMerge: true,
+		Headers:                 http.Header{"X-Provider": []string{"only"}},
+		Query:                   url.Values{"provider": []string{"only"}},
+	}
+	source := &Request{Headers: http.Header{"Authorization": []string{"client-secret"}, "X-Client": []string{"visible"}}, Query: url.Values{"client": []string{"visible"}}}
+	if got := MergeInboundRequest(blocked, source); got != blocked || got.Headers.Get("X-Client") != "" || got.Headers.Get("Authorization") != "" || got.Query.Get("client") != "" {
+		t.Fatalf("skip-all merge leaked inbound request metadata: %#v", got)
+	}
+
+	dest := &Request{Headers: http.Header{"X-Provider": []string{"only"}}, Query: url.Values{"provider": []string{"only"}}}
+	if got := MergeInboundRequest(dest, nil); got != dest || got.Headers.Get("X-Provider") != "only" {
+		t.Fatalf("nil source changed destination: %#v", got)
+	}
+	if got := MergeInboundRequest(dest, &Request{}); got != dest || got.Query.Get("provider") != "only" {
+		t.Fatalf("empty source changed destination: %#v", got)
+	}
+
+	merged := MergeInboundRequest(dest, &Request{Headers: http.Header{"X-Client": []string{"visible"}}, Query: url.Values{"client": []string{"visible"}}})
+	if merged.Headers.Get("X-Client") != "visible" || merged.Query.Get("client") != "visible" || merged.Query.Get("provider") != "only" {
+		t.Fatalf("ordinary merge did not preserve provider/client partition: %#v", merged)
+	}
+	queryBlocked := &Request{SkipInboundQueryMerge: true, Headers: http.Header{}, Query: url.Values{"provider": []string{"only"}}}
+	MergeInboundRequest(queryBlocked, &Request{Headers: http.Header{"X-Client": []string{"visible"}}, Query: url.Values{"client": []string{"must-not-merge"}}})
+	if queryBlocked.Headers.Get("X-Client") != "visible" || queryBlocked.Query.Get("client") != "" {
+		t.Fatalf("query-only skip did not preserve request boundary: %#v", queryBlocked)
+	}
 }

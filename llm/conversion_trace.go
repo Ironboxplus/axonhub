@@ -140,7 +140,32 @@ type ConversionActionTrace struct {
 	SemanticClass   string                     `json:"semantic_class,omitempty"`
 	RawBytes        uint32                     `json:"raw_bytes,omitempty"`
 	SourceDigest    string                     `json:"source_digest,omitempty"`
-	LogicalIDHash   string                     `json:"logical_id_hash,omitempty"`
+	// Inline compaction evidence is fixed-size and payload-free. Owner and
+	// decision are closed vocabulary; bytes/counts never include an opaque
+	// token, URL, prompt, tool argument, result, or provider-private state.
+	CompactionOwner              string `json:"compaction_owner,omitempty"`
+	CompactionStage              string `json:"compaction_stage,omitempty"`
+	CompactionErrorCode          string `json:"compaction_error_code,omitempty"`
+	CompactionGeneration         uint32 `json:"compaction_generation,omitempty"`
+	CompactionStateBytes         uint32 `json:"compaction_state_bytes,omitempty"`
+	CompactionRetainedItems      uint32 `json:"compaction_retained_items,omitempty"`
+	CompactionDroppedReasoning   uint32 `json:"compaction_dropped_reasoning,omitempty"`
+	CompactionHostedProjected    uint32 `json:"compaction_hosted_projected,omitempty"`
+	CompactionDroppedPrivate     uint32 `json:"compaction_dropped_private,omitempty"`
+	CompactionDroppedStructured  uint32 `json:"compaction_dropped_structured,omitempty"`
+	CompactionRetainedTruncated  uint32 `json:"compaction_retained_truncated,omitempty"`
+	CompactionRetainedTrimmed    uint32 `json:"compaction_retained_trimmed_bytes,omitempty"`
+	CompactionSummaryTruncated   uint32 `json:"compaction_summary_truncated,omitempty"`
+	CompactionSummaryTrimmed     uint32 `json:"compaction_summary_trimmed_bytes,omitempty"`
+	CompactionDocumentsProjected uint32 `json:"compaction_documents_projected,omitempty"`
+	CompactionDocumentsTruncated uint32 `json:"compaction_documents_truncated,omitempty"`
+	CompactionDocumentTrimmed    uint32 `json:"compaction_document_trimmed_bytes,omitempty"`
+	CompactionDocumentSidecars   uint32 `json:"compaction_document_sidecars_stripped,omitempty"`
+	// CompactionSourceSidecars counts harmless source-union provenance markers
+	// removed from otherwise typed compact-summary input. It is deliberately
+	// separate from CompactionDroppedPrivate: provenance is not sensitive data.
+	CompactionSourceSidecars uint32 `json:"compaction_source_sidecars_stripped,omitempty"`
+	LogicalIDHash            string `json:"logical_id_hash,omitempty"`
 }
 
 // ConversionDebugTrace is emitted only for sampled requests. Actions are

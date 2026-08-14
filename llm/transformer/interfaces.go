@@ -70,6 +70,14 @@ type OutboundWrapper interface {
 	UnwrapOutbound() Outbound
 }
 
+// ProviderStreamMode is an optional outbound capability for request classes
+// whose client-facing SSE lifecycle is rendered by the gateway after one
+// non-streaming provider exchange. It is intentionally a request predicate so
+// ordinary streaming traffic never pays for or inherits the mode.
+type ProviderStreamMode interface {
+	ForceNonStreaming(ctx context.Context, request *llm.Request) bool
+}
+
 // VideoTaskOutbound is an optional extension interface for outbound transformers that support
 // video task query/delete operations (async task model).
 type VideoTaskOutbound interface {

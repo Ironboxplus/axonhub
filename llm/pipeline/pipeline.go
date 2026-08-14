@@ -447,6 +447,11 @@ func (p *pipeline) Process(ctx context.Context, request *httpclient.Request) (*R
 
 func (p *pipeline) processRequest(ctx context.Context, request *llm.Request) (*Result, error) {
 	originalWantStream := request.Stream != nil && *request.Stream
+	if originalWantStream {
+		if mode, ok := outboundCapability[transformer.ProviderStreamMode](p.Outbound); ok && mode.ForceNonStreaming(ctx, request) {
+			return p.processForcedNonStreamingStream(ctx, request)
+		}
+	}
 	if p.toolLoopController != nil && isToolLoopRequest(request) {
 		return p.processToolLoop(ctx, request, originalWantStream)
 	}

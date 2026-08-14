@@ -14,23 +14,30 @@ import (
 func TestPlannerItemEvidenceDistinguishesCompactionTriggerAndFutureUnknown(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name       string
-		item       llm.Item
-		ref        ObjectKind
-		sourceType string
-		semantic   string
-		reason     ReasonCode
+		name             string
+		item             llm.Item
+		ref              ObjectKind
+		sourceType       string
+		semantic         string
+		reason           ReasonCode
+		identityKind     ActionKind
+		identityStrategy StrategyID
+		crossComplete    bool
+		requiresHistory  bool
 	}{
 		{
 			name: "compaction checkpoint", ref: ObjectCompaction,
-			sourceType: "compaction_summary", semantic: "compaction_checkpoint", reason: ReasonProviderPrivate,
-			item: llm.Item{Kind: llm.ItemKindCompaction, Compaction: &llm.CompactionItem{}, ProtocolHints: llm.ProtocolHints{
+			sourceType: "compaction_summary", semantic: "compaction_checkpoint", reason: ReasonGatewayCheckpoint,
+			identityKind: ActionOpaque, identityStrategy: StrategyOpaqueSidecar, crossComplete: true,
+			item: llm.Item{Kind: llm.ItemKindCompaction, Compaction: &llm.CompactionItem{EncryptedContent: "gateway-checkpoint"}, ProtocolHints: llm.ProtocolHints{
 				SourceFormat: llm.APIFormatOpenAIResponse, SourceType: "compaction_summary", SourceBytes: 71, SourceDigest: testEvidenceDigest("compaction"),
 			}},
 		},
 		{
 			name: "compaction trigger request control", ref: ObjectRequestControl,
-			sourceType: "compaction_trigger", semantic: "compaction_trigger_request_control", reason: ReasonProviderPrivate,
+			sourceType: "compaction_trigger", semantic: "compaction_trigger_request_control", reason: ReasonGatewayCompaction,
+			identityKind: ActionEmulate, identityStrategy: StrategyInlineCompactionGateway, crossComplete: true,
+			requiresHistory: true,
 			item: llm.Item{Kind: llm.ItemKindCompactionTrigger, CompactionTrigger: &llm.CompactionTriggerItem{}, ProtocolHints: llm.ProtocolHints{
 				SourceFormat: llm.APIFormatOpenAIResponse, SourceType: "compaction_trigger", SourceBytes: 29, SourceDigest: testEvidenceDigest("trigger"),
 			}},
@@ -38,6 +45,7 @@ func TestPlannerItemEvidenceDistinguishesCompactionTriggerAndFutureUnknown(t *te
 		{
 			name: "context compaction checkpoint", ref: ObjectContextCompaction,
 			sourceType: "context_compaction", semantic: "context_compaction_checkpoint", reason: ReasonProviderPrivate,
+			identityKind: ActionNative, identityStrategy: StrategyNative,
 			item: llm.Item{Kind: llm.ItemKindContextCompaction, ContextCompaction: &llm.ContextCompactionItem{}, ProtocolHints: llm.ProtocolHints{
 				SourceFormat: llm.APIFormatOpenAIResponse, SourceType: "context_compaction", SourceBytes: 61, SourceDigest: testEvidenceDigest("context"),
 			}},
@@ -45,6 +53,7 @@ func TestPlannerItemEvidenceDistinguishesCompactionTriggerAndFutureUnknown(t *te
 		{
 			name: "future unknown behavioral", ref: ObjectInputItem,
 			sourceType: "future_context_checkpoint", semantic: "future_unknown_behavioral", reason: ReasonNoStrategy,
+			identityKind: ActionOpaque, identityStrategy: StrategyOpaqueSidecar,
 			item: llm.Item{Kind: llm.ItemKindUnknown, Unknown: &llm.UnknownItem{
 				Type: "future_context_checkpoint", Raw: json.RawMessage(`{"type":"future_context_checkpoint","secret":"PRIVATE"}`), Behavioral: true,
 			}, ProtocolHints: llm.ProtocolHints{SourceFormat: llm.APIFormatOpenAIResponse, SourceBytes: 58, SourceDigest: testEvidenceDigest("future")}},
@@ -55,26 +64,47 @@ func TestPlannerItemEvidenceDistinguishesCompactionTriggerAndFutureUnknown(t *te
 		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			request := &llm.Request{APIFormat: llm.APIFormatOpenAIResponse, Input: []llm.Item{test.item}}
+			input := []llm.Item{test.item}
+			actionIndex := 0
+			if test.requiresHistory {
+				// A compaction_trigger is a request control, not a standalone
+				// provider operation. Give its evidence test a valid compactable
+				// history so it exercises the gateway plan rather than the separate
+				// no_safe_retained_context rejection.
+				input = append([]llm.Item{{Kind: llm.ItemKindMessage, Role: llm.RoleUser, Content: []llm.ContentBlock{{Kind: llm.ContentKindText, Text: "retain"}}}}, input...)
+				actionIndex = 1
+			}
+			request := &llm.Request{APIFormat: llm.APIFormatOpenAIResponse, Input: input}
 			identity, err := NewPlanner().Plan(request, llm.APIFormatOpenAIResponse)
-			if err != nil || len(identity.Actions) != 1 {
+			if err != nil || len(identity.Actions) != actionIndex+1 {
 				t.Fatalf("identity plan = %#v err=%v", identity, err)
 			}
-			assertItemEvidenceAction(t, identity.Actions[0], test.ref, test.sourceType, test.semantic, test.item.ProtocolHints.SourceBytes, test.item.ProtocolHints.SourceDigest)
+			assertItemEvidenceAction(t, identity.Actions[actionIndex], actionIndex, test.ref, test.sourceType, test.semantic, test.item.ProtocolHints.SourceBytes, test.item.ProtocolHints.SourceDigest)
 			if test.item.Kind == llm.ItemKindUnknown {
-				if identity.Actions[0].Kind != ActionOpaque || identity.Actions[0].Reason != ReasonSameProtocolOpaque || !identity.Actions[0].Reversible {
-					t.Fatalf("identity future unknown action = %#v", identity.Actions[0])
+				if identity.Actions[actionIndex].Kind != ActionOpaque || identity.Actions[actionIndex].Reason != ReasonSameProtocolOpaque || !identity.Actions[actionIndex].Reversible {
+					t.Fatalf("identity future unknown action = %#v", identity.Actions[actionIndex])
 				}
-			} else if identity.Actions[0].Kind != ActionNative || identity.Actions[0].Reason != ReasonTargetNative || !identity.Actions[0].Reversible {
-				t.Fatalf("identity typed control action = %#v", identity.Actions[0])
+			} else if identity.Actions[actionIndex].Kind != test.identityKind || identity.Actions[actionIndex].Strategy != test.identityStrategy || !identity.Actions[actionIndex].Reversible {
+				t.Fatalf("identity typed control action = %#v", identity.Actions[actionIndex])
 			}
 
 			cross, err := NewPlanner().Plan(request, llm.APIFormatOpenAIChatCompletion)
+			if test.crossComplete {
+				if err != nil || cross == nil || !cross.Complete() || len(cross.Actions) != actionIndex+1 {
+					t.Fatalf("cross gateway plan = %#v err=%v", cross, err)
+				}
+				action := cross.Actions[actionIndex]
+				assertItemEvidenceAction(t, action, actionIndex, test.ref, test.sourceType, test.semantic, test.item.ProtocolHints.SourceBytes, test.item.ProtocolHints.SourceDigest)
+				if action.Kind != ActionEmulate || action.Reason != test.reason || !action.Reversible {
+					t.Fatalf("cross gateway action = %#v", action)
+				}
+				return
+			}
 			if !errors.Is(err, ErrIncompletePlan) || cross == nil || cross.Complete() || cross.Summary.Unknown != 1 || len(cross.Actions) != 1 {
 				t.Fatalf("cross plan = %#v err=%v", cross, err)
 			}
 			action := cross.Actions[0]
-			assertItemEvidenceAction(t, action, test.ref, test.sourceType, test.semantic, test.item.ProtocolHints.SourceBytes, test.item.ProtocolHints.SourceDigest)
+			assertItemEvidenceAction(t, action, actionIndex, test.ref, test.sourceType, test.semantic, test.item.ProtocolHints.SourceBytes, test.item.ProtocolHints.SourceDigest)
 			if action.Kind != ActionUnknown || action.Strategy != StrategyUnavailable || action.Reason != test.reason || action.Reversible {
 				t.Fatalf("cross fail-closed action = %#v", action)
 			}
@@ -174,9 +204,9 @@ func TestItemEvidenceSourceTypeIsBoundedWithoutMutatingUnknownIdentity(t *testin
 	}
 }
 
-func assertItemEvidenceAction(t *testing.T, action Action, ref ObjectKind, sourceType, semantic string, rawBytes uint32, sourceDigest string) {
+func assertItemEvidenceAction(t *testing.T, action Action, itemIndex int, ref ObjectKind, sourceType, semantic string, rawBytes uint32, sourceDigest string) {
 	t.Helper()
-	if action.Ref.Kind != ref || action.Ref.ItemIndex != 0 || action.SourceType != sourceType ||
+	if action.Ref.Kind != ref || action.Ref.ItemIndex != itemIndex || action.SourceType != sourceType ||
 		action.SemanticClass != semantic || action.RawBytes != rawBytes || action.SourceDigest != sourceDigest {
 		t.Fatalf("item evidence action = %#v", action)
 	}

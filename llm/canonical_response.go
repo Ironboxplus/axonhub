@@ -18,6 +18,7 @@ type CanonicalResponseAccumulator struct {
 	usage              *Usage
 	terminal           EventKind
 	terminalReason     string
+	terminalError      *ResponseError
 	id                 string
 	model              string
 	created            int64
@@ -73,8 +74,10 @@ func (accumulator *CanonicalResponseAccumulator) Observe(response *Response) err
 		}
 		if response.Error != nil {
 			accumulator.terminal = EventKindResponseFailed
+			accumulator.terminalError = cloneCanonicalResponseError(response.Error)
 		} else if len(response.Output) > 0 {
 			accumulator.terminal = EventKindResponseCompleted
+			accumulator.terminalError = nil
 		}
 		return nil
 	}
@@ -118,6 +121,11 @@ func (accumulator *CanonicalResponseAccumulator) Observe(response *Response) err
 			EventKindResponseIncomplete, EventKindResponseCancelled:
 			accumulator.terminal = event.Kind
 			accumulator.terminalReason = event.TerminalReason
+			if event.Kind == EventKindResponseFailed {
+				accumulator.terminalError = cloneCanonicalResponseError(event.Error)
+			} else {
+				accumulator.terminalError = nil
+			}
 		}
 	}
 	return nil
@@ -173,9 +181,18 @@ func (accumulator *CanonicalResponseAccumulator) Snapshot() *Response {
 		ID: accumulator.id, Model: accumulator.model, Created: accumulator.created,
 		Output: output, Usage: cloneCanonicalUsage(accumulator.usage), Status: responseStatusFromTerminal(accumulator.terminal),
 		TerminalReason:     accumulator.terminalReason,
+		Error:              cloneCanonicalResponseError(accumulator.terminalError),
 		ProviderExtensions: CloneResponseProviderExtensions(accumulator.providerExtensions),
 	}
 	return response
+}
+
+func cloneCanonicalResponseError(source *ResponseError) *ResponseError {
+	if source == nil {
+		return nil
+	}
+	clone := *source
+	return &clone
 }
 
 func responseStatusFromTerminal(kind EventKind) ResponseStatus {
