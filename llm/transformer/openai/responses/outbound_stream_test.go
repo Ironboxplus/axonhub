@@ -137,25 +137,49 @@ func TestOutboundTransformer_StreamTransformation_ErrorEvent(t *testing.T) {
 	require.Contains(t, err.Error(), "Something went wrong")
 }
 
-func TestOutboundTransformer_StreamTransformation_ResponseFailed(t *testing.T) {
+func TestOutboundTransformer_StreamTransformation_ResponseFailedIsSemanticTerminal(t *testing.T) {
 	trans, err := NewOutboundTransformer("https://api.openai.com", "test-api-key")
 	require.NoError(t, err)
 
 	events := []*httpclient.StreamEvent{
 		{Type: "response.created", Data: []byte(`{"type":"response.created","response":{"id":"resp_failed","object":"response","model":"gpt-5","status":"in_progress","output":[]}}`)},
 		{Type: "response.output_text.delta", Data: []byte(`{"type":"response.output_text.delta","item_id":"msg_failed","output_index":0,"content_index":0,"delta":"partial"}`)},
-		{Type: "response.failed", Data: []byte(`{"type":"response.failed","response":{"id":"resp_failed","object":"response","model":"gpt-5","status":"failed","output":[],"error":{"code":"stream_failed","message":"matrix stream failed"}}}`)},
+		{Type: "response.failed", Data: []byte(`{"type":"response.failed","response":{"id":"resp_failed","object":"response","model":"gpt-5","status":"failed","output":[],"usage":{"input_tokens":17,"output_tokens":5,"total_tokens":22},"error":{"code":"stream_failed","message":"matrix stream failed"}}}`)},
 	}
 
 	stream, err := trans.TransformStream(t.Context(), nil, streams.SliceStream(events))
 	require.NoError(t, err)
-	_, err = streams.All(stream)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "matrix stream failed")
-	var responseErr *llm.ResponseError
-	require.ErrorAs(t, err, &responseErr)
-	require.Equal(t, "server_error", responseErr.Detail.Type)
-	require.Equal(t, "stream_failed", responseErr.Detail.Code)
+	responses, err := streams.All(stream)
+	require.NoError(t, err)
+	require.NotEmpty(t, responses)
+
+	var terminal *llm.Response
+	for index := range responses {
+		for eventIndex := range responses[index].Events {
+			if responses[index].Events[eventIndex].Kind == llm.EventKindResponseFailed {
+				terminal = responses[index]
+				break
+			}
+		}
+	}
+	require.NotNil(t, terminal)
+	var usage *llm.Usage
+	var failed *llm.ResponseError
+	for index := range terminal.Events {
+		switch terminal.Events[index].Kind {
+		case llm.EventKindUsage:
+			usage = terminal.Events[index].Usage
+		case llm.EventKindResponseFailed:
+			failed = terminal.Events[index].Error
+		}
+	}
+	require.NotNil(t, usage)
+	require.Equal(t, int64(17), usage.PromptTokens)
+	require.Equal(t, int64(5), usage.CompletionTokens)
+	require.Equal(t, int64(22), usage.TotalTokens)
+	require.NotNil(t, failed)
+	require.Equal(t, "stream_failed", failed.Detail.Code)
+	require.Equal(t, "matrix stream failed", failed.Detail.Message)
 }
 
 func TestOutboundTransformer_TransformStream_UsesFinalEncryptedContentPerReasoningItem(t *testing.T) {

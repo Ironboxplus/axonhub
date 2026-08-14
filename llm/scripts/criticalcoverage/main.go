@@ -153,6 +153,7 @@ var targets = []target{
 	{File: "transformer/openai/responses/canonical_stream.go", Function: "cloneCanonicalSafetyChecks"},
 	{File: "transformer/openai/responses/canonical_stream.go", Function: "cloneCanonicalReasoningParts"},
 	{File: "transformer/openai/responses/canonical_stream.go", Function: "cloneCanonicalContent"},
+	{File: "transformer/openai/responses/canonical_stream.go", Function: "emitResponsesTerminalUsage"},
 	{File: "transformer/openai/responses/canonical_stream_encoder.go", Function: "applyProtocolFrameHints"},
 	{File: "transformer/openai/responses/canonical_stream_encoder.go", Function: "hasProtocolFrame"},
 	{File: "transformer/openai/responses/canonical_stream_encoder.go", Function: "responsesItemHasLifecycleStatus"},

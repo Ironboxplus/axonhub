@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"github.com/looplj/axonhub/llm"
+	"github.com/looplj/axonhub/llm/httpclient"
+	"github.com/looplj/axonhub/llm/streams"
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/require"
 )
@@ -487,6 +489,218 @@ func TestCanonicalResponsesStreamPreservesNestedResponseResidualPerLifecycleEven
 	var conversation map[string]json.RawMessage
 	require.NoError(t, json.Unmarshal(response["conversation"], &conversation))
 	require.JSONEq(t, `{"shard":"sg"}`, string(conversation["future_conversation"]))
+}
+
+// TestCanonicalResponsesTerminalUsageRoundTrips verifies the wire contract at
+// the exact boundary exercised by an SSE relay: JSON SSE frame -> canonical
+// lifecycle -> JSON SSE frame. ResponseUsage is optional on a Response, but
+// its three token totals are required whenever a usage object is present.
+// The latter is enforced by the currently pinned async-openai client types.
+func TestCanonicalResponsesTerminalUsageRoundTrips(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range terminalUsageCases() {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			decoder := newCanonicalStreamDecoder()
+			canonicalEvents := decodeTerminalUsageSSE(t, decoder, test.terminalType, test.status, true, test.hasError)
+
+			usageIndex := -1
+			terminalIndex := -1
+			for index := range canonicalEvents {
+				switch canonicalEvents[index].Kind {
+				case llm.EventKindUsage:
+					usageIndex = index
+				case llm.EventKindResponseCompleted, llm.EventKindResponseIncomplete,
+					llm.EventKindResponseFailed, llm.EventKindResponseCancelled:
+					terminalIndex = index
+				}
+			}
+			require.GreaterOrEqual(t, usageIndex, 0, "terminal usage was lost in canonical lifecycle")
+			require.Greater(t, terminalIndex, usageIndex, "usage must precede its terminal response event")
+
+			encoded := encodeCanonicalResponsesEvents(t, canonicalEvents)
+			assertTerminalUsageWireContract(t, encoded, test.terminalType, true)
+			if test.hasError {
+				require.NotNil(t, encoded.Response)
+				require.NotNil(t, encoded.Response.Error)
+				require.Equal(t, "upstream_failed", encoded.Response.Error.Code)
+				require.Equal(t, "provider returned failure", encoded.Response.Error.Message)
+			}
+		})
+	}
+}
+
+func TestCanonicalResponsesTerminalUsageDoesNotInventUsage(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range terminalUsageCases() {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			decoder := newCanonicalStreamDecoder()
+			canonicalEvents := decodeTerminalUsageSSE(t, decoder, test.terminalType, test.status, false, test.hasError)
+			for index := range canonicalEvents {
+				require.NotEqual(t, llm.EventKindUsage, canonicalEvents[index].Kind)
+			}
+
+			encoded := encodeCanonicalResponsesEvents(t, canonicalEvents)
+			assertTerminalUsageWireContract(t, encoded, test.terminalType, false)
+		})
+	}
+}
+
+// TestResponsesTerminalUsageSurvivesTransformerBridge covers the production
+// streaming path rather than the encoder in isolation. In particular,
+// response.failed must retain its terminal usage and its semantic error when
+// the legacy outbound adapter reports failure to the next layer.
+func TestResponsesTerminalUsageSurvivesTransformerBridge(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range terminalUsageCases() {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			providerEvents := terminalUsageProviderEvents(t, test.terminalType, test.status, test.hasError)
+			outbound, err := NewOutboundTransformer("https://example.invalid", "fixture-key")
+			require.NoError(t, err)
+			canonical, err := outbound.TransformStream(t.Context(), nil, streams.SliceStream(providerEvents))
+			require.NoError(t, err)
+			client, err := NewInboundTransformer().TransformStream(t.Context(), canonical)
+			require.NoError(t, err)
+
+			var terminal *StreamEvent
+			for client.Next() {
+				var event StreamEvent
+				require.NoError(t, json.Unmarshal(client.Current().Data, &event))
+				if event.Type == test.terminalType {
+					terminal = &event
+				}
+			}
+			require.NoError(t, client.Err())
+			assertTerminalUsageWireContract(t, terminal, test.terminalType, true)
+			if test.hasError {
+				require.NotNil(t, terminal.Response.Error)
+				require.Equal(t, "upstream_failed", terminal.Response.Error.Code)
+			}
+		})
+	}
+}
+
+func decodeTerminalUsageSSE(
+	t *testing.T,
+	decoder *canonicalStreamDecoder,
+	terminalType StreamEventType,
+	status string,
+	includeUsage bool,
+	includeError bool,
+) []llm.Event {
+	t.Helper()
+
+	var events []llm.Event
+	for _, raw := range terminalUsageSSEFrames(t, terminalType, status, includeUsage, includeError) {
+		var wire StreamEvent
+		require.NoError(t, json.Unmarshal([]byte(raw), &wire))
+		decoded, err := decoder.decode(&wire)
+		require.NoError(t, err, "decode %s", wire.Type)
+		events = append(events, decoded...)
+	}
+	return events
+}
+
+func terminalUsageProviderEvents(t *testing.T, terminalType StreamEventType, status string, includeError bool) []*httpclient.StreamEvent {
+	t.Helper()
+
+	frames := terminalUsageSSEFrames(t, terminalType, status, true, includeError)
+	return []*httpclient.StreamEvent{
+		{Type: string(StreamEventTypeResponseCreated), Data: []byte(frames[0])},
+		{Type: string(terminalType), Data: []byte(frames[1])},
+	}
+}
+
+type terminalUsageCase struct {
+	name         string
+	terminalType StreamEventType
+	status       string
+	hasError     bool
+}
+
+func terminalUsageCases() []terminalUsageCase {
+	return []terminalUsageCase{
+		{name: "completed", terminalType: StreamEventTypeResponseCompleted, status: "completed"},
+		{name: "incomplete", terminalType: StreamEventTypeResponseIncomplete, status: "incomplete"},
+		{name: "failed", terminalType: StreamEventTypeResponseFailed, status: "failed", hasError: true},
+		{name: "cancelled", terminalType: StreamEventTypeResponseCancelled, status: "cancelled"},
+	}
+}
+
+func terminalUsageSSEFrames(t *testing.T, terminalType StreamEventType, status string, includeUsage bool, includeError bool) []string {
+	t.Helper()
+
+	terminal := `{"type":` + stringMustMarshal(t, string(terminalType)) + `,"sequence_number":2,"response":{"id":"resp_terminal_usage","object":"response","created_at":1,"model":"fixture-model","status":` + stringMustMarshal(t, status) + `,"output":[]`
+	if includeUsage {
+		terminal += `,"usage":{"input_tokens":17,"output_tokens":5,"total_tokens":22,"future_usage":{"billing":"reserved"}}`
+	}
+	if includeError {
+		terminal += `,"error":{"type":"server_error","code":"upstream_failed","message":"provider returned failure"}`
+	}
+	terminal += `},"future_terminal":{"checkpoint":"terminal"}}`
+	return []string{
+		`{"type":"response.created","sequence_number":1,"response":{"id":"resp_terminal_usage","object":"response","created_at":1,"model":"fixture-model","status":"in_progress","output":[]}}`,
+		terminal,
+	}
+}
+
+func encodeCanonicalResponsesEvents(t *testing.T, events []llm.Event) *StreamEvent {
+	t.Helper()
+
+	encoder := newCanonicalStreamEncoder()
+	source := &responsesInboundStream{
+		ctx: context.Background(), transformerMetadata: make(map[string]any), aggregator: newStreamAggregator(),
+	}
+	for index := range events {
+		require.NoError(t, encoder.encode(source, events[index]), "encode %s", events[index].Kind)
+	}
+	require.NotEmpty(t, source.eventQueue)
+
+	var encoded StreamEvent
+	require.NoError(t, json.Unmarshal(source.eventQueue[len(source.eventQueue)-1].Data, &encoded))
+	return &encoded
+}
+
+func assertTerminalUsageWireContract(t *testing.T, event *StreamEvent, terminalType StreamEventType, wantUsage bool) {
+	t.Helper()
+	require.NotNil(t, event)
+	require.Equal(t, terminalType, event.Type)
+	require.NotNil(t, event.Response)
+
+	if !wantUsage {
+		require.Nil(t, event.Response.Usage)
+		return
+	}
+
+	require.NotNil(t, event.Response.Usage)
+	require.Equal(t, int64(17), event.Response.Usage.InputTokens)
+	require.Equal(t, int64(5), event.Response.Usage.OutputTokens)
+	require.Equal(t, int64(22), event.Response.Usage.TotalTokens)
+
+	serialized, err := json.Marshal(event)
+	require.NoError(t, err)
+	var envelope struct {
+		Response struct {
+			Usage map[string]json.RawMessage `json:"usage"`
+		} `json:"response"`
+	}
+	require.NoError(t, json.Unmarshal(serialized, &envelope))
+	require.Contains(t, envelope.Response.Usage, "input_tokens")
+	require.Contains(t, envelope.Response.Usage, "output_tokens")
+	require.Contains(t, envelope.Response.Usage, "total_tokens")
+	require.JSONEq(t, `{"billing":"reserved"}`, string(envelope.Response.Usage["future_usage"]))
+}
+
+func stringMustMarshal(t *testing.T, value string) string {
+	t.Helper()
+	encoded, err := json.Marshal(value)
+	require.NoError(t, err)
+	return string(encoded)
 }
 
 func TestCanonicalResponsesStreamPreservesFramingEventAndPartResiduals(t *testing.T) {

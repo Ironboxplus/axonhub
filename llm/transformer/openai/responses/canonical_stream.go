@@ -312,16 +312,17 @@ func (decoder *canonicalStreamDecoder) decode(wire *StreamEvent) ([]llm.Event, e
 		if err := decoder.closeOpenItems(llm.ItemStatusCompleted, add); err != nil {
 			return nil, err
 		}
-		if wire.Response != nil && wire.Response.Usage != nil {
-			if err := add(llm.Event{Kind: llm.EventKindUsage, Usage: wire.Response.Usage.ToUsage()}); err != nil {
-				return nil, err
-			}
+		if err := emitResponsesTerminalUsage(wire, add); err != nil {
+			return nil, err
 		}
 		if err := add(llm.Event{Kind: llm.EventKindResponseCompleted}); err != nil {
 			return nil, err
 		}
 	case StreamEventTypeResponseFailed:
 		if err := decoder.closeOpenItems(llm.ItemStatusFailed, add); err != nil {
+			return nil, err
+		}
+		if err := emitResponsesTerminalUsage(wire, add); err != nil {
 			return nil, err
 		}
 		responseErr := responsesStreamError(wire)
@@ -332,11 +333,17 @@ func (decoder *canonicalStreamDecoder) decode(wire *StreamEvent) ([]llm.Event, e
 		if err := decoder.closeOpenItems(llm.ItemStatusIncomplete, add); err != nil {
 			return nil, err
 		}
+		if err := emitResponsesTerminalUsage(wire, add); err != nil {
+			return nil, err
+		}
 		if err := add(llm.Event{Kind: llm.EventKindResponseIncomplete}); err != nil {
 			return nil, err
 		}
 	case StreamEventTypeResponseCancelled:
 		if err := decoder.closeOpenItems(llm.ItemStatusIncomplete, add); err != nil {
+			return nil, err
+		}
+		if err := emitResponsesTerminalUsage(wire, add); err != nil {
 			return nil, err
 		}
 		if err := add(llm.Event{Kind: llm.EventKindResponseCancelled}); err != nil {
@@ -370,6 +377,17 @@ func responsesEventNeedsLifecycle(eventType StreamEventType) bool {
 	default:
 		return false
 	}
+}
+
+// emitResponsesTerminalUsage keeps usage adjacent to the terminal lifecycle
+// event no matter whether the response completed, failed, was incomplete, or
+// was cancelled. A Responses response may omit usage altogether, but the
+// protocol requires its token totals whenever it is present.
+func emitResponsesTerminalUsage(wire *StreamEvent, add func(llm.Event) error) error {
+	if wire == nil || wire.Response == nil || wire.Response.Usage == nil {
+		return nil
+	}
+	return add(llm.Event{Kind: llm.EventKindUsage, Usage: wire.Response.Usage.ToUsage()})
 }
 
 func responsesMCPEventStatus(eventType StreamEventType) llm.MCPCallStatus {

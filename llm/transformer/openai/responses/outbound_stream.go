@@ -604,24 +604,11 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 		}
 
 	case StreamEventTypeResponseFailed:
+		// response.failed is a valid Responses terminal payload, not a transport
+		// failure. Keep its canonical terminal event (including usage and the
+		// structured error) available to the client encoder instead of aborting
+		// before pendingCanonical can be enqueued.
 		s.responseCompleted = true
-		detail := llm.ErrorDetail{
-			Type:    "server_error",
-			Code:    "response_failed",
-			Message: "response failed",
-		}
-		if streamEvent.Response != nil && streamEvent.Response.Error != nil {
-			if streamEvent.Response.Error.Type != "" {
-				detail.Type = streamEvent.Response.Error.Type
-			}
-			if streamEvent.Response.Error.Code != "" {
-				detail.Code = streamEvent.Response.Error.Code
-			}
-			if streamEvent.Response.Error.Message != "" {
-				detail.Message = streamEvent.Response.Error.Message
-			}
-		}
-		return &llm.ResponseError{Detail: detail}
 
 	case StreamEventTypeResponseIncomplete:
 		// Response incomplete (e.g., max tokens)

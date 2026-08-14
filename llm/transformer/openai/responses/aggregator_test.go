@@ -71,6 +71,50 @@ func TestAggregateStreamChunks_CancelledSnapshotPreservesStatus(t *testing.T) {
 	require.Equal(t, "canceled", *body.Status)
 }
 
+func TestAggregateStreamChunks_TerminalUsageSurvivesAllResponseStates(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name         string
+		terminalType string
+		status       string
+		hasError     bool
+	}{
+		{name: "completed", terminalType: "response.completed", status: "completed"},
+		{name: "incomplete", terminalType: "response.incomplete", status: "incomplete"},
+		{name: "failed", terminalType: "response.failed", status: "failed", hasError: true},
+		{name: "cancelled", terminalType: "response.cancelled", status: "cancelled"},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			response := `{"id":"resp_terminal_usage","object":"response","created_at":1,"model":"fixture-model","status":"` + test.status + `","output":[],"usage":{"input_tokens":17,"output_tokens":5,"total_tokens":22}}`
+			if test.hasError {
+				response = `{"id":"resp_terminal_usage","object":"response","created_at":1,"model":"fixture-model","status":"failed","output":[],"usage":{"input_tokens":17,"output_tokens":5,"total_tokens":22},"error":{"type":"server_error","code":"upstream_failed","message":"provider returned failure"}}`
+			}
+			resultBytes, meta, err := AggregateStreamChunks(t.Context(), []*httpclient.StreamEvent{{
+				Type: test.terminalType,
+				Data: []byte(`{"type":"` + test.terminalType + `","response":` + response + `}`),
+			}})
+			require.NoError(t, err)
+			require.NotNil(t, meta.Usage)
+			require.Equal(t, int64(17), meta.Usage.PromptTokens)
+			require.Equal(t, int64(5), meta.Usage.CompletionTokens)
+			require.Equal(t, int64(22), meta.Usage.TotalTokens)
+
+			var body Response
+			require.NoError(t, json.Unmarshal(resultBytes, &body))
+			require.NotNil(t, body.Usage)
+			require.Equal(t, int64(17), body.Usage.InputTokens)
+			require.Equal(t, int64(5), body.Usage.OutputTokens)
+			require.Equal(t, int64(22), body.Usage.TotalTokens)
+			if test.hasError {
+				require.NotNil(t, body.Error)
+				require.Equal(t, "upstream_failed", body.Error.Code)
+			}
+		})
+	}
+}
+
 func TestAggregateStreamChunks_WithTestData(t *testing.T) {
 	tests := []struct {
 		name             string
